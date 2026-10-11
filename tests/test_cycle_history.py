@@ -278,6 +278,7 @@ def test_briefing_last_24h_summary(hist):
     assert "shadow only" in payload["markdown"].lower()
     assert "reached judge 1" in payload["markdown"]
     assert "## Passed judge/picks" in payload["markdown"]
+    assert "## Judge verdicts" in payload["markdown"]
     assert "No tokens judged in the window." not in payload["markdown"]
     assert w["shadow"]["fills"] == 0
     assert "picks are not fills" in w["shadow"]["fills_note"]
@@ -572,6 +573,10 @@ def test_ops_html_has_briefing_and_trends():
     assert "Reached judge" in html
     assert "Passed judge/picks" in html
     assert "No tokens passed judge/picks" in html
+    assert "Judge verdicts" in html
+    assert 'id="briefing-judge-verdicts"' in html
+    assert 'id="judge-verdicts-section"' in html
+    assert "renderJudgeVerdicts" in html
     assert 'id="briefing-regime"' in html
     assert 'id="trends-regime"' in html
     assert "Market regime (log-only)" in html

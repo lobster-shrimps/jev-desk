@@ -630,6 +630,8 @@ tr:hover td { background: #151515; }
   <div id="briefing-momentum"></div>
   <div class="section-title">Passed judge/picks (24h)</div>
   <div id="briefing-judged"></div>
+  <div class="section-title">Judge verdicts</div>
+  <div id="briefing-judge-verdicts"></div>
   <div class="section-title">Young free-pass outcomes</div>
   <div id="briefing-young"></div>
   <div class="section-title">Picks / fills / shadow P&amp;L</div>
@@ -733,6 +735,11 @@ tr:hover td { background: #151515; }
 <div class="section">
   <div class="section-title">Held Positions (Live)</div>
   <div id="held-section"></div>
+</div>
+
+<div class="section">
+  <div class="section-title">Judge verdicts</div>
+  <div id="judge-verdicts-section"></div>
 </div>
 
 <div class="section">
@@ -1528,6 +1535,51 @@ function renderShadowLedger(ledger) {
   section.innerHTML = html;
 }
 
+function renderJudgeVerdicts(tokens) {
+  const section = document.getElementById('judge-verdicts-section');
+  if (!section) return;
+  const rows = (tokens || []).filter(t => t.stage === 'judged' || t.stage === 'judge_error' || t.judge_verdict);
+  if (!rows.length) {
+    section.innerHTML = '<div class="empty">No tokens reached the judge this cycle</div>';
+    return;
+  }
+  const table = document.createElement('table');
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Chain</th>
+        <th>Verdict</th>
+        <th>Score</th>
+        <th>Conf</th>
+        <th>Reason</th>
+        <th>Scores</th>
+        <th>Age min</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map(t => {
+        const scores = t.soft_scores || {};
+        const compact = Object.keys(scores).sort().map(k => `${k}=${Number(scores[k]).toFixed(3)}`).join(', ');
+        const score = t.judge_score;
+        const conf = t.judge_confidence;
+        return `<tr>
+          <td>${t.ticker || '—'}</td>
+          <td>${t.chain || '—'}</td>
+          <td>${t.judge_verdict || '—'}</td>
+          <td>${score == null ? '—' : Number(score).toFixed(3)}</td>
+          <td>${conf == null ? '—' : Number(conf).toFixed(3)}</td>
+          <td>${t.judge_reason || '—'}</td>
+          <td>${compact || '—'}</td>
+          <td>${t.age_minutes != null ? Math.round(t.age_minutes) : '—'}</td>
+        </tr>`;
+      }).join('')}
+    </tbody>
+  `;
+  section.innerHTML = '';
+  section.appendChild(table);
+}
+
 function renderTokens(tokens) {
   const section = document.getElementById('tokens-section');
   if (!tokens || tokens.length === 0) {
@@ -1672,6 +1724,7 @@ async function refresh() {
     
     renderFomoHealth(state);
     renderHeld(state.held);
+    renderJudgeVerdicts(state.tokens);
     renderTokens(state.tokens);
     renderAgeDistribution(state.tokens);
     
@@ -1844,6 +1897,27 @@ function renderBriefing(data) {
       const age = t.age_minutes != null ? Number(t.age_minutes).toFixed(1) : '—';
       return `<tr><td>${esc(t.ticker||'—')}</td><td>${esc(t.chain||'—')}</td>
         <td>${age}</td><td>${mom == null ? '—' : Number(mom).toFixed(3)}</td><td>${esc(compact||'—')}</td></tr>`;
+    }).join('')}</tbody></table>`;
+  }
+
+  const verdictsEl = document.getElementById('briefing-judge-verdicts');
+  const verdictRows = judged.concat(w.judge_error_tokens || []);
+  if (!verdictRows.length) {
+    verdictsEl.innerHTML = '<div class="empty">No judge verdicts in the window</div>';
+  } else {
+    verdictsEl.innerHTML = `<table><thead><tr>
+      <th>Ticker</th><th>Chain</th><th>Verdict</th><th>Score</th><th>Conf</th><th>Reason</th><th>Scores</th>
+    </tr></thead><tbody>${verdictRows.map(t => {
+      const scores = t.soft_scores || {};
+      const compact = Object.keys(scores).sort().map(k => `${k}=${Number(scores[k]).toFixed(3)}`).join(', ');
+      const score = t.judge_score;
+      const conf = t.judge_confidence;
+      return `<tr><td>${esc(t.ticker||'—')}</td><td>${esc(t.chain||'—')}</td>
+        <td>${esc(t.judge_verdict||'—')}</td>
+        <td>${score == null ? '—' : Number(score).toFixed(3)}</td>
+        <td>${conf == null ? '—' : Number(conf).toFixed(3)}</td>
+        <td>${esc(t.judge_reason||'—')}</td>
+        <td>${esc(compact||'—')}</td></tr>`;
     }).join('')}</tbody></table>`;
   }
 

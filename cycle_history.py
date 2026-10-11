@@ -155,6 +155,10 @@ def _init_schema(db: sqlite3.Connection) -> None:
       developer_holding_percentage REAL,
       holder_count INTEGER,
       soft_scores_json TEXT,
+      judge_verdict TEXT,
+      judge_reason TEXT,
+      judge_score REAL,
+      judge_confidence REAL,
       FOREIGN KEY (cycle_id) REFERENCES cycles(id)
     );
     CREATE INDEX IF NOT EXISTS idx_tokens_ts ON tokens(ts);
@@ -218,6 +222,15 @@ def _init_schema(db: sqlite3.Connection) -> None:
     ):
         if name not in cols:
             db.execute(f"ALTER TABLE cycles ADD COLUMN {name} {decl}")
+    token_cols = {row[1] for row in db.execute("PRAGMA table_info(tokens)")}
+    for name, decl in (
+        ("judge_verdict", "TEXT"),
+        ("judge_reason", "TEXT"),
+        ("judge_score", "REAL"),
+        ("judge_confidence", "REAL"),
+    ):
+        if name not in token_cols:
+            db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {decl}")
     db.commit()
 
 
@@ -372,6 +385,8 @@ def classify_young_outcome(row: dict | None) -> tuple[str, str | None]:
         return "soft", reason
     if stage == "judged":
         return "judged", reason
+    if stage == "judge_error":
+        return "judge_error", reason
     if stage == "trade":
         return "trade", reason
     if stage:
@@ -473,7 +488,7 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
             stage = row.get("stage")
             if stage == "soft" and row.get("tid") in written_tids:
                 continue
-            if stage not in ("judged", "soft"):
+            if stage not in ("judged", "soft", "judge_error"):
                 continue
             _insert_token(db, cycle_id, _token_from_stats_row(row, now, stage))
         later_by_tid = {r.get("tid"): r for r in tokens if r.get("tid")}
@@ -528,6 +543,10 @@ def _token_from_stats_row(row: dict, now: float, kind: str) -> dict:
         "developer_holding_percentage": _num(row.get("developer_holding_percentage")),
         "holder_count": _int(row.get("holder_count")),
         "soft_scores": row.get("soft_scores") or {},
+        "judge_verdict": row.get("judge_verdict"),
+        "judge_reason": row.get("judge_reason"),
+        "judge_score": _num(row.get("judge_score")),
+        "judge_confidence": _num(row.get("judge_confidence")),
     }
 
 
@@ -537,8 +556,9 @@ def _insert_token(db: sqlite3.Connection, cycle_id: int, row: dict) -> None:
         """INSERT INTO tokens (
              cycle_id, ts, kind, tid, chain_id, chain, ticker, reason, noul,
              age_minutes, top_10_percent, top_wallet_percent,
-             developer_holding_percentage, holder_count, soft_scores_json
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             developer_holding_percentage, holder_count, soft_scores_json,
+             judge_verdict, judge_reason, judge_score, judge_confidence
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             cycle_id, row.get("ts"), row.get("kind"), row.get("tid"),
             row.get("chain_id"), row.get("chain"), row.get("ticker"),
@@ -546,6 +566,8 @@ def _insert_token(db: sqlite3.Connection, cycle_id: int, row: dict) -> None:
             row.get("top_10_percent"), row.get("top_wallet_percent"),
             row.get("developer_holding_percentage"), row.get("holder_count"),
             _json(scores),
+            row.get("judge_verdict"), row.get("judge_reason"),
+            _num(row.get("judge_score")), _num(row.get("judge_confidence")),
         ),
     )
 
@@ -726,6 +748,10 @@ def _token_dict(r: sqlite3.Row) -> dict:
         "developer_holding_percentage": r["developer_holding_percentage"],
         "holder_count": r["holder_count"],
         "soft_scores": _loads(r["soft_scores_json"]),
+        "judge_verdict": r["judge_verdict"] if "judge_verdict" in r.keys() else None,
+        "judge_reason": r["judge_reason"] if "judge_reason" in r.keys() else None,
+        "judge_score": r["judge_score"] if "judge_score" in r.keys() else None,
+        "judge_confidence": r["judge_confidence"] if "judge_confidence" in r.keys() else None,
     }
 
 
@@ -907,6 +933,7 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
     tokens = _tokens_since(since_ts, until_ts=now)
     young = _young_since(since_ts, until_ts=now)
     judged = [t for t in tokens if t.get("kind") == "judged"]
+    judge_errors = [t for t in tokens if t.get("kind") == "judge_error"]
     soft = [t for t in tokens if t.get("kind") == "soft"]
     free = _kill_counts(_merge_counts(*(c["free"] for c in cycles)))
     trade = _kill_counts(_merge_counts(*(c["trade"] for c in cycles)))
@@ -963,6 +990,7 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "kills": {"free": free, "trade": trade, "chain": chain, "soft": soft_kills},
         "kill_mix": mix,
         "judged_tokens": judged,
+        "judge_error_tokens": judge_errors,
         "soft_tokens": soft,
         "median_momentum": _median(momenta),
         "median_momentum_soft": _median(soft_momenta),
@@ -1267,6 +1295,33 @@ def render_briefing_md(payload: dict) -> str:
             lines.append(
                 f"| {t.get('ticker') or '—'} | {t.get('chain') or '—'} | {age_s} | {mom_s} | {compact or '—'} |"
             )
+    lines += ["", "## Judge verdicts", ""]
+    verdict_rows = list(judged) + list(w.get("judge_error_tokens") or [])
+    if not verdict_rows:
+        lines.append("No judge verdicts in the window.")
+    else:
+        lines.append("| ticker | chain | verdict | score | conf | reason | scores |")
+        lines.append("| --- | --- | --- | ---: | ---: | --- | --- |")
+        for t in verdict_rows:
+            scores = t.get("soft_scores") or {}
+            compact = ", ".join(
+                f"{k}={v:.3f}" if isinstance(v, (int, float)) else f"{k}={v}"
+                for k, v in sorted(scores.items())
+            )
+            score = t.get("judge_score")
+            conf = t.get("judge_confidence")
+            score_s = "—" if score is None else (
+                f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
+            )
+            conf_s = "—" if conf is None else (
+                f"{conf:.3f}" if isinstance(conf, (int, float)) else str(conf)
+            )
+            reason = (t.get("judge_reason") or "—").replace("|", "/")
+            lines.append(
+                f"| {t.get('ticker') or '—'} | {t.get('chain') or '—'} | "
+                f"{t.get('judge_verdict') or '—'} | {score_s} | {conf_s} | "
+                f"{reason} | {compact or '—'} |"
+            )
     lines += ["", "## Young free-pass outcomes", ""]
     yo = w.get("young_outcomes") or {}
     if not yo:
@@ -1459,6 +1514,10 @@ YOUNG_429_RE = re.compile(
 )
 SOFT_HINT_RE = re.compile(r"soft tid=")
 CHAIN_HINT_RE = re.compile(r"chain tid=")
+JUDGE_RE = re.compile(
+    r"judge tid=(\S+) ticker=(.+?) verdict=(\S+) score=(\S+) "
+    r"confidence=(\S+) reason=(.*) mode=(\S+)\s*$"
+)
 UNEVAL_RE = re.compile(r"unevaluated (\d+) ids")
 CARRY_RE = re.compile(r"carrying (\d+) of (\d+) unevaluated ids")
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -1653,6 +1712,27 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
                 "tid": tid, "ticker": ticker, "stage": "trade", "reason": reason,
                 "verdict": "DROP", "net": chain_id_of(tid=tid),
                 "chain": chain_name(tid=tid),
+            }
+            continue
+
+        m = JUDGE_RE.search(line)
+        if m:
+            tid, ticker, jverdict = m.group(1), m.group(2), m.group(3)
+            existing = pending_later.get(tid) or {}
+            if existing.get("stage") == "soft":
+                continue
+            pending_later[tid] = {
+                **existing,
+                "tid": tid, "ticker": ticker,
+                "stage": "judge_error" if jverdict == "error" else "judged",
+                "reason": existing.get("reason"),
+                "verdict": existing.get("verdict") or "PASS",
+                "net": chain_id_of(tid=tid),
+                "chain": chain_name(tid=tid),
+                "judge_verdict": jverdict,
+                "judge_score": _num(m.group(4)),
+                "judge_confidence": _num(m.group(5)),
+                "judge_reason": (m.group(6) or "").strip(),
             }
             continue
 
