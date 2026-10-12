@@ -7,8 +7,9 @@ Cache lives under outbox/ (default outbox/x_cache.db). Positive hits last
 30 minutes; negative hits last 10. Per-cycle HTTP lookups are capped by
 X_LOOKUPS_PER_CYCLE (default 15) and a wall-clock budget X_LOOKUP_BUDGET_SEC
 (default 60). Only tokens that reached the judge step should call this.
-Statuses 404s are retried (the fxtwitter timeline flaps); a statuses 404
-never negative-caches a good profile.
+Profile and statuses 404s are retried (the fxtwitter endpoints flap);
+a statuses 404 never negative-caches a good profile. A success with
+no posts is cached 10 minutes, not 30, so the timeline can recover.
 """
 from __future__ import annotations
 
@@ -37,8 +38,10 @@ DEFAULT_LOOKUPS_PER_CYCLE = 15
 DEFAULT_BUDGET_SEC = 60.0
 LOCK_TIMEOUT_SEC = 0.2
 STATUSES_COUNT = 10
-STATUSES_404_RETRIES = 2          # extra tries after the first 404
-STATUSES_404_GAP_SEC = 1.5        # pause between statuses 404 retries
+NOT_FOUND_RETRIES = 2             # extra tries after the first 404 (profile + statuses)
+NOT_FOUND_GAP_SEC = 1.5           # pause between 404 retries
+STATUSES_404_RETRIES = NOT_FOUND_RETRIES
+STATUSES_404_GAP_SEC = NOT_FOUND_GAP_SEC
 
 HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 RESERVED_PATHS = {
@@ -53,6 +56,10 @@ _time_fn = time.time
 _sleep_fn = time.sleep
 _lookups_this_cycle = 0
 _window_start: float | None = None
+
+
+class _BudgetExceeded(Exception):
+    """Lookup wall-clock budget ran out mid-retry. Fail open, do not negative-cache."""
 
 
 def set_time_fn(fn):
@@ -235,6 +242,14 @@ def read_x(handle: str, tid: str | None = None) -> dict | None:
         _cache_put(key, block, ok=True)
         _log_lookup(tid, handle, True, block, block, "fxtwitter", "-")
         return block
+    except _BudgetExceeded:
+        elapsed = 0.0 if _window_start is None else current_time() - _window_start
+        log.info(
+            "x budget exceeded elapsed=%.1fs budget=%s tid=%s handle=%s",
+            elapsed, lookup_budget_sec(), tid or "-", handle,
+        )
+        _log_lookup(tid, handle, False, None, None, "none", "budget")
+        return None
     except Exception as e:
         err = safe_err(e)
         try:
@@ -258,10 +273,44 @@ def _log_lookup(tid, handle, ok, followers_src, posts_src, source, err) -> None:
     )
 
 
+def _sleep_gap_respecting_budget() -> None:
+    """Pause NOT_FOUND_GAP_SEC unless the cycle X-lookup budget is already gone."""
+    if _over_budget():
+        raise _BudgetExceeded()
+    try:
+        _sleep_fn(NOT_FOUND_GAP_SEC)
+    except _BudgetExceeded:
+        raise
+    except Exception as e:
+        log.warning("x 404 sleep: %s", safe_err(e))
+    if _over_budget():
+        raise _BudgetExceeded()
+
+
 def _fetch_account(handle: str) -> dict | None:
-    """HTTP fetch. Raises on timeout/JSON errors so read_x can safe_err them."""
+    """HTTP fetch. Raises on timeout/JSON errors so read_x can safe_err them.
+
+    Profile 404s flap like statuses; retry up to NOT_FOUND_RETRIES extra times
+    with NOT_FOUND_GAP_SEC between tries, stopping early if the cycle budget
+    is exhausted.
+    """
     profile_url = FX_PROFILE_URL.format(handle=quote(handle, safe=""))
-    resp = _get_with_retry(profile_url)
+    resp = None
+    for attempt in range(1 + NOT_FOUND_RETRIES):
+        resp = _get_with_retry(profile_url)
+        status = getattr(resp, "status_code", 0) or 0
+        if status == 200:
+            break
+        if status == 404 and attempt < NOT_FOUND_RETRIES:
+            log.info(
+                "x profile 404 retry %s/%s handle=%s",
+                attempt + 1, NOT_FOUND_RETRIES, handle,
+            )
+            _sleep_gap_respecting_budget()
+            continue
+        raise RuntimeError(f"HTTP {status}")
+    else:
+        raise RuntimeError(f"HTTP {getattr(resp, 'status_code', 404)}")
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}")
     try:
@@ -351,7 +400,7 @@ def _fetch_statuses(handle: str) -> list:
     """
     url = FX_STATUSES_URL.format(handle=quote(handle, safe="")) + f"?count={STATUSES_COUNT}"
     last_status = None
-    for attempt in range(1 + STATUSES_404_RETRIES):
+    for attempt in range(1 + NOT_FOUND_RETRIES):
         try:
             resp = _get_with_retry(url)
         except Exception as e:
@@ -365,15 +414,16 @@ def _fetch_statuses(handle: str) -> list:
                 log.warning("x statuses JSON for @%s: %s", handle, safe_err(e))
                 return []
             return _parse_statuses_payload(payload)
-        if last_status == 404 and attempt < STATUSES_404_RETRIES:
+        if last_status == 404 and attempt < NOT_FOUND_RETRIES:
             log.info(
                 "x statuses 404 retry %s/%s handle=%s",
-                attempt + 1, STATUSES_404_RETRIES, handle,
+                attempt + 1, NOT_FOUND_RETRIES, handle,
             )
             try:
-                _sleep_fn(STATUSES_404_GAP_SEC)
-            except Exception as e:
-                log.warning("x statuses sleep: %s", safe_err(e))
+                _sleep_gap_respecting_budget()
+            except _BudgetExceeded:
+                log.info("x statuses 404 stop budget handle=%s", handle)
+                return []
             continue
         log.warning("x statuses HTTP %s for @%s: %s", last_status, handle,
                     safe_err(RuntimeError(f"HTTP {last_status}")))
@@ -511,18 +561,28 @@ def _cache_get(handle: str):
             return None, None
         age = current_time() - float(row["fetched_at"])
         ok = int(row["ok"]) == 1
-        ttl = POSITIVE_TTL_SEC if ok else NEGATIVE_TTL_SEC
-        if age > ttl:
-            return None, None
         if not ok:
+            if age > NEGATIVE_TTL_SEC:
+                return None, None
             return None, False
         payload = json.loads(row["payload_json"]) if row["payload_json"] else None
         if not isinstance(payload, dict):
+            return None, None
+        ttl = _positive_ttl_sec(payload)
+        if age > ttl:
             return None, None
         return payload, True
     except Exception as e:
         log.warning("x cache get failed: %s", safe_err(e))
         return None, None
+
+
+def _positive_ttl_sec(payload: dict) -> float:
+    """30 min when we got posts; 10 min when the timeline came back empty."""
+    posts = payload.get("recent_posts") if isinstance(payload, dict) else None
+    if not posts:
+        return float(NEGATIVE_TTL_SEC)
+    return float(POSITIVE_TTL_SEC)
 
 
 def _cache_put(handle: str, payload, ok: bool) -> bool:

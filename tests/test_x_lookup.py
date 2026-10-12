@@ -173,6 +173,11 @@ def test_http_error_returns_none_and_logs_safe_err(status, caplog):
     assert f"HTTP {status}" in caplog.text
     assert "err=RuntimeError: HTTP" in caplog.text
     assert not any("/statuses" in u for u in calls)
+    profile_calls = [u for u in calls if "/statuses" not in u]
+    if status == 404:
+        assert len(profile_calls) == 1 + x_lookup.NOT_FOUND_RETRIES
+    else:
+        assert len(profile_calls) == 1
 
 
 def test_timeout_returns_none_and_logs_safe_err(caplog):
@@ -273,6 +278,100 @@ def test_per_cycle_cap_is_respected():
     assert b is None
     assert not any(u.endswith("/two") or "/two?" in u or u.endswith("/two/statuses")
                    or "/profile/two/" in u for u in monkey_calls)
+
+
+def test_profile_404_retries_then_succeeds():
+    """fxtwitter profile flaps 404; retry up to 2 more times with a 1.5s gap."""
+    slept = []
+    x_lookup.set_sleep_fn(lambda d: slept.append(d))
+    profile_calls = []
+
+    def get(url, timeout=None, **kw):
+        if "/statuses" in url:
+            return _resp(200, _statuses_body(n=3))
+        profile_calls.append(url)
+        if len(profile_calls) < 3:
+            return _resp(404, {"code": 404, "message": "NOT_FOUND"})
+        return _resp(200, _profile_body())
+
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("tokacct")
+    assert block is not None
+    assert block["followers"] == 1200
+    assert block["own_posts_count"] == 3
+    assert len(profile_calls) == 3
+    assert slept == [x_lookup.NOT_FOUND_GAP_SEC, x_lookup.NOT_FOUND_GAP_SEC]
+    assert 1.0 <= x_lookup.NOT_FOUND_GAP_SEC <= 2.0
+
+
+def test_profile_404_budget_abort_does_not_negative_cache():
+    """Stopping a profile 404 retry for budget must fail open, not cache the miss."""
+    clock = [1_000.0]
+    x_lookup.set_time_fn(lambda: clock[0])
+
+    def sleeper(gap):
+        clock[0] += float(gap)
+
+    x_lookup.set_sleep_fn(sleeper)
+    calls = []
+
+    def get(url, timeout=None, **kw):
+        calls.append(url)
+        if "/statuses" in url:
+            return _resp(200, _statuses_body(n=1))
+        return _resp(404, {"code": 404, "message": "NOT_FOUND"})
+
+    with patch.dict(os.environ, {"X_LOOKUP_BUDGET_SEC": "2"}):
+        x_lookup.reset_cycle()
+        with patch("x_lookup.requests.get", side_effect=get):
+            first = x_lookup.read_x("flappy")
+            n = len(calls)
+            x_lookup.reset_cycle()
+            clock[0] = 2_000.0
+            second = x_lookup.read_x("flappy")
+    assert first is None
+    assert second is None
+    assert n >= 2  # first attempt + at least one retry before budget
+    assert len(calls) > n  # second cycle hits HTTP again: not negative-cached
+    assert all("/statuses" not in u for u in calls)
+
+
+def test_empty_posts_cached_10_min_not_30():
+    """Profile ok + 0 posts after retries: 10 min TTL. Posts present: 30 min."""
+    clock = [5_000.0]
+    x_lookup.set_time_fn(lambda: clock[0])
+
+    def empty_then_full(url, timeout=None, **kw):
+        if "/statuses" in url:
+            return _resp(404, {"code": 404})
+        return _resp(200, _profile_body(followers=50))
+
+    with patch("x_lookup.requests.get", side_effect=empty_then_full) as mock_get:
+        first = x_lookup.read_x("quiet")
+        assert first is not None and first["own_posts_count"] == 0
+        n = mock_get.call_count
+        clock[0] += 10 * 60 - 1
+        assert x_lookup.read_x("quiet") is not None  # still within 10 min
+        assert mock_get.call_count == n
+        clock[0] += 2
+        x_lookup.reset_cycle()  # cache TTL, not the cycle budget window
+        x_lookup.read_x("quiet")
+        assert mock_get.call_count > n
+
+    x_lookup.reset()
+    clock[0] = 20_000.0
+    x_lookup.set_time_fn(lambda: clock[0])
+    get_ok, calls = _route()
+    with patch("x_lookup.requests.get", side_effect=get_ok):
+        assert x_lookup.read_x("tokacct") is not None
+        n = len(calls)
+        clock[0] += 10 * 60 + 5  # past the empty-post TTL, still inside 30 min
+        assert x_lookup.read_x("tokacct") is not None
+        assert len(calls) == n
+        clock[0] += 20 * 60  # past 30 min
+        x_lookup.reset_cycle()
+        x_lookup.read_x("tokacct")
+        assert len(calls) > n
 
 
 def test_statuses_404_retries_then_succeeds():
