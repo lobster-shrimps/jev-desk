@@ -581,6 +581,13 @@ def test_ops_html_has_briefing_and_trends():
     assert 'id="trends-regime"' in html
     assert "Market regime (log-only)" in html
     assert "regime / day" in html
+    assert 'id="backtest-panel"' in html
+    assert 'id="shadow-kills-panel"' in html
+    assert "Signal backtest" in html
+    assert "Shadow kills by reason" in html
+    assert "/ops/backtest" in html
+    assert "renderBacktest" in html
+    assert "6h forward outcome" in html
 
 
 def test_briefing_payload_empty_store(hist):

@@ -7,6 +7,10 @@ Entrypoint. Wires FOMO + judge + desk into main.main().
                                  # week of shadow rows, not before.
     python run.py --mock-judge   # answers from mock_judge instead of JUDGE_URL (funnel testing)
     python run.py --bench        # print what is benched and why, then exit
+
+Weekly signal backtest (log/analysis only): the first cycle after Sunday 07:00
+local kicks python backtest_signals.py --days 7 in a time-capped background
+thread. It never uses the cycle GT limiter and never changes a kill/judge/pick.
 """
 import argparse
 import logging

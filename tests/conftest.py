@@ -23,6 +23,32 @@ def isolate_coinalyze(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_outcomes(tmp_path, monkeypatch):
+    """Point outcomes cache at a per-test SQLite file. No network, no weekly thread."""
+    monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
+    monkeypatch.setenv("BACKTEST_DISABLE", "1")
+    import outcomes
+    import backtest_signals
+    outcomes.reset()
+    outcomes.set_time_fn(None)
+    outcomes.set_sleep_fn(lambda _d: None)
+
+    def _no_network(*_a, **_k):
+        raise AssertionError("outcomes tests must not use the network")
+
+    outcomes.set_get_fn(_no_network)
+    backtest_signals.reset()
+    backtest_signals.set_time_fn(None)
+    yield
+    outcomes.reset()
+    outcomes.set_get_fn(None)
+    outcomes.set_sleep_fn(None)
+    outcomes.set_time_fn(None)
+    backtest_signals.reset()
+    backtest_signals.set_time_fn(None)
+
+
+@pytest.fixture(autouse=True)
 def isolate_gt_info_cache(tmp_path, monkeypatch):
     """Point the GT /info cache at a per-test SQLite file. No leftover hits."""
     monkeypatch.setenv("GT_INFO_CACHE_DB", str(tmp_path / "gt_info_cache.db"))
