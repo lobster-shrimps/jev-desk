@@ -10,7 +10,8 @@ DESK — the Grok Bot side, as seen from main.py. Five hooks:
 Wiring (all optional, all via env):
   BANK_USD             free cash the desk may size against. SIZE clamps at 6% of this.
   SOCIAL_URL           SOCIAL bot endpoint. POST {"x_handle": ...} -> the X block JSON.
-                       Unset: no social read, tokens carry the gap (NO_SOCIAL_CUT applies).
+                       Unset: in-desk fxtwitter lookup (x_lookup.read_x). Failure is
+                       None and NO_SOCIAL_CUT still applies.
   SEATS_WEBHOOK_URL    where a finished order goes (CHIEF's inbox). Unset: orders are
                        written to outbox/orders/<order_id>.json for you to hand over.
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID    the one line per cycle.
@@ -25,6 +26,8 @@ import time
 import requests
 
 import shadow_ledger
+from secret_utils import safe_err
+import x_lookup
 
 log = logging.getLogger("desk.side")
 
@@ -47,18 +50,23 @@ class Desk:
         return self.bank_usd
 
     def read_x(self, handle: str):
-        """Ask the SOCIAL seat for the X block. Missing is missing: never substitute."""
-        if not self.social_url or not handle:
+        """X block for the SOCIAL question set. Missing is missing: never substitute.
+
+        SOCIAL_URL still POSTs to the bot. Unset: fxtwitter via x_lookup.read_x.
+        """
+        if not handle:
             return None
-        try:
-            r = requests.post(self.social_url, json={"x_handle": handle}, timeout=60)
-            r.raise_for_status()
-            block = r.json()
-            x = block.get("x_account", block) if isinstance(block, dict) else None
-            return x or None
-        except Exception as e:
-            log.warning("SOCIAL read failed for @%s: %s", handle, e)
-            return None
+        if self.social_url:
+            try:
+                r = requests.post(self.social_url, json={"x_handle": handle}, timeout=60)
+                r.raise_for_status()
+                block = r.json()
+                x = block.get("x_account", block) if isinstance(block, dict) else None
+                return x or None
+            except Exception as e:
+                log.warning("SOCIAL read failed for @%s: %s", handle, safe_err(e))
+                return None
+        return x_lookup.read_x(handle)
 
     # ---- outputs --------------------------------------------------------------
     def log_shadow(self, order: dict, stats: dict, fomo_data: dict = None):

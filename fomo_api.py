@@ -357,6 +357,13 @@ class Fomo:
         created = token_data.get("createdAt") or token_data.get("created")
         if created is not None:
             updates["createdAt"] = created
+
+        tw = (token_data.get("twitter") or token_data.get("twitterUrl")
+              or token_data.get("twitter_url") or token_data.get("twitterHandle")
+              or token_data.get("twitter_handle") or token_data.get("x")
+              or token_data.get("xUrl"))
+        if tw is not None:
+            updates["twitter"] = tw
         
         flattened.update(updates)
         
@@ -378,7 +385,9 @@ class Fomo:
                 "holders": _i(g("holders", "holderCount")),
                 "top10_holders_percent": _f(g("top10HoldersPercent")),
                 "change":  {sec: _f(m.get(k)) for k, sec in CHANGE_WINDOWS.items()},
-                "created": g("createdAt", "created", "pairCreatedAt")}
+                "created": g("createdAt", "created", "pairCreatedAt"),
+                "twitter": g("twitter", "twitterUrl", "twitter_url",
+                             "twitterHandle", "twitter_handle", "x", "xUrl")}
 
 
 def _f(v):
