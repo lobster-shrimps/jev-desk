@@ -97,6 +97,10 @@ class HolderResult:
     # Raw values before exclusions (for logging)
     raw_top_wallet: float | None = None  # 0-1 fraction
     raw_top_10: float | None = None  # 0-100 percent
+    # Present only when Honeypot.is holder data already named the creator.
+    creator: str | None = None
+    creator_balance: int | None = None
+    creator_initial_balance: int | None = None
 
 
 class RateLimiter:
@@ -217,6 +221,37 @@ def _classify_error(error: str) -> bool:
     
     # Default: treat as transient
     return True
+
+
+def _creator_from_honeypot(data: dict) -> tuple[str | None, int | None, int | None]:
+    """Creator address if the TopHolders payload already carries it. No extra calls."""
+    if not isinstance(data, dict):
+        return None, None, None
+    creator = (data.get("creator") or data.get("creatorAddress")
+               or data.get("creator_address") or data.get("deployer")
+               or data.get("deployerAddress") or data.get("createdBy"))
+    if isinstance(creator, str):
+        creator = creator.strip() or None
+    else:
+        creator = None
+    initial = data.get("creatorInitialBalance") or data.get("creator_initial_balance")
+    try:
+        initial = int(initial) if initial is not None else None
+    except (TypeError, ValueError):
+        initial = None
+    balance = None
+    for h in data.get("holders") or []:
+        if not isinstance(h, dict):
+            continue
+        if not creator and (h.get("isCreator") or h.get("isDeployer") or h.get("isOwner")):
+            creator = (h.get("address") or "").strip() or None
+        if creator and str(h.get("address") or "").lower() == creator.lower():
+            try:
+                balance = int(h.get("balance"))
+            except (TypeError, ValueError):
+                balance = None
+            break
+    return creator, balance, initial
 
 
 def _holders_honeypot(chain_id: int, token: str, deadline: float) -> tuple[dict | None, str | None]:
@@ -1031,7 +1066,10 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 error=result.error,
                 is_transient=result.is_transient,
                 raw_top_wallet=result.raw_top_wallet,
-                raw_top_10=result.raw_top_10
+                raw_top_10=result.raw_top_10,
+                creator=getattr(result, "creator", None),
+                creator_balance=getattr(result, "creator_balance", None),
+                creator_initial_balance=getattr(result, "creator_initial_balance", None),
             )
             return cached_result
     
@@ -1051,6 +1089,8 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
             total_supply = data["totalSupply"]
             holders_raw = data["holders"]
             
+            creator, creator_balance, creator_initial = _creator_from_honeypot(data)
+
             # Convert to format
             holders = []
             for h in holders_raw:
@@ -1125,7 +1165,9 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 
                 primary_result = HolderResult(
                     top_wallet_pct, top_10_pct, "honeypot", excluded, True, None, False,
-                    raw_top_wallet=raw_top_wallet, raw_top_10=raw_top_10
+                    raw_top_wallet=raw_top_wallet, raw_top_10=raw_top_10,
+                    creator=creator, creator_balance=creator_balance,
+                    creator_initial_balance=creator_initial,
                 )
     
     elif chain_id == 4663:
