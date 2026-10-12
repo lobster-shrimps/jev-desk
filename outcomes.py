@@ -38,6 +38,7 @@ CANDLE_SEC = 5 * 60
 GT_SPACING_SEC = 7.0
 GT_429_BACKOFF_SEC = 30.0
 OHLCV_LIMIT = 80
+DEAD_NO_POOL_ATTEMPTS = 5
 TICKET_USD = 50.0
 COST = 0.03
 SL_PCT = -0.30
@@ -168,6 +169,10 @@ def _init_schema(db: sqlite3.Connection) -> None:
     );
     """)
     db.commit()
+    try:
+        _retire_overlimit_jobs(db)
+    except Exception as e:
+        log.warning("outcomes retire overlimit failed: %s", safe_err(e))
     try:
         gt_api.set_demo_capped_fn(demo_month_capped)
     except Exception:
@@ -617,7 +622,19 @@ def fetch_outcome(tid: str, entry_ts: float, *, now: float | None = None,
         if not pool:
             pool, chain = resolve_pool(tid)
         if not pool or not chain:
-            return cached
+            return {
+                "tid": tid, "entry_ts": float(entry_ts), "pool": None,
+                "complete": False, "resolve_failed": True,
+            }
+        if not (cached or {}).get("pool"):
+            # Keep the Dex pair even if OHLCV later 429s, so no-pool retire
+            # does not kill a resolvable job.
+            put_cached(tid, entry_ts, {
+                "pool": pool, "chain": chain, "complete": False,
+                "candles": (cached or {}).get("candles") or [],
+                "fetched_at": current_time(),
+            })
+            cached = get_cached(tid, entry_ts) or cached
         candles = fetch_ohlcv(chain, pool, entry_ts, deadline=deadline)
         if candles is None:
             return cached
@@ -704,10 +721,44 @@ def _upsert_job(tid: str, entry_ts: float, *, status: str, now: float | None = N
         log.warning("outcomes job update failed: %s", safe_err(e))
 
 
+def _retire_overlimit_jobs(db: sqlite3.Connection | None = None) -> int:
+    """Mark pending jobs already over the no-pool attempt limit as dead. Fail open."""
+    try:
+        conn = db or _connect()
+        cur = conn.execute(
+            """UPDATE fetch_jobs SET status = 'dead',
+                   last_error = COALESCE(NULLIF(last_error, ''), 'no_pool')
+               WHERE status = 'pending' AND attempts >= ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM outcomes o
+                   WHERE o.tid = fetch_jobs.tid
+                     AND ABS(o.entry_ts - fetch_jobs.entry_ts) < 1e-6
+                     AND o.pool IS NOT NULL AND o.pool != ''
+                 )""",
+            (DEAD_NO_POOL_ATTEMPTS,),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+    except Exception as e:
+        log.warning("outcomes retire overlimit failed: %s", safe_err(e))
+        return 0
+
+
 def list_jobs(status: str | None = "pending", limit: int = 500) -> list[dict]:
     try:
         db = _connect()
-        if status:
+        if status == "pending":
+            rows = db.execute(
+                """SELECT tid, entry_ts, status, attempts, last_attempt, last_error
+                   FROM fetch_jobs WHERE status = 'pending'
+                   ORDER BY attempts ASC,
+                            last_attempt IS NULL DESC,
+                            last_attempt ASC,
+                            tid
+                   LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        elif status:
             rows = db.execute(
                 """SELECT tid, entry_ts, status, attempts, last_attempt, last_error
                    FROM fetch_jobs WHERE status = ?
@@ -779,6 +830,7 @@ def drain_jobs(*, now: float | None = None, deadline: float | None = None,
     complete = 0
     paused = False
     try:
+        _retire_overlimit_jobs()
         jobs = list_jobs("pending")
         for job in jobs:
             if deadline is not None and current_time() >= deadline:
@@ -797,9 +849,19 @@ def drain_jobs(*, now: float | None = None, deadline: float | None = None,
                 _upsert_job(tid, entry_ts, status="complete", now=now, bump_attempt=True)
                 complete += 1
             else:
-                err = None if payload else "incomplete"
-                _upsert_job(tid, entry_ts, status="pending", now=now,
-                            error=err, bump_attempt=True)
+                resolve_failed = bool(payload and payload.get("resolve_failed"))
+                cached = get_cached(tid, entry_ts)
+                no_pool = resolve_failed or not (
+                    (payload or {}).get("pool") or (cached or {}).get("pool")
+                )
+                err = "no_pool" if no_pool else ("incomplete" if not payload else None)
+                attempts = int(job.get("attempts") or 0) + 1
+                if no_pool and attempts >= DEAD_NO_POOL_ATTEMPTS:
+                    _upsert_job(tid, entry_ts, status="dead", now=now,
+                                error=err or "no_pool", bump_attempt=True)
+                else:
+                    _upsert_job(tid, entry_ts, status="pending", now=now,
+                                error=err, bump_attempt=True)
             if max_calls is not None and fetched >= int(max_calls):
                 break
     except Exception as e:
@@ -857,6 +919,10 @@ def maybe_start_worker() -> threading.Thread | None:
                     log.warning("outcomes worker: %s", safe_err(e))
                     _sleep(10.0)
 
+        try:
+            _retire_overlimit_jobs()
+        except Exception as e:
+            log.warning("outcomes retire overlimit failed: %s", safe_err(e))
         t = threading.Thread(target=_loop, name="outcomes-fetch", daemon=True)
         _worker_thread = t
         t.start()
