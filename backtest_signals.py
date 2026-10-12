@@ -180,19 +180,24 @@ def _quartile_index(value, xs: list[float]) -> int | None:
     return 3
 
 
+def _is_measured(row: dict) -> bool:
+    """Same definition as log complete=: a finalized 6h outcome window."""
+    return bool(row.get("outcome_complete"))
+
+
 def _cell(rows: list[dict]) -> dict:
     n = len(rows)
-    wins = sum(1 for r in rows if _is_win(r))
-    measured = [r for r in rows if r.get("peak_x") is not None]
+    measured = [r for r in rows if _is_measured(r)]
     n_meas = len(measured)
+    wins = sum(1 for r in measured if _is_win(r))
     return {
         "n": n,
         "n_measured": n_meas,
         "wins": wins,
         "win_pct": _pct(wins, n_meas),
-        "mean_sim_current": _mean([r.get("sim_current_pnl") for r in rows]),
-        "mean_sim_trail": _mean([r.get("sim_trail_pnl") for r in rows]),
-        "mean_peak_x": _mean([r.get("peak_x") for r in rows]),
+        "mean_sim_current": _mean([r.get("sim_current_pnl") for r in measured]),
+        "mean_sim_trail": _mean([r.get("sim_trail_pnl") for r in measured]),
+        "mean_peak_x": _mean([r.get("peak_x") for r in measured]),
     }
 
 
@@ -210,11 +215,14 @@ def _enrich(shadow_row: dict, token: dict | None, regime: str | None) -> dict:
         if mom is None:
             mom = t.get("noul") if (shadow_row.get("reason") == "momentum_already_spent") else None
     x_present = shadow_row.get("x_present")
+    import cycle_history
+    liq = cycle_history._liq_of(shadow_row, t)
+    mcap = cycle_history._mcap_of(shadow_row, t)
     return {
         **shadow_row,
         "age": shadow_row.get("age_minutes") if shadow_row.get("age_minutes") is not None else t.get("age_minutes"),
-        "liq": shadow_row.get("liq") if shadow_row.get("liq") is not None else t.get("liquidity_usd"),
-        "mcap": shadow_row.get("mcap") if shadow_row.get("mcap") is not None else t.get("mcap_usd"),
+        "liq": liq,
+        "mcap": mcap,
         "holders": shadow_row.get("holders") if shadow_row.get("holders") is not None else t.get("holder_count"),
         "top_10": shadow_row.get("top_10_percent") if shadow_row.get("top_10_percent") is not None else t.get("top_10_percent"),
         "top_wallet": shadow_row.get("top_wallet_percent") if shadow_row.get("top_wallet_percent") is not None else t.get("top_wallet_percent"),
@@ -293,7 +301,9 @@ def attach_outcomes(rows: list[dict], *, now: float | None = None,
             log.warning("outcome attach failed: %s", safe_err(e))
             payload = None
         merged = dict(row)
-        if payload:
+        complete = bool(payload and payload.get("complete"))
+        merged["outcome_complete"] = complete
+        if complete:
             merged["peak_x"] = payload.get("peak_x")
             merged["trough_x"] = payload.get("trough_x")
             merged["ret_6h"] = payload.get("ret_6h")
@@ -301,18 +311,21 @@ def attach_outcomes(rows: list[dict], *, now: float | None = None,
             merged["sim_trail_pnl"] = payload.get("sim_trail_pnl")
             merged["sim_current_reason"] = payload.get("sim_current_reason")
             merged["sim_trail_reason"] = payload.get("sim_trail_reason")
-            merged["outcome_complete"] = bool(payload.get("complete"))
         else:
-            merged.setdefault("peak_x", None)
-            merged.setdefault("sim_current_pnl", None)
-            merged.setdefault("sim_trail_pnl", None)
-            merged["outcome_complete"] = False
+            # Incomplete candles must not count as "measured" (log complete=).
+            merged["peak_x"] = None
+            merged["trough_x"] = None
+            merged["ret_6h"] = None
+            merged["sim_current_pnl"] = None
+            merged["sim_trail_pnl"] = None
+            merged["sim_current_reason"] = None
+            merged["sim_trail_reason"] = None
         out.append(merged)
     return out
 
 
 def _winners_table(rows: list[dict]) -> dict:
-    measured = [r for r in rows if r.get("peak_x") is not None]
+    measured = [r for r in rows if _is_measured(r)]
     both = [
         r for r in measured
         if _is_win(r)
@@ -324,7 +337,7 @@ def _winners_table(rows: list[dict]) -> dict:
         ("sim_current P&L > 0", [r for r in measured if (r.get("sim_current_pnl") or 0) > 0]),
         ("sim_trail P&L > 0", [r for r in measured if (r.get("sim_trail_pnl") or 0) > 0]),
         ("peak_x>=2 and both sims > 0", both),
-        ("losers (peak_x < 2)", [r for r in measured if r.get("peak_x") is not None and not _is_win(r)]),
+        ("losers (peak_x < 2)", [r for r in measured if not _is_win(r)]),
     ]
     return {
         "n_measured": len(measured),
@@ -454,7 +467,7 @@ def render_markdown(report: dict) -> str:
         "",
         "## Per-feature quartiles",
         "",
-        "win% = share with peak_x ≥ 2 among rows that have a 6h outcome.",
+        "win% = share with peak_x ≥ 2 among complete 6h outcomes (measured = complete).",
         "",
     ]
     for key, table in (report.get("features") or {}).items():
@@ -516,6 +529,7 @@ def render_markdown(report: dict) -> str:
 
 def build_report(rows: list[dict], *, week_id: str, days: int, now: float,
                  extra: dict | None = None) -> dict:
+    n_complete = sum(1 for r in rows if _is_measured(r))
     report = {
         "week_id": week_id,
         "days": days,
@@ -524,7 +538,8 @@ def build_report(rows: list[dict], *, week_id: str, days: int, now: float,
         "ticket_usd": TICKET_USD,
         "cost": 0.03,
         "n": len(rows),
-        "n_complete": sum(1 for r in rows if r.get("outcome_complete")),
+        "n_complete": n_complete,
+        "n_measured": n_complete,
         "winners": _winners_table(rows),
         "features": _quartile_tables(rows),
         "kill_reasons": _reason_table(rows),
@@ -571,6 +586,12 @@ def run_backtest(*, days: int = DEFAULT_DAYS, now: float | None = None,
     try:
         import cycle_history
         try:
+            # Re-parse run.log so skipped cycles still pick up liq/mcap that
+            # were missing when tokens was first written (week 2026-41).
+            cycle_history.backfill_log()
+        except Exception as e:
+            log.warning("backtest log backfill: %s", safe_err(e))
+        try:
             cycle_history.backfill_shadow_kills()
         except Exception as e:
             log.warning("shadow kills backfill: %s", safe_err(e))
@@ -580,8 +601,9 @@ def run_backtest(*, days: int = DEFAULT_DAYS, now: float | None = None,
         if persist:
             persist_report(report)
         log.info(
-            "backtest %s n=%d complete=%d path=%s",
-            week_id, report.get("n"), report.get("n_complete"), report.get("path"),
+            "backtest %s n=%d complete=%d measured=%d path=%s",
+            week_id, report.get("n"), report.get("n_complete"),
+            report.get("n_measured"), report.get("path"),
         )
         return report
     except Exception as e:

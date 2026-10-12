@@ -156,6 +156,8 @@ def _init_schema(db: sqlite3.Connection) -> None:
       reason TEXT,
       noul REAL,
       age_minutes REAL,
+      liquidity_usd REAL,
+      mcap_usd REAL,
       top_10_percent REAL,
       top_wallet_percent REAL,
       developer_holding_percentage REAL,
@@ -183,6 +185,8 @@ def _init_schema(db: sqlite3.Connection) -> None:
       age_minutes REAL,
       outcome TEXT NOT NULL,
       reason TEXT,
+      liquidity_usd REAL,
+      mcap_usd REAL,
       FOREIGN KEY (cycle_id) REFERENCES cycles(id)
     );
     CREATE INDEX IF NOT EXISTS idx_yfp_ts ON young_free_pass(ts);
@@ -254,9 +258,18 @@ def _init_schema(db: sqlite3.Connection) -> None:
         ("judge_reason", "TEXT"),
         ("judge_score", "REAL"),
         ("judge_confidence", "REAL"),
+        ("liquidity_usd", "REAL"),
+        ("mcap_usd", "REAL"),
     ):
         if name not in token_cols:
             db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {decl}")
+    young_cols = {row[1] for row in db.execute("PRAGMA table_info(young_free_pass)")}
+    for name, decl in (
+        ("liquidity_usd", "REAL"),
+        ("mcap_usd", "REAL"),
+    ):
+        if name not in young_cols:
+            db.execute(f"ALTER TABLE young_free_pass ADD COLUMN {name} {decl}")
     shadow_cols = {row[1] for row in db.execute("PRAGMA table_info(shadow_kills)")}
     for name, decl in (
         ("cycle_id", "INTEGER"),
@@ -340,6 +353,40 @@ def _num(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_num(*values):
+    """First numeric value. Dicts with usd= are accepted. Never treats a dict as truthy."""
+    for value in values:
+        if isinstance(value, dict):
+            n = _num(value.get("usd"))
+            if n is not None:
+                return n
+            continue
+        n = _num(value)
+        if n is not None:
+            return n
+    return None
+
+
+def _liq_of(*rows) -> float | None:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        n = _first_num(row.get("liq"), row.get("liquidity_usd"), row.get("liquidity"))
+        if n is not None:
+            return n
+    return None
+
+
+def _mcap_of(*rows) -> float | None:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        n = _first_num(row.get("mcap"), row.get("mcap_usd"), row.get("marketCap"))
+        if n is not None:
+            return n
+    return None
 
 
 def _int(value):
@@ -539,8 +586,8 @@ def _insert_shadow_kill(db: sqlite3.Connection, cycle_id, now: float, row: dict,
         (
             float(row.get("ts") or now), row.get("tid"), row.get("ticker"),
             row.get("chain"), stage, reason, _num(row.get("age_minutes")),
-            _num(row.get("liq") or row.get("liquidity_usd")),
-            _num(row.get("mcap") or row.get("mcap_usd")),
+            _liq_of(row),
+            _mcap_of(row),
             _int(row.get("holders") or row.get("holder_count")),
             _num(row.get("judge_score")),
             regime or row.get("regime"),
@@ -554,6 +601,20 @@ def _insert_shadow_kill(db: sqlite3.Connection, cycle_id, now: float, row: dict,
             _json(scores) if scores else None,
             _num(row.get("noul") or row.get("soft_noul")),
             row.get("judge_verdict"),
+        ),
+    )
+    # Fill market fields left NULL by an earlier backfill from tokens-without-liq.
+    db.execute(
+        """UPDATE shadow_kills SET
+             liq = COALESCE(liq, ?),
+             mcap = COALESCE(mcap, ?),
+             holders = COALESCE(holders, ?)
+           WHERE tid IS ? AND ABS(entry_ts - ?) < 1e-6 AND IFNULL(stage,'') = IFNULL(?, '')
+             AND IFNULL(reason,'') = IFNULL(?, '')""",
+        (
+            _liq_of(row), _mcap_of(row),
+            _int(row.get("holders") or row.get("holder_count")),
+            row.get("tid"), entry_ts, stage, reason,
         ),
     )
 
@@ -646,7 +707,7 @@ def backfill_shadow_kills() -> dict:
                 "stage": stage, "reason": reason or extra.get("reason"),
                 "age_minutes": y.get("age_minutes"),
                 "ts": y.get("ts"), "entry_ts": y.get("ts"),
-                "liq": extra.get("liquidity_usd"), "mcap": extra.get("mcap_usd"),
+                "liq": _liq_of(extra, y), "mcap": _mcap_of(extra, y),
                 "holders": extra.get("holder_count"),
                 "top_10_percent": extra.get("top_10_percent"),
                 "top_wallet_percent": extra.get("top_wallet_percent"),
@@ -660,6 +721,24 @@ def backfill_shadow_kills() -> dict:
                 continue
             _insert_shadow_kill(db, y.get("cycle_id"), y.get("ts") or 0, row,
                                 regime=regimes.get(y.get("cycle_id")))
+        # Join tokens.liquidity_usd / mcap_usd onto shadow_kills rows that missed them.
+        try:
+            db.execute("""
+                UPDATE shadow_kills SET
+                  liq = COALESCE(liq, (
+                    SELECT t.liquidity_usd FROM tokens t
+                    WHERE t.tid = shadow_kills.tid AND t.liquidity_usd IS NOT NULL
+                    ORDER BY ABS(t.ts - shadow_kills.ts) LIMIT 1
+                  )),
+                  mcap = COALESCE(mcap, (
+                    SELECT t.mcap_usd FROM tokens t
+                    WHERE t.tid = shadow_kills.tid AND t.mcap_usd IS NOT NULL
+                    ORDER BY ABS(t.ts - shadow_kills.ts) LIMIT 1
+                  ))
+                WHERE liq IS NULL OR mcap IS NULL
+            """)
+        except Exception as e:
+            log.warning("shadow kills liq/mcap backfill join failed: %s", safe_err(e))
         db.commit()
         after = db.execute("SELECT COUNT(*) FROM shadow_kills").fetchone()[0]
         inserted = max(0, after - before)
@@ -667,6 +746,67 @@ def backfill_shadow_kills() -> dict:
     except Exception as e:
         log.warning("shadow kills backfill failed: %s", safe_err(e))
         return {"inserted": 0, "skipped": skipped, "total": 0, "error": safe_err(e)}
+
+
+def _patch_market_fields(stats: dict, soft_rows: list | None, ts: float) -> None:
+    """Fill NULL liq/mcap on tokens / young_free_pass / shadow_kills for an existing cycle.
+
+    Used when log backfill skips a duplicate cycle (week 2026-41 rows were written
+    before tokens stored these columns). Fail open.
+    """
+    if not stats:
+        return
+    try:
+        db = _connect()
+        crow = db.execute(
+            "SELECT id FROM cycles WHERE ts_sec = ? OR ABS(ts - ?) < ? LIMIT 1",
+            (int(ts), float(ts), CYCLE_DEDUP_SEC),
+        ).fetchone()
+        cycle_id = int(crow["id"]) if crow else None
+        rows = []
+        for src in (stats.get("tokens") or [], soft_rows or [], stats.get("young_free") or []):
+            for row in src:
+                if isinstance(row, dict) and row.get("tid"):
+                    rows.append(row)
+        for row in rows:
+            liq = _liq_of(row)
+            mcap = _mcap_of(row)
+            if liq is None and mcap is None:
+                continue
+            tid = row.get("tid")
+            if cycle_id is not None:
+                db.execute(
+                    """UPDATE tokens SET
+                         liquidity_usd = COALESCE(liquidity_usd, ?),
+                         mcap_usd = COALESCE(mcap_usd, ?)
+                       WHERE tid IS ? AND (cycle_id IS ? OR ABS(ts - ?) < ?)""",
+                    (liq, mcap, tid, cycle_id, float(ts), CYCLE_DEDUP_SEC),
+                )
+                exists = db.execute(
+                    """SELECT 1 FROM tokens WHERE tid IS ?
+                         AND (cycle_id IS ? OR ABS(ts - ?) < ?) LIMIT 1""",
+                    (tid, cycle_id, float(ts), CYCLE_DEDUP_SEC),
+                ).fetchone()
+                kind = row.get("stage") or row.get("kind") or "chain"
+                if not exists and kind in ("judged", "soft", "judge_error", "chain"):
+                    _insert_token(db, cycle_id, _token_from_stats_row(row, ts, kind))
+                db.execute(
+                    """UPDATE young_free_pass SET
+                         liquidity_usd = COALESCE(liquidity_usd, ?),
+                         mcap_usd = COALESCE(mcap_usd, ?)
+                       WHERE tid IS ? AND cycle_id IS ?""",
+                    (liq, mcap, tid, cycle_id),
+                )
+            db.execute(
+                """UPDATE shadow_kills SET
+                     liq = COALESCE(liq, ?),
+                     mcap = COALESCE(mcap, ?)
+                   WHERE tid IS ?""",
+                (liq, mcap, tid),
+            )
+        db.commit()
+    except Exception as e:
+        log.warning("market field patch failed: %s", safe_err(e))
 
 
 def on_soft_token(
@@ -684,9 +824,14 @@ def on_soft_token(
     holder_count=None,
     soft_scores=None,
     ts=None,
+    liquidity_usd=None,
+    mcap_usd=None,
+    liq=None,
+    mcap=None,
 ) -> None:
     """Buffer one soft-killed token. Flushed by on_cycle. Hook next to `soft tid=`."""
     cid = chain_id_of(tid=tid, net=net)
+    market = {"liq": liq, "liquidity_usd": liquidity_usd, "mcap": mcap, "mcap_usd": mcap_usd}
     _pending_soft.append({
         "ts": float(ts) if ts is not None else time.time(),
         "kind": "soft",
@@ -697,6 +842,8 @@ def on_soft_token(
         "reason": reason,
         "noul": _num(noul),
         "age_minutes": _num(age_minutes),
+        "liquidity_usd": _liq_of(market),
+        "mcap_usd": _mcap_of(market),
         "top_10_percent": _num(top_10_percent),
         "top_wallet_percent": _num(top_wallet_percent),
         "developer_holding_percentage": _num(developer_holding_percentage),
@@ -763,7 +910,9 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
             stage = row.get("stage")
             if stage == "soft" and row.get("tid") in written_tids:
                 continue
-            if stage not in ("judged", "soft", "judge_error"):
+            # Persist chain rows too: backtest quartiles join tokens.liquidity_usd /
+            # mcap_usd onto shadow_kills. Dropping chain left those buckets at n=0.
+            if stage not in ("judged", "soft", "judge_error", "chain"):
                 continue
             _insert_token(db, cycle_id, _token_from_stats_row(row, now, stage))
         later_by_tid = {r.get("tid"): r for r in tokens if r.get("tid")}
@@ -771,16 +920,18 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
             later = later_by_tid.get(y.get("tid"))
             outcome, reason = classify_young_outcome(later)
             cid = chain_id_of(tid=y.get("tid"), net=y.get("net"))
+            market = later if isinstance(later, dict) else {}
             db.execute(
                 """INSERT INTO young_free_pass (
                      cycle_id, ts, tid, chain_id, chain, ticker,
-                     age_minutes, outcome, reason
-                   ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                     age_minutes, outcome, reason, liquidity_usd, mcap_usd
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     cycle_id, now, y.get("tid"), cid,
                     chain_name(net=cid, tid=y.get("tid"), fallback=y.get("chain")),
                     y.get("ticker"), _num(y.get("age_minutes")),
                     outcome, reason,
+                    _liq_of(y, market), _mcap_of(y, market),
                 ),
             )
         db.commit()
@@ -827,6 +978,8 @@ def _token_from_stats_row(row: dict, now: float, kind: str) -> dict:
         "reason": row.get("reason"),
         "noul": _num(row.get("soft_noul")),
         "age_minutes": _num(row.get("age_minutes")),
+        "liquidity_usd": _liq_of(row),
+        "mcap_usd": _mcap_of(row),
         "top_10_percent": _num(row.get("top_10_percent")),
         "top_wallet_percent": _num(row.get("top_wallet_percent")),
         "developer_holding_percentage": _num(row.get("developer_holding_percentage")),
@@ -844,14 +997,15 @@ def _insert_token(db: sqlite3.Connection, cycle_id: int, row: dict) -> None:
     db.execute(
         """INSERT INTO tokens (
              cycle_id, ts, kind, tid, chain_id, chain, ticker, reason, noul,
-             age_minutes, top_10_percent, top_wallet_percent,
+             age_minutes, liquidity_usd, mcap_usd, top_10_percent, top_wallet_percent,
              developer_holding_percentage, holder_count, soft_scores_json,
              judge_verdict, judge_reason, judge_score, judge_confidence
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             cycle_id, row.get("ts"), row.get("kind"), row.get("tid"),
             row.get("chain_id"), row.get("chain"), row.get("ticker"),
             row.get("reason"), row.get("noul"), row.get("age_minutes"),
+            _liq_of(row), _mcap_of(row),
             row.get("top_10_percent"), row.get("top_wallet_percent"),
             row.get("developer_holding_percentage"), row.get("holder_count"),
             _json(scores),
@@ -1064,6 +1218,8 @@ def _token_dict(r: sqlite3.Row) -> dict:
         "reason": r["reason"],
         "noul": r["noul"],
         "age_minutes": r["age_minutes"],
+        "liquidity_usd": r["liquidity_usd"] if "liquidity_usd" in r.keys() else None,
+        "mcap_usd": r["mcap_usd"] if "mcap_usd" in r.keys() else None,
         "top_10_percent": r["top_10_percent"],
         "top_wallet_percent": r["top_wallet_percent"],
         "developer_holding_percentage": r["developer_holding_percentage"],
@@ -1202,6 +1358,8 @@ def _young_since(since_ts: float, until_ts: float | None = None) -> list[dict]:
         "age_minutes": r["age_minutes"],
         "outcome": r["outcome"],
         "reason": r["reason"],
+        "liquidity_usd": r["liquidity_usd"] if "liquidity_usd" in r.keys() else None,
+        "mcap_usd": r["mcap_usd"] if "mcap_usd" in r.keys() else None,
     } for r in rows]
 
 
@@ -1961,6 +2119,7 @@ SOFT_RE = re.compile(
 )
 FREE_PASS_RE = re.compile(
     r"free tid=(\S+) reason=pass age_minutes=(\S+)"
+    r"(?: liquidity_usd=(\S+) volume_usd=(\S+) mcap_usd=(\S+))?"
 )
 CHAIN_RE = re.compile(r"chain tid=(\S+) ticker=(.+?) reason=(\S+)")
 TRADE_RE = re.compile(r"trade tid=(\S+) ticker=(.+?) reason=(\S+)")
@@ -2021,7 +2180,16 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
             young.append(y)
             # classify later via on_cycle using pending_later as tokens
             if later and later.get("tid") == tid:
-                pass
+                if later.get("liquidity_usd") is None and y.get("liquidity_usd") is not None:
+                    later["liquidity_usd"] = y.get("liquidity_usd")
+                if later.get("mcap_usd") is None and y.get("mcap_usd") is not None:
+                    later["mcap_usd"] = y.get("mcap_usd")
+        for s in pending_soft:
+            y = pending_young.get(s.get("tid")) or {}
+            if s.get("liquidity_usd") is None and y.get("liquidity_usd") is not None:
+                s["liquidity_usd"] = y.get("liquidity_usd")
+            if s.get("mcap_usd") is None and y.get("mcap_usd") is not None:
+                s["mcap_usd"] = y.get("mcap_usd")
         tokens = list(pending_later.values())
         # Soft rows that never got a later token still need a tokens entry.
         for s in pending_soft:
@@ -2034,6 +2202,8 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
                 "top_wallet_percent": s.get("top_wallet_percent"),
                 "developer_holding_percentage": s.get("developer_holding_percentage"),
                 "holder_count": s.get("holder_count"),
+                "liquidity_usd": s.get("liquidity_usd"),
+                "mcap_usd": s.get("mcap_usd"),
             })
         stats = dict(stats)
         stats["tokens"] = tokens
@@ -2111,6 +2281,13 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
                 "developer_holding_percentage": row["developer_holding_percentage"],
                 "holder_count": row["holder_count"],
             }
+            y = pending_young.get(tid) or {}
+            if y.get("liquidity_usd") is not None:
+                row["liquidity_usd"] = y.get("liquidity_usd")
+                pending_later[tid]["liquidity_usd"] = y.get("liquidity_usd")
+            if y.get("mcap_usd") is not None:
+                row["mcap_usd"] = y.get("mcap_usd")
+                pending_later[tid]["mcap_usd"] = y.get("mcap_usd")
             continue
 
         m = FREE_PASS_RE.search(line)
@@ -2124,6 +2301,8 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
                     "net": chain_id_of(tid=tid),
                     "age_minutes": age,
                     "chain": chain_name(tid=tid),
+                    "liquidity_usd": _num(m.group(3)) if m.lastindex and m.lastindex >= 3 else None,
+                    "mcap_usd": _num(m.group(5)) if m.lastindex and m.lastindex >= 5 else None,
                 }
             continue
 
@@ -2156,6 +2335,11 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
             }
             if tid in pending_young:
                 pending_young[tid]["ticker"] = ticker
+                y = pending_young[tid]
+                if y.get("liquidity_usd") is not None:
+                    pending_later[tid]["liquidity_usd"] = y.get("liquidity_usd")
+                if y.get("mcap_usd") is not None:
+                    pending_later[tid]["mcap_usd"] = y.get("mcap_usd")
             continue
 
         m = TRADE_RE.search(line)
@@ -2220,6 +2404,10 @@ def backfill_text(text: str, *, source: str = "backfill") -> dict:
     for item in parsed:
         if cycle_exists(item["ts"]):
             skipped += 1
+            try:
+                _patch_market_fields(item.get("stats") or {}, item.get("soft") or [], item["ts"])
+            except Exception as e:
+                log.warning("market field patch failed: %s", safe_err(e))
             _pending_soft.clear()
             continue
         for s in item["soft"]:
@@ -2233,6 +2421,8 @@ def backfill_text(text: str, *, source: str = "backfill") -> dict:
                 holder_count=s.get("holder_count"),
                 soft_scores=s.get("soft_scores"),
                 ts=s.get("ts") or item["ts"],
+                liquidity_usd=s.get("liquidity_usd"),
+                mcap_usd=s.get("mcap_usd"),
             )
         cid = on_cycle(
             item["stats"], shadow=True, now=item["ts"], source=source,
