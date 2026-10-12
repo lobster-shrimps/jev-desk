@@ -283,6 +283,12 @@ def _apply_judge_verdicts(stats, survivors, order, pick_answers, pick_error):
         row["judge_reason"] = reason
         row["judge_score"] = score
         row["judge_confidence"] = confidence
+        shape = _as_dict(ans.get("shape"))
+        probs = shape.get("probabilities")
+        if isinstance(probs, dict) and probs.get("crowd") is not None:
+            crowd = _as_number(probs.get("crowd"))
+            if crowd is not None:
+                row["crowd_prob"] = crowd
         _log_judge_line(
             tid=tid, ticker=ticker, verdict=verdict,
             score=score, confidence=confidence, reason=reason,
@@ -372,9 +378,17 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         if judge_confidence is not None:
             row["judge_confidence"] = judge_confidence
         for k in ("net", "top_10_percent", "top_wallet_percent",
-                  "developer_holding_percentage", "holder_count"):
+                  "developer_holding_percentage", "holder_count",
+                  "crowd_prob"):
             if t.get(k) is not None:
                 row[k] = t.get(k)
+        xa = t.get("x_account")
+        if isinstance(xa, dict):
+            row["x_present"] = 1
+            if xa.get("followers") is not None:
+                row["x_followers"] = xa.get("followers")
+            if xa.get("own_posts_count") is not None:
+                row["x_own_posts"] = xa.get("own_posts_count")
         stats["tokens"].append(row)
 
     ids, gt_txns_cache = universe(limiter=gt_limiter, fomo=fomo)  # fresh + trending pools + FOMO feeds, budget-aware
@@ -1007,6 +1021,11 @@ def main(fomo, judge, desk, shadow=True, once=False):
                 "soft": {},
                 "tokens": []
             })
+        try:
+            import backtest_signals
+            backtest_signals.maybe_start_weekly(now=_now())
+        except Exception as e:
+            log.warning("weekly backtest: %s", safe_err(e))
         if once:
             return
         

@@ -46,6 +46,12 @@ TREND_MIN_PRIOR_DAYS = 3
 MOMENTUM_KEY = "momentum_already_spent"
 NON_KILL_REASONS = frozenset({"pass", "free_passed"})
 CYCLE_DEDUP_SEC = 1.5
+YOUNG_MAX_MINUTES = 60
+CHAIN_SHADOW_REASONS = frozenset({
+    "top_wallet", "top_10", "top_wallet_unverified",
+    "holders", "holders_pending",
+})
+SHAPE_REASONS = frozenset({"shape", "shape_weak"})
 
 # Notable-change gates for the trends section (relative or absolute).
 NOTABLE_JUDGED_REL = 0.30
@@ -208,6 +214,25 @@ def _init_schema(db: sqlite3.Connection) -> None:
       exchange TEXT,
       resolved_at REAL NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS shadow_kills (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      tid TEXT,
+      ticker TEXT,
+      chain TEXT,
+      stage TEXT,
+      reason TEXT,
+      age_minutes REAL,
+      liq REAL,
+      mcap REAL,
+      holders INTEGER,
+      judge_score REAL,
+      regime TEXT,
+      entry_ts REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_shadow_kills_ts ON shadow_kills(ts);
+    CREATE INDEX IF NOT EXISTS idx_shadow_kills_tid ON shadow_kills(tid);
     """)
     cols = {row[1] for row in db.execute("PRAGMA table_info(cycles)")}
     if "ts_sec" not in cols:
@@ -231,6 +256,27 @@ def _init_schema(db: sqlite3.Connection) -> None:
     ):
         if name not in token_cols:
             db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {decl}")
+    shadow_cols = {row[1] for row in db.execute("PRAGMA table_info(shadow_kills)")}
+    for name, decl in (
+        ("cycle_id", "INTEGER"),
+        ("top_10_percent", "REAL"),
+        ("top_wallet_percent", "REAL"),
+        ("developer_holding_percentage", "REAL"),
+        ("crowd_prob", "REAL"),
+        ("momentum_noul", "REAL"),
+        ("x_present", "INTEGER"),
+        ("x_followers", "REAL"),
+        ("x_own_posts", "REAL"),
+        ("soft_scores_json", "TEXT"),
+        ("noul", "REAL"),
+        ("judge_verdict", "TEXT"),
+    ):
+        if name not in shadow_cols:
+            db.execute(f"ALTER TABLE shadow_kills ADD COLUMN {name} {decl}")
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_kills_dedup "
+        "ON shadow_kills(tid, entry_ts, stage, IFNULL(reason, ''))"
+    )
     db.commit()
 
 
@@ -394,6 +440,234 @@ def classify_young_outcome(row: dict | None) -> tuple[str, str | None]:
     return "other", reason
 
 
+def _is_young(age) -> bool:
+    n = _num(age)
+    return n is not None and n < YOUNG_MAX_MINUTES
+
+
+def _is_chain_shadow_reason(reason) -> bool:
+    if not reason:
+        return False
+    r = str(reason)
+    if r in CHAIN_SHADOW_REASONS:
+        return True
+    return r.startswith("holders")
+
+
+def is_shadow_candidate(row: dict | None) -> bool:
+    """Young chain (top_wallet/top_10/holders*) or soft kills, plus judged pass / judge-error controls."""
+    if not row:
+        return False
+    if not _is_young(row.get("age_minutes")):
+        return False
+    stage = row.get("stage") or row.get("kind")
+    reason = row.get("reason")
+    verdict = row.get("judge_verdict")
+    if stage == "chain" and _is_chain_shadow_reason(reason):
+        return True
+    if stage == "soft":
+        return True
+    if stage == "judge_error" or verdict == "error":
+        return True
+    if stage == "judged" and verdict != "pick":
+        return True
+    return False
+
+
+def _crowd_prob_of(row: dict) -> float | None:
+    n = _num(row.get("crowd_prob"))
+    if n is not None:
+        return n
+    scores = row.get("soft_scores") or {}
+    if isinstance(scores, str):
+        scores = _loads(scores)
+    n = _num((scores or {}).get("crowd"))
+    if n is not None:
+        return n
+    if (row.get("reason") or "") in SHAPE_REASONS:
+        return _num(row.get("noul") or row.get("soft_noul"))
+    return None
+
+
+def _momentum_of_row(row: dict) -> float | None:
+    scores = row.get("soft_scores") or {}
+    if isinstance(scores, str):
+        scores = _loads(scores)
+    n = _num((scores or {}).get(MOMENTUM_KEY))
+    if n is not None:
+        return n
+    if row.get("reason") == MOMENTUM_KEY:
+        return _num(row.get("noul") or row.get("soft_noul"))
+    return _num(row.get("momentum_noul"))
+
+
+def _x_fields(row: dict) -> tuple:
+    xa = row.get("x_account")
+    if isinstance(xa, dict):
+        present = 1
+        followers = _num(xa.get("followers"))
+        posts = _num(xa.get("own_posts_count"))
+        return present, followers, posts
+    if row.get("x_present"):
+        return 1, _num(row.get("x_followers")), _num(row.get("x_own_posts"))
+    present = row.get("x_present")
+    if present in (0, "0", False):
+        return 0, None, None
+    return None, _num(row.get("x_followers")), _num(row.get("x_own_posts"))
+
+
+def _insert_shadow_kill(db: sqlite3.Connection, cycle_id, now: float, row: dict,
+                        regime: str | None = None) -> None:
+    """Idempotent insert. Failures are the caller's to swallow."""
+    stage = row.get("stage") or row.get("kind")
+    reason = row.get("reason")
+    if stage == "judged" and not reason:
+        reason = row.get("judge_verdict") or "pass"
+    if stage == "judge_error" and not reason:
+        reason = "error"
+    entry_ts = float(row.get("entry_ts") or now)
+    x_present, x_followers, x_own_posts = _x_fields(row)
+    scores = row.get("soft_scores") or {}
+    db.execute(
+        """INSERT OR IGNORE INTO shadow_kills (
+             ts, tid, ticker, chain, stage, reason, age_minutes, liq, mcap, holders,
+             judge_score, regime, entry_ts, cycle_id, top_10_percent, top_wallet_percent,
+             developer_holding_percentage, crowd_prob, momentum_noul, x_present,
+             x_followers, x_own_posts, soft_scores_json, noul, judge_verdict
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            float(row.get("ts") or now), row.get("tid"), row.get("ticker"),
+            row.get("chain"), stage, reason, _num(row.get("age_minutes")),
+            _num(row.get("liq") or row.get("liquidity_usd")),
+            _num(row.get("mcap") or row.get("mcap_usd")),
+            _int(row.get("holders") or row.get("holder_count")),
+            _num(row.get("judge_score")),
+            regime or row.get("regime"),
+            entry_ts, cycle_id,
+            _num(row.get("top_10_percent")),
+            _num(row.get("top_wallet_percent")),
+            _num(row.get("developer_holding_percentage")),
+            _crowd_prob_of(row),
+            _momentum_of_row(row),
+            x_present, x_followers, x_own_posts,
+            _json(scores) if scores else None,
+            _num(row.get("noul") or row.get("soft_noul")),
+            row.get("judge_verdict"),
+        ),
+    )
+
+
+def _insert_shadow_kills_from_stats(db: sqlite3.Connection, cycle_id, now: float,
+                                    stats: dict) -> None:
+    for row in stats.get("tokens") or []:
+        if not isinstance(row, dict):
+            continue
+        if not is_shadow_candidate(row):
+            continue
+        cid = chain_id_of(tid=row.get("tid"), net=row.get("net"))
+        enriched = dict(row)
+        enriched.setdefault("chain", chain_name(net=cid, tid=row.get("tid"),
+                                                fallback=row.get("chain")))
+        enriched.setdefault("entry_ts", now)
+        _insert_shadow_kill(db, cycle_id, now, enriched)
+
+
+def _stamp_shadow_regime(cycle_id: int) -> None:
+    try:
+        db = _connect()
+        row = db.execute(
+            "SELECT regime FROM market_regimes WHERE cycle_id = ? ORDER BY ts DESC LIMIT 1",
+            (cycle_id,),
+        ).fetchone()
+        if not row:
+            return
+        db.execute(
+            "UPDATE shadow_kills SET regime = ? WHERE cycle_id = ? AND regime IS NULL",
+            (row["regime"], cycle_id),
+        )
+        db.commit()
+    except Exception as e:
+        log.warning("shadow kills regime stamp failed: %s", safe_err(e))
+
+
+def backfill_shadow_kills() -> dict:
+    """Build shadow_kills from tokens + young_free_pass. Idempotent. Fail open."""
+    inserted = 0
+    skipped = 0
+    try:
+        db = _connect()
+        tokens = _tokens_since(0)
+        young = _young_since(0)
+        regimes = {}
+        try:
+            for r in db.execute("SELECT cycle_id, regime FROM market_regimes"):
+                if r["cycle_id"] is not None:
+                    regimes[r["cycle_id"]] = r["regime"]
+        except Exception:
+            regimes = {}
+        before = db.execute("SELECT COUNT(*) FROM shadow_kills").fetchone()[0]
+        for t in tokens:
+            row = dict(t)
+            row["stage"] = t.get("kind")
+            if not is_shadow_candidate(row):
+                skipped += 1
+                continue
+            row["entry_ts"] = t.get("ts")
+            _insert_shadow_kill(db, t.get("cycle_id"), t.get("ts") or 0, row,
+                                regime=regimes.get(t.get("cycle_id")))
+        by_tid = {}
+        for t in tokens:
+            if t.get("tid"):
+                by_tid.setdefault(t["tid"], []).append(t)
+        for y in young:
+            outcome = y.get("outcome")
+            reason = y.get("reason")
+            if not _is_young(y.get("age_minutes")):
+                continue
+            stage = None
+            if outcome == "chain" and _is_chain_shadow_reason(reason):
+                stage = "chain"
+            elif outcome == "soft":
+                stage = "soft"
+            elif outcome == "judged":
+                stage = "judged"
+            elif outcome == "judge_error":
+                stage = "judge_error"
+            else:
+                continue
+            matches = by_tid.get(y.get("tid")) or []
+            extra = {}
+            if matches:
+                extra = min(matches, key=lambda t: abs((t.get("ts") or 0) - (y.get("ts") or 0)))
+            row = {
+                "tid": y.get("tid"), "ticker": y.get("ticker") or extra.get("ticker"),
+                "chain": y.get("chain") or extra.get("chain"),
+                "stage": stage, "reason": reason or extra.get("reason"),
+                "age_minutes": y.get("age_minutes"),
+                "ts": y.get("ts"), "entry_ts": y.get("ts"),
+                "liq": extra.get("liquidity_usd"), "mcap": extra.get("mcap_usd"),
+                "holders": extra.get("holder_count"),
+                "top_10_percent": extra.get("top_10_percent"),
+                "top_wallet_percent": extra.get("top_wallet_percent"),
+                "developer_holding_percentage": extra.get("developer_holding_percentage"),
+                "soft_scores": extra.get("soft_scores"),
+                "noul": extra.get("noul"),
+                "judge_score": extra.get("judge_score"),
+                "judge_verdict": extra.get("judge_verdict"),
+            }
+            if not is_shadow_candidate(row):
+                continue
+            _insert_shadow_kill(db, y.get("cycle_id"), y.get("ts") or 0, row,
+                                regime=regimes.get(y.get("cycle_id")))
+        db.commit()
+        after = db.execute("SELECT COUNT(*) FROM shadow_kills").fetchone()[0]
+        inserted = max(0, after - before)
+        return {"inserted": inserted, "skipped": skipped, "total": after}
+    except Exception as e:
+        log.warning("shadow kills backfill failed: %s", safe_err(e))
+        return {"inserted": 0, "skipped": skipped, "total": 0, "error": safe_err(e)}
+
+
 def on_soft_token(
     *,
     tid=None,
@@ -509,6 +783,11 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
                 ),
             )
         db.commit()
+        try:
+            _insert_shadow_kills_from_stats(db, cycle_id, now, stats)
+            db.commit()
+        except Exception as e:
+            log.warning("shadow kills write failed: %s", safe_err(e))
     except Exception as e:
         log.warning("cycle history write failed: %s", safe_err(e))
         _pending_soft.clear()
@@ -520,9 +799,18 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
         except Exception as e:
             log.info("coinalyze: skipped (%s)", safe_err(e))
         try:
+            _stamp_shadow_regime(cycle_id)
+        except Exception as e:
+            log.warning("shadow kills regime: %s", safe_err(e))
+        try:
             maybe_persist_briefing(now=now, localtime=localtime)
         except Exception as e:
             log.warning("morning briefing failed: %s", safe_err(e))
+    else:
+        try:
+            _stamp_shadow_regime(cycle_id)
+        except Exception as e:
+            log.warning("shadow kills regime: %s", safe_err(e))
     return cycle_id
 
 
@@ -753,6 +1041,113 @@ def _token_dict(r: sqlite3.Row) -> dict:
         "judge_score": r["judge_score"] if "judge_score" in r.keys() else None,
         "judge_confidence": r["judge_confidence"] if "judge_confidence" in r.keys() else None,
     }
+
+
+def _shadow_kill_dict(r: sqlite3.Row) -> dict:
+    keys = r.keys()
+    scores = _loads(r["soft_scores_json"]) if "soft_scores_json" in keys else {}
+    return {
+        "id": r["id"],
+        "cycle_id": r["cycle_id"] if "cycle_id" in keys else None,
+        "ts": r["ts"],
+        "tid": r["tid"],
+        "ticker": r["ticker"],
+        "chain": r["chain"],
+        "stage": r["stage"],
+        "reason": r["reason"],
+        "age_minutes": r["age_minutes"],
+        "liq": r["liq"],
+        "mcap": r["mcap"],
+        "holders": r["holders"],
+        "judge_score": r["judge_score"],
+        "regime": r["regime"],
+        "entry_ts": r["entry_ts"],
+        "top_10_percent": r["top_10_percent"] if "top_10_percent" in keys else None,
+        "top_wallet_percent": r["top_wallet_percent"] if "top_wallet_percent" in keys else None,
+        "developer_holding_percentage": (
+            r["developer_holding_percentage"] if "developer_holding_percentage" in keys else None
+        ),
+        "crowd_prob": r["crowd_prob"] if "crowd_prob" in keys else None,
+        "momentum_noul": r["momentum_noul"] if "momentum_noul" in keys else None,
+        "x_present": r["x_present"] if "x_present" in keys else None,
+        "x_followers": r["x_followers"] if "x_followers" in keys else None,
+        "x_own_posts": r["x_own_posts"] if "x_own_posts" in keys else None,
+        "soft_scores": scores,
+        "noul": r["noul"] if "noul" in keys else None,
+        "judge_verdict": r["judge_verdict"] if "judge_verdict" in keys else None,
+    }
+
+
+def shadow_kills_since(since_ts: float, until_ts: float | None = None) -> list[dict]:
+    try:
+        if until_ts is None:
+            rows = _rows("SELECT * FROM shadow_kills WHERE ts >= ? ORDER BY ts", (since_ts,))
+        else:
+            rows = _rows(
+                "SELECT * FROM shadow_kills WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                (since_ts, until_ts),
+            )
+        return [_shadow_kill_dict(r) for r in rows]
+    except Exception as e:
+        log.warning("shadow kills read failed: %s", safe_err(e))
+        return []
+
+
+def _latest_backtest_link() -> str | None:
+    try:
+        import backtest_signals
+        path = backtest_signals.latest_path()
+        if path is None:
+            return None
+        return str(path)
+    except Exception:
+        dest = outbox_dir() / "backtests"
+        if not dest.exists():
+            return None
+        files = sorted(dest.glob("*.md"))
+        if not files:
+            return None
+        return str(files[-1])
+
+
+def _shadow_kills_window(since_ts: float, now: float) -> dict:
+    rows = shadow_kills_since(since_ts, now)
+    by_reason: dict[str, dict] = {}
+    for row in rows:
+        reason = row.get("reason") or (row.get("stage") or "other")
+        bag = by_reason.setdefault(reason, {
+            "n": 0, "with_outcome": 0, "wins": 0, "pending": 0,
+            "mean_peak_x": None, "mean_sim_current": None, "mean_sim_trail": None,
+            "_peaks": [], "_cur": [], "_tr": [],
+        })
+        bag["n"] += 1
+        outcome = None
+        try:
+            import outcomes
+            outcome = outcomes.get_cached(row.get("tid"), row.get("entry_ts") or row.get("ts"))
+        except Exception:
+            outcome = None
+        if outcome and outcome.get("complete"):
+            bag["with_outcome"] += 1
+            peak = outcome.get("peak_x")
+            if peak is not None:
+                bag["_peaks"].append(float(peak))
+            if outcome.get("sim_current_pnl") is not None:
+                bag["_cur"].append(float(outcome["sim_current_pnl"]))
+            if outcome.get("sim_trail_pnl") is not None:
+                bag["_tr"].append(float(outcome["sim_trail_pnl"]))
+            if peak is not None and peak >= 2:
+                bag["wins"] += 1
+        else:
+            bag["pending"] += 1
+    for bag in by_reason.values():
+        peaks, cur, tr = bag.pop("_peaks"), bag.pop("_cur"), bag.pop("_tr")
+        bag["mean_peak_x"] = (sum(peaks) / len(peaks)) if peaks else None
+        bag["mean_sim_current"] = (sum(cur) / len(cur)) if cur else None
+        bag["mean_sim_trail"] = (sum(tr) / len(tr)) if tr else None
+        n = bag["with_outcome"]
+        bag["win_pct"] = (bag["wins"] / n * 100.0) if n else None
+    return {"n": len(rows), "by_reason": by_reason, "rows": rows}
 
 
 def _young_since(since_ts: float, until_ts: float | None = None) -> list[dict]:
@@ -1004,6 +1399,8 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "uptime": uptime,
         "shadow": _shadow_window(since_ts, now),
         "regime": _regime_window(since_ts, now),
+        "shadow_kills": _shadow_kills_window(since_ts, now),
+        "latest_backtest": _latest_backtest_link(),
     }
 
 
@@ -1355,6 +1752,31 @@ def render_briefing_md(payload: dict) -> str:
         "## Market regime (log-only)",
     ]
     lines.extend(_render_regime_md(w.get("regime") or {}))
+    lines += ["", "## Killed young tokens (6h outcome)", ""]
+    sk = w.get("shadow_kills") or {}
+    by_reason = sk.get("by_reason") or {}
+    if not by_reason:
+        lines.append("No shadow-tracked young kills in the window.")
+    else:
+        lines.append("| reason | n | with 6h | pending | win% (peak≥2x) | mean sim_current $ | mean sim_trail $ |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for reason, bag in sorted(by_reason.items(), key=lambda kv: (-kv[1].get("n", 0), kv[0])):
+            win = bag.get("win_pct")
+            win_s = "—" if win is None else f"{win:.0f}%"
+            cur = bag.get("mean_sim_current")
+            tr = bag.get("mean_sim_trail")
+            cur_s = "—" if cur is None else f"{cur:+.2f}"
+            tr_s = "—" if tr is None else f"{tr:+.2f}"
+            lines.append(
+                f"| {reason} | {bag.get('n', 0)} | {bag.get('with_outcome', 0)} "
+                f"| {bag.get('pending', 0)} | {win_s} | {cur_s} | {tr_s} |"
+            )
+        lines.append(f"n={sk.get('n', 0)}; cells with n<10 are noisy — do not retune on them.")
+    latest = w.get("latest_backtest") or payload.get("latest_backtest")
+    if latest:
+        lines.append(f"Latest backtest: {latest}")
+    else:
+        lines.append("Latest backtest: (none yet)")
     lines += [
         "",
         "## Trends vs prior 7 days",
@@ -1786,6 +2208,11 @@ def backfill_text(text: str, *, source: str = "backfill") -> dict:
             inserted += 1
         else:
             skipped += 1
+    shadow = {"inserted": 0, "skipped": 0, "total": 0}
+    try:
+        shadow = backfill_shadow_kills()
+    except Exception as e:
+        log.warning("shadow kills backfill failed: %s", safe_err(e))
     return {
         "inserted": inserted,
         "skipped": skipped,
@@ -1793,6 +2220,7 @@ def backfill_text(text: str, *, source: str = "backfill") -> dict:
         "unparsed": meta["unparsed"],
         "unparsed_soft": meta["unparsed_soft"],
         "unparsed_chain": meta["unparsed_chain"],
+        "shadow_kills": shadow,
     }
 
 

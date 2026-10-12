@@ -10,6 +10,7 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
   POST /book/release   RISK calls this the moment a close is filled. Nothing else does.
   GET  /ops            ops panel HTML
   GET  /ops/briefing   last-24h briefing + 7-day trends
+  GET  /ops/backtest   latest weekly signal-backtest JSON
   GET  /api/state      outbox/state.json for ops panel
 """
 import json
@@ -82,6 +83,35 @@ async def ops_briefing():
             "last_24h": {},
             "trends": {"days": [], "flags": [], "notable": []},
             "markdown": "",
+        })
+
+
+@app.get("/ops/backtest")
+async def ops_backtest():
+    """Latest weekly signal backtest JSON. Local-only (bind 127.0.0.1). Fail open."""
+    try:
+        import backtest_signals
+        data = backtest_signals.latest_payload()
+        if data is None:
+            return JSONResponse({
+                "error": "no backtest yet",
+                "n": 0,
+                "winners": {"rows": []},
+                "kill_reasons": [],
+                "judge_buckets": [],
+                "features": {},
+                "n_caveat": backtest_signals.N_CAVEAT,
+                "shadow_only": True,
+            })
+        return JSONResponse(data)
+    except Exception as e:
+        log.warning("ops backtest: %s", safe_err(e))
+        return JSONResponse({
+            "error": "backtest unavailable",
+            "n": 0,
+            "winners": {"rows": []},
+            "kill_reasons": [],
+            "shadow_only": True,
         })
 
 
