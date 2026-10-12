@@ -18,6 +18,7 @@ import requests
 from fomo_api import Fomo                      # Privy bearer out of Chrome over CDP
 from secret_utils import safe_err
 import gt_info_cache
+import x_lookup
 
 log = logging.getLogger("collect")
 
@@ -667,7 +668,8 @@ def normalise(tid: str, m: dict) -> dict:
             "fomo_top10_holders_percent": m.get("top10_holders_percent"),
             "change": {"5m": m["change"].get(300), "1h": m["change"].get(3600),
                        "4h": m["change"].get(14400), "24h": m["change"].get(86400)},
-            "age_minutes": age_minutes(m["created"])}
+            "age_minutes": age_minutes(m["created"]),
+            "fomo_twitter": m.get("twitter")}
 
 
 def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
@@ -821,6 +823,7 @@ def trade_counts(t: dict, gt_txns_cache: dict = None) -> tuple[dict, str]:
             return (total_txns, liq)  # tuple sorts by first element, then second
         
         best_pair = max(data, key=pair_score)
+        t["dex_twitter"] = _dex_twitter_from_pair(best_pair)
         
         txns = best_pair.get("txns") or {}
         h1 = txns.get("h1") or {}
@@ -836,7 +839,8 @@ def trade_counts(t: dict, gt_txns_cache: dict = None) -> tuple[dict, str]:
             "buys_h6": h6.get("buys"), 
             "sells_h6": h6.get("sells"),
             "trades_h24": buys_h24 + sells_h24,  # Always a number, never None
-            "pair_address": best_pair.get("pairAddress")  # Store for EVM holder checks
+            "pair_address": best_pair.get("pairAddress"),  # Store for EVM holder checks
+            "dex_twitter": t.get("dex_twitter"),
         }, 'ok'
     except (TypeError, AttributeError, KeyError, ValueError) as e:
         log.warning("DexScreener data parse error for %s (%s): %s", t["ticker"], t["addr"], e)
@@ -1048,6 +1052,7 @@ def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict) -> dict:
         d["top_wallet_percent"] = preserved_top_wallet
     if preserved_top_10 is not None:
         d["top_10_percent"] = preserved_top_10
+    fill_x_handle(d)
     return d
 
 
@@ -1136,6 +1141,37 @@ def clean_handle(h):
         return None
     h = h.strip().lstrip("@").split("?")[0].split("/")[0]
     return h if h and h.replace("_", "").isalnum() and len(h) <= 15 else None
+
+
+def _dex_twitter_from_pair(pair: dict):
+    """DexScreener pair info.socials[type=twitter] url or handle, else None."""
+    if not isinstance(pair, dict):
+        return None
+    info = pair.get("info") or {}
+    if not isinstance(info, dict):
+        return None
+    socials = info.get("socials") or []
+    if not isinstance(socials, list):
+        return None
+    for s in socials:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("type") or "").lower() == "twitter":
+            return s.get("url") or s.get("handle") or s.get("value")
+    return None
+
+
+def fill_x_handle(d: dict) -> dict:
+    """GT handle first; else DexScreener pair social; else FOMO twitter field."""
+    if d.get("x_handle"):
+        return d
+    for raw in (d.get("dex_twitter"), d.get("fomo_twitter")):
+        h = x_lookup.normalize_handle(raw)
+        if h:
+            d["x_handle"] = h
+            return d
+    d["x_handle"] = None
+    return d
 
 
 # Known AMM/curve programs whose PDAs should be excluded from holder concentration checks

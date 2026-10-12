@@ -28,6 +28,7 @@ from collect import (
     DossierRetryNeeded, DossierDeadlineExceeded, dex_canary_check, _clear_sol_owner_cache,
     reset_gt_info_cycle_stats, gt_info_cycle_stats,
 )
+import x_lookup
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
 from pick import pick, size_factor_for, summary
@@ -301,6 +302,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Clear Solana owner cache at start of each cycle
     _clear_sol_owner_cache()
     reset_gt_info_cycle_stats()
+    x_lookup.reset_cycle()
     
     # Item #13: Prune old EVM holder cache entries
     try:

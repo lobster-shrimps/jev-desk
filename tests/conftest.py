@@ -34,6 +34,18 @@ def isolate_gt_info_cache(tmp_path, monkeypatch):
     gt_info_cache.set_time_fn(None)
 
 
+@pytest.fixture(autouse=True)
+def isolate_x_cache(tmp_path, monkeypatch):
+    """Point the X lookup cache at a per-test SQLite file. Reset the cycle cap."""
+    monkeypatch.setenv("X_CACHE_DB", str(tmp_path / "x_cache.db"))
+    import x_lookup
+    x_lookup.reset()
+    x_lookup.set_time_fn(None)
+    yield
+    x_lookup.reset()
+    x_lookup.set_time_fn(None)
+
+
 @pytest.fixture
 def isolate_evm_state(monkeypatch):
     """
