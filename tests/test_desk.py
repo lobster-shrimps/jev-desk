@@ -730,7 +730,7 @@ class FakeFomo:
 class FakeDesk:
     def __init__(self): self.shadow, self.reports, self.sent = [], [], []
     def bank(self): return 1000.0
-    def read_x(self, h, tid=None): return None
+    def read_x(self, h, tid=None, token=None): return None
     def log_shadow(self, o, s, fomo_data=None): self.shadow.append((o, s))
     def report(self, o, s): self.reports.append((o, s))
     def send_to_seats(self, o): self.sent.append(o)

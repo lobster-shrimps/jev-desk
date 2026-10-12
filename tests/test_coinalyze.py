@@ -492,7 +492,7 @@ def test_run_once_unaffected_by_regime(hist, monkeypatch, caplog):
 
     class Desk:
         def bank(self): return 1000.0
-        def read_x(self, h, tid=None): return None
+        def read_x(self, h, tid=None, token=None): return None
         def log_shadow(self, o, s, fomo_data=None): pass
         def report(self, o, s): pass
         def send_to_seats(self, o): pass
