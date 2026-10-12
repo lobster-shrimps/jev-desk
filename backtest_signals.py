@@ -644,8 +644,9 @@ def maybe_start_weekly(now: float | None = None, *, localtime: Callable | None =
 
             def _run():
                 try:
+                    # Cache only: outcome HTTP is the off-peak / trickle worker.
                     run_backtest(days=days, now=now, week_id=week_id,
-                                 deadline=deadline, fetch=True, persist=True)
+                                 deadline=deadline, fetch=False, persist=True)
                 except Exception as e:
                     log.warning("weekly backtest: %s", safe_err(e))
 
@@ -666,9 +667,18 @@ def main(argv=None) -> int:
     )
     ap = argparse.ArgumentParser(description="Weekly signal backtest (log/analysis only)")
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS)
+    ap.add_argument("--fetch", action="store_true",
+                    help="drain pending outcome jobs (network) before the cache-only report")
     args = ap.parse_args(argv)
     try:
-        report = run_backtest(days=args.days, fetch=True, persist=True)
+        if args.fetch:
+            import outcomes
+            try:
+                outcomes.enqueue_from_history(days=args.days)
+                outcomes.drain_jobs(trickle=False)
+            except Exception as e:
+                log.warning("outcomes fetch: %s", safe_err(e))
+        report = run_backtest(days=args.days, fetch=False, persist=True)
         path = report.get("path") or ""
         log.info("wrote %s", path)
         return 0 if not report.get("error") else 1

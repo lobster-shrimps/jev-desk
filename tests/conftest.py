@@ -27,8 +27,12 @@ def isolate_outcomes(tmp_path, monkeypatch):
     """Point outcomes cache at a per-test SQLite file. No network, no weekly thread."""
     monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
     monkeypatch.setenv("BACKTEST_DISABLE", "1")
+    monkeypatch.setenv("OUTCOMES_FETCH_DISABLE", "1")
+    monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    import gt_api
     import outcomes
     import backtest_signals
+    gt_api.reset()
     outcomes.reset()
     outcomes.set_time_fn(None)
     outcomes.set_sleep_fn(lambda _d: None)

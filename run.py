@@ -9,8 +9,10 @@ Entrypoint. Wires FOMO + judge + desk into main.main().
     python run.py --bench        # print what is benched and why, then exit
 
 Weekly signal backtest (log/analysis only): the first cycle after Sunday 07:00
-local kicks python backtest_signals.py --days 7 in a time-capped background
-thread. It never uses the cycle GT limiter and never changes a kill/judge/pick.
+local writes the report from cached outcomes only (no network). Outcome OHLCV
+is fetched in OUTCOMES_WINDOW (default 01:00-06:00 local) plus a daytime trickle.
+CLI: python backtest_signals.py --days 7 [--fetch]. Never uses the cycle GT
+limiter and never changes a kill/judge/pick.
 """
 import argparse
 import logging

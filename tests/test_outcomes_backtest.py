@@ -469,6 +469,7 @@ def test_weekly_thread_sunday_after_0700(hist, tmp_path, monkeypatch):
     t.join(timeout=2)
     assert called.get("week_id") == "2026-41"
     assert called.get("days") == 7
+    assert called.get("fetch") is False
     assert (tmp_path / "backtests" / "2026-41.json").exists()
     # Second kick is a no-op.
     t2 = backtest_signals.maybe_start_weekly(now=now)
@@ -491,12 +492,20 @@ def test_weekly_not_before_sunday_0700(hist, monkeypatch, tmp_path):
 def test_cli_days_flag(hist, tmp_path, monkeypatch):
     import backtest_signals
     monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
-    monkeypatch.setattr(
-        backtest_signals, "run_backtest",
-        lambda **k: {"path": str(tmp_path / "backtests" / "x.md"), "week_id": "x", **k},
-    )
+    seen = {}
+
+    def fake(**k):
+        seen.update(k)
+        return {"path": str(tmp_path / "backtests" / "x.md"), "week_id": "x", **k}
+
+    monkeypatch.setattr(backtest_signals, "run_backtest", fake)
     rc = backtest_signals.main(["--days", "7"])
     assert rc == 0
+    assert seen.get("fetch") is False
+    seen.clear()
+    rc = backtest_signals.main(["--days", "7", "--fetch"])
+    assert rc == 0
+    assert seen.get("fetch") is False  # report stays cache-only; --fetch drains first
 
 
 def test_no_secrets_in_outcome_logs(hist, caplog):
@@ -702,3 +711,192 @@ def test_measured_equals_complete_not_partial_peak(hist, tmp_path, monkeypatch, 
     assert incomplete["outcome_complete"] is False
     assert incomplete["peak_x"] is None
     assert backtest_signals._is_measured(incomplete) is False
+
+
+def test_outcomes_window_default_and_wrap():
+    import gt_api
+    import time as time_mod
+    start, end = gt_api.parse_outcomes_window("01:00-06:00")
+    assert start == 60
+    assert end == 360
+    start, end = gt_api.parse_outcomes_window("22:00-04:00")
+    assert start == 22 * 60
+    assert end == 4 * 60
+
+    def lt_at(hour, minute=0):
+        def _lt(_ts):
+            return time_mod.struct_time((2026, 10, 12, hour, minute, 0, 0, 0, -1))
+        return _lt
+
+    assert gt_api.in_outcomes_window(0, localtime=lt_at(1, 0)) is True
+    assert gt_api.in_outcomes_window(0, localtime=lt_at(5, 59)) is True
+    assert gt_api.in_outcomes_window(0, localtime=lt_at(6, 0)) is False
+    assert gt_api.in_outcomes_window(0, localtime=lt_at(12, 0)) is False
+
+
+def test_fetch_jobs_resume_after_deadline(hist, monkeypatch):
+    """Each completed fetch is in outcomes.db; a timeout leaves the rest pending."""
+    import outcomes
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    clock = [0.0]
+    outcomes.set_sleep_fn(lambda d: clock.__setitem__(0, clock[0] + d))
+    calls = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        calls.append(url)
+        if "dexscreener.com" in url:
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(now - 8 * 3600 + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    a, b = "aa:1399811149", "bb:1399811149"
+    entry = now - 8 * 3600
+    outcomes.enqueue_job(a, entry, now=now)
+    outcomes.enqueue_job(b, entry, now=now)
+    assert len(outcomes.list_jobs("pending")) == 2
+    result = outcomes.drain_jobs(now=now, trickle=False, max_calls=1)
+    assert result["fetched"] == 1
+    assert result["complete"] == 1
+    pending = outcomes.list_jobs("pending")
+    assert len(pending) == 1
+    cached_a = outcomes.get_cached(a, entry)
+    cached_b = outcomes.get_cached(b, entry)
+    assert (cached_a and cached_a.get("complete")) or (cached_b and cached_b.get("complete"))
+    assert not ((cached_a and cached_a.get("complete")) and (cached_b and cached_b.get("complete")))
+    result2 = outcomes.drain_jobs(now=now, trickle=False)
+    assert result2["complete"] >= 1
+    assert outcomes.get_cached(a, entry)["complete"] is True
+    assert outcomes.get_cached(b, entry)["complete"] is True
+    assert outcomes.list_jobs("pending") == []
+
+
+def test_drain_pauses_on_cycle_gt_429(hist, monkeypatch):
+    import outcomes
+    import main as shift
+    now = ts(2026, 10, 12, 15)
+    outcomes.set_time_fn(lambda: now)
+    shift._gt_limiter.reset_for_test()
+    shift._gt_limiter.stats_429_count = 1
+    calls = []
+    outcomes.set_get_fn(lambda *a, **k: calls.append(a) or Resp(500, {}))
+    outcomes.enqueue_job("z:1399811149", now - 8 * 3600, now=now)
+    result = outcomes.drain_jobs(now=now, trickle=True, max_calls=1)
+    assert result["paused"] is True
+    assert result["fetched"] == 0
+    assert calls == []
+    shift._gt_limiter.reset_for_test()
+
+
+def test_trickle_spacing_is_20s(hist):
+    import gt_api
+    import outcomes
+    assert gt_api.outcomes_spacing_sec(trickle=True) == 20.0
+    outcomes._trickle_mode = True
+    try:
+        slept = []
+        outcomes.set_sleep_fn(lambda d: slept.append(d))
+        outcomes.set_time_fn(lambda: 1000.0)
+        with outcomes._gt_lock:
+            outcomes._last_gt_call = 1000.0
+            outcomes._gt_backoff_until = 0.0
+        assert outcomes._pace_gt(deadline=None) is True
+        assert slept and slept[0] == pytest.approx(20.0)
+    finally:
+        outcomes._trickle_mode = False
+
+
+def test_coingecko_pro_url_and_fallback(hist, monkeypatch, caplog):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-SUPERSECRETKEY")
+    gt_api.reset()
+    assert gt_api.using_pro() is True
+    pro = gt_api.prefer_pro_url("https://api.geckoterminal.com/api/v2/networks/solana/pools/x/ohlcv/minute")
+    assert pro.startswith("https://pro-api.coingecko.com/api/v3/onchain/")
+    assert "SUPERSECRET" not in pro
+    headers = gt_api.request_headers()
+    assert headers.get("x-cg-pro-api-key") == "CG-SUPERSECRETKEY"
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    seen = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        seen.append(url)
+        if "pro-api.coingecko.com" in url:
+            return Resp(401, {"error": "unauthorized"})
+        if "dexscreener.com" in url:
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(now - 8 * 3600 + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    with caplog.at_level(logging.INFO):
+        got = outcomes.fetch_outcome("tok:1399811149", now - 8 * 3600, now=now)
+    assert got is not None
+    assert any("pro-api.coingecko.com" in u for u in seen)
+    assert any("api.geckoterminal.com" in u for u in seen)
+    assert "CG-SUPERSECRETKEY" not in caplog.text
+    assert "SUPERSECRET" not in caplog.text
+    assert gt_api.using_pro() is False
+    monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    gt_api.reset()
+
+
+def test_desk_limiter_pro_pacing(monkeypatch):
+    import gt_api
+    from collect import GTRateLimiter
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-TESTKEY99")
+    monkeypatch.delenv("GT_CALLS_PER_MIN", raising=False)
+    gt_api.reset()
+    lim = GTRateLimiter(calls_per_min=5, min_spacing_sec=12.0)
+    gt_api.apply_desk_pacing(lim)
+    assert lim.calls_per_min == 30
+    assert lim.min_spacing_sec == 2.0
+    monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    gt_api.reset()
+
+
+def test_cli_fetch_drains_then_cache_report(hist, tmp_path, monkeypatch):
+    import backtest_signals
+    import outcomes
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    drained = []
+    monkeypatch.setattr(outcomes, "enqueue_from_history", lambda **k: 2)
+    monkeypatch.setattr(outcomes, "drain_jobs", lambda **k: drained.append(k) or {"fetched": 2})
+    monkeypatch.setattr(
+        backtest_signals, "run_backtest",
+        lambda **k: {"path": str(tmp_path / "backtests" / "x.md"), "week_id": "x",
+                     "fetch": k.get("fetch"), **k},
+    )
+    rc = backtest_signals.main(["--days", "7", "--fetch"])
+    assert rc == 0
+    assert drained
+    assert drained[0].get("trickle") is False
+
+
+def test_weekly_backtest_does_not_hit_network(hist, tmp_path, monkeypatch):
+    import backtest_signals
+    import outcomes
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    monkeypatch.delenv("BACKTEST_DISABLE", raising=False)
+    now = ts(2026, 10, 11, 8, 0)
+    backtest_signals.set_time_fn(lambda: now)
+    outcomes.set_get_fn(lambda *a, **k: (_ for _ in ()).throw(AssertionError("network")))
+    hist.on_cycle({
+        "seen": 1, "benched": 0, "judged": 0, "requeued": 0,
+        "free": {}, "trade": {}, "chain": {"top_wallet": 1}, "soft": {},
+        "tokens": [{
+            "tid": "w:1399811149", "ticker": "WHL", "net": 1399811149,
+            "stage": "chain", "reason": "top_wallet", "age_minutes": 20,
+            "liquidity_usd": 10_000, "mcap_usd": 50_000,
+        }],
+    }, now=now - 8 * 3600, source="backfill")
+    report = backtest_signals.run_backtest(
+        days=7, now=now, week_id="2026-41", fetch=False, persist=True,
+    )
+    assert report.get("error") is None
+    assert report["n"] >= 1
+    assert report["n_complete"] == 0
