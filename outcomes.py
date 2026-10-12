@@ -108,6 +108,7 @@ def reset() -> None:
     with _worker_lock:
         _worker_thread = None
     try:
+        gt_api.set_demo_capped_fn(demo_month_capped)
         gt_api.reset()
     except Exception:
         pass
@@ -161,8 +162,16 @@ def _init_schema(db: sqlite3.Connection) -> None:
       PRIMARY KEY (tid, entry_ts)
     );
     CREATE INDEX IF NOT EXISTS idx_fetch_jobs_status ON fetch_jobs(status);
+    CREATE TABLE IF NOT EXISTS cg_demo_calls (
+      yyyymm TEXT PRIMARY KEY,
+      calls INTEGER NOT NULL DEFAULT 0
+    );
     """)
     db.commit()
+    try:
+        gt_api.set_demo_capped_fn(demo_month_capped)
+    except Exception:
+        pass
 
 
 def _sleep(seconds: float) -> None:
@@ -175,7 +184,10 @@ def _sleep(seconds: float) -> None:
 
 def _http_get(url: str, params=None, timeout=HTTP_TIMEOUT):
     fn = _get_fn or requests.get
-    return fn(url, params=params, timeout=timeout, headers=gt_api.request_headers())
+    return fn(
+        url, params=params, timeout=timeout,
+        headers=gt_api.request_headers(url, purpose="outcomes"),
+    )
 
 
 def parse_tid(tid) -> tuple[str | None, int | None]:
@@ -500,10 +512,55 @@ def resolve_pool(tid: str) -> tuple[str | None, str | None]:
         return None, chain
 
 
+def _yyyymm(now: float | None = None) -> str:
+    ts = current_time() if now is None else float(now)
+    lt = time.localtime(ts)
+    return f"{lt.tm_year:04d}-{lt.tm_mon:02d}"
+
+
+def demo_calls_this_month(now: float | None = None) -> int:
+    try:
+        db = _connect()
+        row = db.execute(
+            "SELECT calls FROM cg_demo_calls WHERE yyyymm = ?",
+            (_yyyymm(now),),
+        ).fetchone()
+        return int(row["calls"]) if row else 0
+    except Exception as e:
+        log.warning("demo call counter read failed: %s", safe_err(e))
+        return gt_api.DEMO_MONTHLY_CAP
+
+
+def record_demo_call(now: float | None = None) -> int:
+    """Count one Demo onchain request. Returns the new monthly total."""
+    month = _yyyymm(now)
+    try:
+        db = _connect()
+        db.execute(
+            """INSERT INTO cg_demo_calls (yyyymm, calls) VALUES (?, 1)
+               ON CONFLICT(yyyymm) DO UPDATE SET calls = calls + 1""",
+            (month,),
+        )
+        db.commit()
+        row = db.execute(
+            "SELECT calls FROM cg_demo_calls WHERE yyyymm = ?", (month,),
+        ).fetchone()
+        return int(row["calls"]) if row else 1
+    except Exception as e:
+        log.warning("demo call counter write failed: %s", safe_err(e))
+        return gt_api.DEMO_MONTHLY_CAP
+
+
+def demo_month_capped(now: float | None = None) -> bool:
+    return demo_calls_this_month(now) >= gt_api.DEMO_MONTHLY_CAP
+
+
 def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None = None):
-    """GT / CoinGecko Pro 5m OHLCV ending at entry+6h. Own limiter. None on 429/error."""
+    """GT / CoinGecko 5m OHLCV ending at entry+6h. Own limiter. None on 429/error."""
     net = chain
-    url = gt_api.prefer_pro_url(f"{GT_API}/networks/{net}/pools/{pool}/ohlcv/minute")
+    url = gt_api.prefer_onchain_url(
+        f"{GT_API}/networks/{net}/pools/{pool}/ohlcv/minute", purpose="outcomes",
+    )
     params = {
         "aggregate": 5,
         "before_timestamp": int(float(entry_ts) + WINDOW_SEC),
@@ -516,12 +573,16 @@ def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None =
         return None
     try:
         resp = _http_get(url, params=params, timeout=HTTP_TIMEOUT)
+        if gt_api.is_demo_url(url):
+            n = record_demo_call()
+            if n >= gt_api.DEMO_MONTHLY_CAP:
+                log.info("coingecko demo monthly cap reached (%d), falling back to free GT", n)
         status = getattr(resp, "status_code", None)
         if status in (401, 403):
             free = gt_api.fallback_free_url(url)
             if free:
-                gt_api.note_pro_failed()
-                log.info("outcomes coingecko pro HTTP %s, falling back to free GT", status)
+                gt_api.note_key_failed()
+                log.info("outcomes coingecko HTTP %s, falling back to free GT", status)
                 resp = _http_get(free, params=params, timeout=HTTP_TIMEOUT)
                 status = getattr(resp, "status_code", None)
         if status == 429:

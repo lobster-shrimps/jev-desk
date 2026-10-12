@@ -1,10 +1,12 @@
-"""GeckoTerminal / CoinGecko Pro onchain helper.
+"""GeckoTerminal / CoinGecko onchain helper.
 
-Free GT: https://api.geckoterminal.com/api/v2
-Pro:     https://pro-api.coingecko.com/api/v3/onchain  (same paths, header key)
+Free GT:  https://api.geckoterminal.com/api/v2
+Demo:     https://api.coingecko.com/api/v3/onchain     (x-cg-demo-api-key)
+Pro:      https://pro-api.coingecko.com/api/v3/onchain (x-cg-pro-api-key)
 
-Never logs COINGECKO_API_KEY. Fail open to free GT on 401/403.
-LOG/ANALYSIS + HTTP only: does not change kill/judge/pick logic.
+COINGECKO_PLAN=demo|pro. Default demo when COINGECKO_API_KEY is set.
+Demo is outcomes/backtest only (10k calls/month). Pro is desk + outcomes.
+Never logs the key. Fail open to free GT on 401/403 or demo monthly cap.
 """
 from __future__ import annotations
 
@@ -16,7 +18,9 @@ from secret_utils import safe_err
 log = logging.getLogger("gt_api")
 
 GT_FREE_BASE = "https://api.geckoterminal.com/api/v2"
+CG_DEMO_ONCHAIN = "https://api.coingecko.com/api/v3/onchain"
 CG_PRO_ONCHAIN = "https://pro-api.coingecko.com/api/v3/onchain"
+DEMO_HEADER = "x-cg-demo-api-key"
 PRO_HEADER = "x-cg-pro-api-key"
 
 UA = {
@@ -25,6 +29,7 @@ UA = {
 }
 
 FREE_OUTCOMES_SPACING_SEC = 7.0
+DEMO_OUTCOMES_SPACING_SEC = 2.0
 PRO_OUTCOMES_SPACING_SEC = 1.5
 FREE_GT_CALLS_PER_MIN = 5
 PRO_GT_CALLS_PER_MIN = 30
@@ -32,14 +37,22 @@ FREE_GT_MIN_SPACING_SEC = 12.0
 PRO_GT_MIN_SPACING_SEC = 2.0
 DEFAULT_TRICKLE_SEC = 20.0
 DEFAULT_WINDOW = "01:00-06:00"
+DEMO_MONTHLY_CAP = 9000
 
-_pro_failed = False
+_key_failed = False
+_demo_capped_fn = None
 
 
 def reset() -> None:
-    """Tests: clear the pro-fallback latch."""
-    global _pro_failed
-    _pro_failed = False
+    """Tests: clear the key-fallback latch."""
+    global _key_failed
+    _key_failed = False
+
+
+def set_demo_capped_fn(fn) -> None:
+    """outcomes.db wires the monthly Demo cap. None restores."""
+    global _demo_capped_fn
+    _demo_capped_fn = fn
 
 
 def coingecko_api_key() -> str | None:
@@ -50,46 +63,118 @@ def coingecko_api_key() -> str | None:
     return key or None
 
 
+def plan() -> str | None:
+    """'demo' | 'pro' | None. Default demo when a key is set."""
+    if not coingecko_api_key():
+        return None
+    raw = (os.environ.get("COINGECKO_PLAN") or "demo").strip().lower()
+    if raw in ("pro", "paid"):
+        return "pro"
+    return "demo"
+
+
+def demo_capped() -> bool:
+    fn = _demo_capped_fn
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        # Can't read the counter: do not burn the Demo monthly quota.
+        return True
+
+
 def using_pro() -> bool:
-    return bool(coingecko_api_key()) and not _pro_failed
+    return plan() == "pro" and bool(coingecko_api_key()) and not _key_failed
+
+
+def using_demo() -> bool:
+    return (
+        plan() == "demo"
+        and bool(coingecko_api_key())
+        and not _key_failed
+        and not demo_capped()
+    )
+
+
+def key_for(purpose: str) -> bool:
+    """Desk uses Pro only. Outcomes/backtest may use Demo or Pro."""
+    if purpose == "desk":
+        return using_pro()
+    return using_pro() or using_demo()
+
+
+def note_key_failed() -> None:
+    global _key_failed
+    if not _key_failed:
+        _key_failed = True
+        label = plan() or "key"
+        log.info("coingecko %s unavailable, falling back to free GT", label)
 
 
 def note_pro_failed() -> None:
-    global _pro_failed
-    if not _pro_failed:
-        _pro_failed = True
-        log.info("coingecko pro unavailable, falling back to free GT")
+    """Back-compat alias."""
+    note_key_failed()
 
 
-def request_headers() -> dict:
-    """UA plus Pro key when set. Caller must never log this dict."""
+def onchain_base(*, purpose: str = "outcomes") -> str:
+    if not key_for(purpose):
+        return GT_FREE_BASE
+    if using_pro():
+        return CG_PRO_ONCHAIN
+    return CG_DEMO_ONCHAIN
+
+
+def request_headers(url: str | None = None, *, purpose: str = "outcomes") -> dict:
+    """UA plus plan header when this URL should use the key. Never log this dict."""
     headers = dict(UA)
+    if not key_for(purpose):
+        return headers
+    if url and url.startswith(GT_FREE_BASE):
+        return headers
+    if url and "dexscreener.com" in url:
+        return headers
     key = coingecko_api_key()
-    if key and not _pro_failed:
+    if not key:
+        return headers
+    if using_pro() and (url is None or url.startswith(CG_PRO_ONCHAIN)):
         headers[PRO_HEADER] = key
+    elif using_demo() and (url is None or url.startswith(CG_DEMO_ONCHAIN)):
+        headers[DEMO_HEADER] = key
     return headers
 
 
-def prefer_pro_url(url: str) -> str:
-    if not url or not using_pro():
+def prefer_onchain_url(url: str, *, purpose: str = "outcomes") -> str:
+    if not url or not key_for(purpose):
         return url
     if url.startswith(GT_FREE_BASE):
-        return CG_PRO_ONCHAIN + url[len(GT_FREE_BASE):]
+        return onchain_base(purpose=purpose) + url[len(GT_FREE_BASE):]
     return url
 
 
+def prefer_pro_url(url: str) -> str:
+    """Back-compat: rewrite for outcomes/backtest (Demo or Pro)."""
+    return prefer_onchain_url(url, purpose="outcomes")
+
+
 def fallback_free_url(url: str) -> str | None:
-    if url and url.startswith(CG_PRO_ONCHAIN):
-        return GT_FREE_BASE + url[len(CG_PRO_ONCHAIN):]
+    if not url:
+        return None
+    for base in (CG_PRO_ONCHAIN, CG_DEMO_ONCHAIN):
+        if url.startswith(base):
+            return GT_FREE_BASE + url[len(base):]
     return None
 
 
-def onchain_url(path: str) -> str:
+def is_demo_url(url: str | None) -> bool:
+    return bool(url) and str(url).startswith(CG_DEMO_ONCHAIN)
+
+
+def onchain_url(path: str, *, purpose: str = "outcomes") -> str:
     """path like /networks/solana/pools/x/ohlcv/minute"""
     if not path.startswith("/"):
         path = "/" + path
-    base = CG_PRO_ONCHAIN if using_pro() else GT_FREE_BASE
-    return base + path
+    return onchain_base(purpose=purpose) + path
 
 
 def outcomes_spacing_sec(*, trickle: bool = False) -> float:
@@ -103,6 +188,8 @@ def outcomes_spacing_sec(*, trickle: bool = False) -> float:
         return DEFAULT_TRICKLE_SEC
     if using_pro():
         return PRO_OUTCOMES_SPACING_SEC
+    if using_demo():
+        return DEMO_OUTCOMES_SPACING_SEC
     return FREE_OUTCOMES_SPACING_SEC
 
 

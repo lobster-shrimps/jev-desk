@@ -29,6 +29,7 @@ def isolate_outcomes(tmp_path, monkeypatch):
     monkeypatch.setenv("BACKTEST_DISABLE", "1")
     monkeypatch.setenv("OUTCOMES_FETCH_DISABLE", "1")
     monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
     import gt_api
     import outcomes
     import backtest_signals

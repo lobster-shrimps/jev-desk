@@ -811,12 +811,17 @@ def test_coingecko_pro_url_and_fallback(hist, monkeypatch, caplog):
     import gt_api
     import outcomes
     monkeypatch.setenv("COINGECKO_API_KEY", "CG-SUPERSECRETKEY")
+    monkeypatch.setenv("COINGECKO_PLAN", "pro")
     gt_api.reset()
+    assert gt_api.plan() == "pro"
     assert gt_api.using_pro() is True
-    pro = gt_api.prefer_pro_url("https://api.geckoterminal.com/api/v2/networks/solana/pools/x/ohlcv/minute")
+    pro = gt_api.prefer_onchain_url(
+        "https://api.geckoterminal.com/api/v2/networks/solana/pools/x/ohlcv/minute",
+        purpose="outcomes",
+    )
     assert pro.startswith("https://pro-api.coingecko.com/api/v3/onchain/")
     assert "SUPERSECRET" not in pro
-    headers = gt_api.request_headers()
+    headers = gt_api.request_headers(pro, purpose="outcomes")
     assert headers.get("x-cg-pro-api-key") == "CG-SUPERSECRETKEY"
     now = ts(2026, 10, 12, 12)
     outcomes.set_time_fn(lambda: now)
@@ -849,6 +854,7 @@ def test_desk_limiter_pro_pacing(monkeypatch):
     import gt_api
     from collect import GTRateLimiter
     monkeypatch.setenv("COINGECKO_API_KEY", "CG-TESTKEY99")
+    monkeypatch.setenv("COINGECKO_PLAN", "pro")
     monkeypatch.delenv("GT_CALLS_PER_MIN", raising=False)
     gt_api.reset()
     lim = GTRateLimiter(calls_per_min=5, min_spacing_sec=12.0)
@@ -856,7 +862,123 @@ def test_desk_limiter_pro_pacing(monkeypatch):
     assert lim.calls_per_min == 30
     assert lim.min_spacing_sec == 2.0
     monkeypatch.delenv("COINGECKO_API_KEY", raising=False)
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
     gt_api.reset()
+
+
+def test_coingecko_demo_default_plan(hist, monkeypatch, caplog):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    assert gt_api.plan() == "demo"
+    assert gt_api.using_pro() is False
+    assert gt_api.using_demo() is True
+    demo = gt_api.prefer_onchain_url(
+        "https://api.geckoterminal.com/api/v2/networks/solana/pools/x/ohlcv/minute",
+        purpose="outcomes",
+    )
+    assert demo.startswith("https://api.coingecko.com/api/v3/onchain/")
+    headers = gt_api.request_headers(demo, purpose="outcomes")
+    assert headers.get("x-cg-demo-api-key") == "CG-DEMOSECRET99"
+    assert "x-cg-pro-api-key" not in headers
+    desk = gt_api.prefer_onchain_url(
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools",
+        purpose="desk",
+    )
+    assert desk.startswith("https://api.geckoterminal.com/api/v2/")
+    desk_h = gt_api.request_headers(desk, purpose="desk")
+    assert "x-cg-demo-api-key" not in desk_h
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    seen = []
+    seen_headers = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        seen.append(url)
+        seen_headers.append(headers or {})
+        if "api.coingecko.com" in url:
+            return Resp(401, {"error": "unauthorized"})
+        if "dexscreener.com" in url:
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(now - 8 * 3600 + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    with caplog.at_level(logging.INFO):
+        got = outcomes.fetch_outcome("tok:1399811149", now - 8 * 3600, now=now)
+    assert got is not None
+    assert any("api.coingecko.com/api/v3/onchain" in u for u in seen)
+    assert any("api.geckoterminal.com" in u for u in seen)
+    assert "CG-DEMOSECRET99" not in caplog.text
+    assert outcomes.demo_calls_this_month(now) >= 1
+    lim = __import__("collect").GTRateLimiter(calls_per_min=5, min_spacing_sec=12.0)
+    gt_api.apply_desk_pacing(lim)
+    assert lim.calls_per_min == 5
+    assert lim.min_spacing_sec == 12.0
+
+
+def test_demo_monthly_cap_stops_key(hist, monkeypatch):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    db = outcomes._connect()
+    db.execute(
+        "INSERT OR REPLACE INTO cg_demo_calls (yyyymm, calls) VALUES (?, ?)",
+        (outcomes._yyyymm(now), gt_api.DEMO_MONTHLY_CAP),
+    )
+    db.commit()
+    assert outcomes.demo_month_capped(now) is True
+    assert gt_api.using_demo() is False
+    url = gt_api.prefer_onchain_url(
+        "https://api.geckoterminal.com/api/v2/networks/solana/pools/x/ohlcv/minute",
+        purpose="outcomes",
+    )
+    assert url.startswith("https://api.geckoterminal.com/api/v2/")
+    assert gt_api.outcomes_spacing_sec() == 7.0
+    seen = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        seen.append(url)
+        if "dexscreener.com" in url:
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(now - 8 * 3600 + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    outcomes.set_sleep_fn(lambda d: None)
+    got = outcomes.fetch_outcome("tok:1399811149", now - 8 * 3600, now=now)
+    assert got is not None
+    assert not any("api.coingecko.com" in u for u in seen)
+    assert any("api.geckoterminal.com" in u for u in seen)
+    assert outcomes.demo_calls_this_month(now) == gt_api.DEMO_MONTHLY_CAP
+
+
+def test_demo_outcomes_spacing_is_2s(hist, monkeypatch):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    assert gt_api.outcomes_spacing_sec(trickle=False) == 2.0
+    outcomes._trickle_mode = False
+    try:
+        slept = []
+        outcomes.set_sleep_fn(lambda d: slept.append(d))
+        outcomes.set_time_fn(lambda: 1000.0)
+        with outcomes._gt_lock:
+            outcomes._last_gt_call = 1000.0
+            outcomes._gt_backoff_until = 0.0
+        assert outcomes._pace_gt(deadline=None) is True
+        assert slept and slept[0] == pytest.approx(2.0)
+    finally:
+        outcomes._trickle_mode = False
 
 
 def test_cli_fetch_drains_then_cache_report(hist, tmp_path, monkeypatch):
