@@ -1022,3 +1022,116 @@ def test_weekly_backtest_does_not_hit_network(hist, tmp_path, monkeypatch):
     assert report.get("error") is None
     assert report["n"] >= 1
     assert report["n_complete"] == 0
+
+
+def _seed_job(outcomes, tid, entry_ts, *, attempts=0, last_attempt=None,
+              last_error=None, status="pending", now=None):
+    db = outcomes._connect()
+    db.execute(
+        """INSERT OR REPLACE INTO fetch_jobs
+           (tid, entry_ts, status, attempts, last_attempt, last_error, enqueued_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (tid, float(entry_ts), status, int(attempts), last_attempt, last_error,
+         float(now or entry_ts)),
+    )
+    db.commit()
+
+
+def test_drain_picks_least_attempted_pending(hist):
+    """Daytime trickle must not stick on a high-attempt Dex-miss head job."""
+    import outcomes
+    now = ts(2026, 10, 12, 15)
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    sticky = "J4KKkYxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:1399811149"
+    fresh = "fresh:1399811149"
+    entry = now - 8 * 3600
+    _seed_job(outcomes, sticky, entry, attempts=4, last_attempt=now - 60,
+              last_error="no_pool", now=now)
+    outcomes.enqueue_job(fresh, entry, now=now)
+    seen_tids = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        if "dexscreener.com" in url:
+            addr = url.rstrip("/").rsplit("/", 1)[-1]
+            if addr.startswith("J4KKkY"):
+                return Resp(200, [])
+            seen_tids.append(addr)
+            return Resp(200, [{"pairAddress": "PoolFresh", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(entry + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    result = outcomes.drain_jobs(now=now, trickle=True, max_calls=1)
+    assert result["fetched"] == 1
+    assert result["complete"] == 1
+    assert any(s.startswith("fresh") for s in seen_tids)
+    pending = outcomes.list_jobs("pending")
+    assert any(j["tid"] == sticky for j in pending)
+    assert not any(j["tid"] == fresh for j in pending)
+    assert outcomes.get_cached(fresh, entry)["complete"] is True
+
+
+def test_no_pool_job_marked_dead_after_five_attempts(hist):
+    import outcomes
+    now = ts(2026, 10, 12, 15)
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    tid = "nopool:1399811149"
+    entry = now - 8 * 3600
+    outcomes.enqueue_job(tid, entry, now=now)
+    outcomes.set_get_fn(lambda *a, **k: Resp(200, []))
+    for i in range(outcomes.DEAD_NO_POOL_ATTEMPTS):
+        result = outcomes.drain_jobs(now=now, trickle=True, max_calls=1)
+        assert result["fetched"] == 1
+    assert outcomes.list_jobs("pending") == []
+    dead = outcomes.list_jobs("dead")
+    assert len(dead) == 1
+    assert dead[0]["tid"] == tid
+    assert dead[0]["attempts"] >= outcomes.DEAD_NO_POOL_ATTEMPTS
+    assert dead[0]["last_error"] == "no_pool"
+    result = outcomes.drain_jobs(now=now, trickle=True, max_calls=1)
+    assert result["fetched"] == 0
+    assert result["remaining"] == 0
+
+
+def test_startup_marks_overlimit_no_pool_jobs_dead(hist):
+    import outcomes
+    now = ts(2026, 10, 12, 15)
+    entry = now - 8 * 3600
+    sticky = "J4KKkYstuck:1399811149"
+    _seed_job(outcomes, sticky, entry, attempts=106, last_attempt=now - 10,
+              last_error="incomplete", now=now)
+    outcomes.enqueue_job("ok:1399811149", entry, now=now)
+    outcomes.reset()
+    pending = outcomes.list_jobs("pending")
+    assert all(j["tid"] != sticky for j in pending)
+    assert any(j["tid"] == "ok:1399811149" for j in pending)
+    dead = outcomes.list_jobs("dead")
+    assert any(j["tid"] == sticky and j["attempts"] == 106 for j in dead)
+    assert all(j["status"] != "pending" for j in dead)
+
+
+def test_resolvable_pool_not_killed_after_incomplete(hist):
+    """GT 429 / incomplete candles must not dead a job that has a Dex pool."""
+    import outcomes
+    now = ts(2026, 10, 12, 15)
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    tid = "haspool:1399811149"
+    entry = now - 8 * 3600
+    outcomes.enqueue_job(tid, entry, now=now)
+
+    def get(url, params=None, timeout=None, headers=None):
+        if "dexscreener.com" in url:
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        return Resp(429, {"error": "rate limited"})
+
+    outcomes.set_get_fn(get)
+    for _ in range(outcomes.DEAD_NO_POOL_ATTEMPTS):
+        outcomes.drain_jobs(now=now, trickle=True, max_calls=1)
+    pending = outcomes.list_jobs("pending")
+    assert any(j["tid"] == tid for j in pending)
+    assert outcomes.list_jobs("dead") == []
+    cached = outcomes.get_cached(tid, entry)
+    assert cached and cached.get("pool") == "PoolX"
