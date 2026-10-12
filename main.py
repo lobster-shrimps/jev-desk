@@ -855,6 +855,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                     developer_holding_percentage=d.get("developer_holding_percentage"),
                     holder_count=d.get("holder_count"),
                     soft_scores=soft_scores,
+                    liquidity_usd=d.get("liquidity_usd"),
+                    mcap_usd=d.get("mcap_usd"),
                 )
                 book.sit(t["tid"], reason, age_minutes=t.get("age_minutes"))
                 log.info("defer outcome tid=%s reason=%s", t["tid"], reason)

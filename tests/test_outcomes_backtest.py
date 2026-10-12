@@ -228,7 +228,7 @@ def test_shadow_kills_backfill_from_tokens_and_young(hist):
              "age_minutes": 16},
         ],
     }, now=ts(2026, 10, 12, 9), source="backfill")
-    # Chain kill only lives on young_free_pass (tokens table drops chain rows).
+    # Extra young/chain row only lives on young_free_pass in this fixture.
     db = hist._connect()
     db.execute(
         """INSERT INTO young_free_pass (cycle_id, ts, tid, chain_id, chain, ticker,
@@ -517,3 +517,188 @@ def test_filter_judge_pick_untouched():
         cwd=str(ROOT), capture_output=True, text=True, check=True,
     )
     assert r.stdout == ""
+
+
+def test_first_num_ignores_truthy_non_numeric_liq():
+    import cycle_history as ch
+    assert ch._liq_of({"liq": {"usd": 12_000}, "liquidity_usd": 99}) == 12_000
+    assert ch._liq_of({"liq": "n/a", "liquidity_usd": 40_000}) == 40_000
+    assert ch._mcap_of({"mcap": {"usd": 80_000}}) == 80_000
+    assert ch._first_num(None, "", "None", {"usd": 5}) == 5
+
+
+def test_tokens_persist_liq_mcap_and_quartile_join(hist):
+    """tokens.liquidity_usd / mcap_usd reach shadow_kills and quartile tables."""
+    import backtest_signals
+    now = ts(2026, 10, 8, 10)
+    hist.on_cycle({
+        "seen": 5, "benched": 0, "judged": 1, "requeued": 0,
+        "free": {}, "trade": {}, "chain": {"top_wallet": 3, "top_10": 1}, "soft": {},
+        "tokens": [
+            {"tid": "w:1399811149", "ticker": "WHL", "net": 1399811149,
+             "stage": "chain", "reason": "top_wallet", "age_minutes": 22,
+             "liquidity_usd": 40_000, "mcap_usd": 200_000, "holder_count": 90},
+            {"tid": "w2:1399811149", "ticker": "WH2", "net": 1399811149,
+             "stage": "chain", "reason": "top_wallet", "age_minutes": 18,
+             "liquidity_usd": 12_000, "mcap_usd": 70_000, "holder_count": 70},
+            {"tid": "t:56", "ticker": "TEN", "net": 56,
+             "stage": "chain", "reason": "top_10", "age_minutes": 30,
+             "liquidity_usd": 55_000, "mcap_usd": 310_000, "holder_count": 140},
+            {"tid": "j:1399811149", "ticker": "JK", "net": 1399811149,
+             "stage": "judged", "reason": None, "age_minutes": 21,
+             "judge_verdict": "pass", "judge_score": 0.31,
+             "liq": {"usd": 18_000}, "mcap": 80_000},
+        ],
+    }, now=now, source="backfill")
+    tokens = hist._tokens_since(0)
+    assert any(t["kind"] == "chain" and t["liquidity_usd"] == 40_000 for t in tokens)
+    judged = next(t for t in tokens if t["kind"] == "judged")
+    assert judged["liquidity_usd"] == 18_000
+    assert judged["mcap_usd"] == 80_000
+    whale = next(s for s in hist.shadow_kills_since(0) if s["ticker"] == "WHL")
+    assert whale["liq"] == 40_000
+    assert whale["mcap"] == 200_000
+    rows = backtest_signals.load_rows(0, now + 1)
+    assert any(r.get("liq") == 40_000 and r.get("mcap") == 200_000 for r in rows)
+    report = backtest_signals.build_report(rows, week_id="2026-41", days=7, now=now)
+    assert report["features"]["liq"]["n_with_value"] >= 1
+    assert sum(q["n"] for q in report["features"]["liq"]["quartiles"]) >= 1
+    assert report["features"]["mcap"]["n_with_value"] >= 1
+
+
+def test_backfill_join_fills_null_shadow_liq_from_tokens(hist):
+    """Existing shadow_kills with NULL liq/mcap pick up tokens columns."""
+    import backtest_signals
+    now = ts(2026, 10, 8, 10)
+    hist.on_cycle({
+        "seen": 1, "benched": 0, "judged": 1, "requeued": 0,
+        "free": {}, "trade": {}, "chain": {}, "soft": {},
+        "tokens": [{
+            "tid": "j:1399811149", "ticker": "JK", "net": 1399811149,
+            "stage": "judged", "age_minutes": 21, "judge_verdict": "pass",
+            "judge_score": 0.31,
+        }],
+    }, now=now, source="backfill")
+    db = hist._connect()
+    db.execute(
+        "UPDATE tokens SET liquidity_usd = 25000, mcap_usd = 90000 WHERE tid = ?",
+        ("j:1399811149",),
+    )
+    db.execute(
+        "UPDATE shadow_kills SET liq = NULL, mcap = NULL WHERE tid = ?",
+        ("j:1399811149",),
+    )
+    db.commit()
+    hist.backfill_shadow_kills()
+    row = hist.shadow_kills_since(0)[0]
+    assert row["liq"] == 25_000
+    assert row["mcap"] == 90_000
+    enriched = backtest_signals.load_rows(0, now + 1)
+    assert enriched[0]["liq"] == 25_000
+    assert enriched[0]["mcap"] == 90_000
+
+
+def test_skip_cycle_patches_liq_mcap_from_log(hist):
+    """Re-parsing run.log fills market fields on already-stored cycles."""
+    log_text = """
+2026-10-08 10:00:01,001 desk INFO free tid=Young1:1399811149 reason=pass age_minutes=22.0 liquidity_usd=48000 volume_usd=610000 mcap_usd=300000
+2026-10-08 10:00:03,003 desk INFO chain tid=Young1:1399811149 ticker=YNG reason=top_wallet
+2026-10-08 10:00:07,007 desk INFO cycle: 2 seen, 0 benched, free {'pass': 1}, trade {}, chain {'top_wallet': 1}, soft {}, judged 0, requeued 0
+"""
+    ts_cycle = time.mktime(time.strptime("2026-10-08 10:00:07", "%Y-%m-%d %H:%M:%S"))
+    hist.on_cycle({
+        "seen": 2, "benched": 0, "judged": 0, "requeued": 0,
+        "free": {"pass": 1}, "trade": {}, "chain": {"top_wallet": 1}, "soft": {},
+        "tokens": [{
+            "tid": "Young1:1399811149", "ticker": "YNG", "net": 1399811149,
+            "stage": "chain", "reason": "top_wallet", "age_minutes": 22,
+        }],
+        "young_free": [{
+            "tid": "Young1:1399811149", "ticker": "YNG", "net": 1399811149,
+            "age_minutes": 22,
+        }],
+    }, now=ts_cycle, source="live")
+    shadows = hist.shadow_kills_since(0)
+    assert shadows
+    assert shadows[0]["liq"] is None
+    result = hist.backfill_text(log_text)
+    assert result["skipped"] == 1
+    whale = next(s for s in hist.shadow_kills_since(0) if s["tid"] == "Young1:1399811149")
+    assert whale["liq"] == 48_000
+    assert whale["mcap"] == 300_000
+    tok = next(t for t in hist._tokens_since(0) if t["tid"] == "Young1:1399811149")
+    assert tok["liquidity_usd"] == 48_000
+    assert tok["mcap_usd"] == 300_000
+
+
+def test_free_pass_parse_carries_liq_mcap(hist):
+    log_text = """
+2026-10-08 10:00:01,001 desk INFO free tid=Young1:1399811149 reason=pass age_minutes=22.0 liquidity_usd=48000 volume_usd=610000 mcap_usd=300000
+2026-10-08 10:00:03,003 desk INFO chain tid=Young1:1399811149 ticker=YNG reason=top_wallet
+2026-10-08 10:00:04,004 desk INFO soft tid=Soft1:56 ticker=SFT reason=momentum_already_spent noul=0.77 age_minutes=44 top_10_percent=31 top_wallet_percent=0.02 developer_holding_percentage=3 holder_count=190 rpc_ok=True soft_scores={'momentum_already_spent': 0.77}
+2026-10-08 10:00:07,007 desk INFO cycle: 3 seen, 0 benched, free {'pass': 1}, trade {}, chain {'top_wallet': 1}, soft {'momentum_already_spent': 1}, judged 0, requeued 0
+"""
+    hist.backfill_text(log_text)
+    chain = next(t for t in hist._tokens_since(0) if t["kind"] == "chain")
+    assert chain["liquidity_usd"] == 48_000
+    assert chain["mcap_usd"] == 300_000
+    yng = next(s for s in hist.shadow_kills_since(0) if s["tid"] == "Young1:1399811149")
+    assert yng["liq"] == 48_000
+    assert yng["mcap"] == 300_000
+    import backtest_signals
+    rows = backtest_signals.load_rows(0, ts(2026, 10, 9))
+    yng_row = next(r for r in rows if r["tid"] == "Young1:1399811149")
+    assert yng_row["liq"] == 48_000
+    assert yng_row["mcap"] == 300_000
+
+
+def test_measured_equals_complete_not_partial_peak(hist, tmp_path, monkeypatch, caplog):
+    """Log complete= and report measured must use the same 6h-complete definition."""
+    import backtest_signals
+    import outcomes
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    now = ts(2026, 10, 12, 12)
+    entry = now - 8 * 3600
+    hist.on_cycle({
+        "seen": 2, "benched": 0, "judged": 0, "requeued": 0,
+        "free": {}, "trade": {}, "chain": {"top_wallet": 1, "top_10": 1}, "soft": {},
+        "tokens": [
+            {"tid": "a:1399811149", "ticker": "A", "net": 1399811149,
+             "stage": "chain", "reason": "top_wallet", "age_minutes": 20,
+             "liquidity_usd": 10_000, "mcap_usd": 50_000},
+            {"tid": "b:1399811149", "ticker": "B", "net": 1399811149,
+             "stage": "chain", "reason": "top_10", "age_minutes": 25,
+             "liquidity_usd": 20_000, "mcap_usd": 80_000},
+        ],
+    }, now=entry, source="backfill")
+    outcomes.put_cached("a:1399811149", entry, {
+        "pool": "p", "chain": "solana", "candles": [],
+        "complete": True, "peak_x": 2.2, "trough_x": 0.8, "ret_6h": 0.1,
+        "sim_current_pnl": 5.0, "sim_current_reason": "time",
+        "sim_trail_pnl": 4.0, "sim_trail_reason": "time",
+        "fetched_at": now,
+    })
+    outcomes.put_cached("b:1399811149", entry, {
+        "pool": "p", "chain": "solana", "candles": [],
+        "complete": False, "peak_x": 3.1, "trough_x": 0.9, "ret_6h": None,
+        "sim_current_pnl": None, "sim_current_reason": None,
+        "sim_trail_pnl": None, "sim_trail_reason": None,
+        "fetched_at": now,
+    })
+    with caplog.at_level(logging.INFO):
+        report = backtest_signals.run_backtest(
+            days=7, now=now, week_id="2026-41", fetch=False, persist=True,
+        )
+    assert report["n"] == 2
+    assert report["n_complete"] == 1
+    assert report["n_measured"] == 1
+    assert report["n_complete"] == report["n_measured"]
+    assert "complete=1" in caplog.text
+    assert "measured=1" in caplog.text
+    rows = backtest_signals.attach_outcomes(
+        backtest_signals.load_rows(entry - 10, now), now=now, fetch=False,
+    )
+    incomplete = next(r for r in rows if r["tid"] == "b:1399811149")
+    assert incomplete["outcome_complete"] is False
+    assert incomplete["peak_x"] is None
+    assert backtest_signals._is_measured(incomplete) is False
