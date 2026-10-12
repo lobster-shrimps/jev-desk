@@ -164,6 +164,7 @@ def _init_schema(db: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_tokens_ts ON tokens(ts);
     CREATE INDEX IF NOT EXISTS idx_tokens_kind ON tokens(kind);
     CREATE INDEX IF NOT EXISTS idx_tokens_chain ON tokens(chain_id);
+    CREATE INDEX IF NOT EXISTS idx_tokens_tid ON tokens(tid);
 
     CREATE TABLE IF NOT EXISTS young_free_pass (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -714,6 +715,38 @@ def _cycle_dict(r: sqlite3.Row) -> dict:
         "gt_dossier_ok": r["gt_dossier_ok"] if "gt_dossier_ok" in r.keys() else 0,
         "source": r["source"],
     }
+
+
+def previous_holder_sample(tid: str, now: float | None = None,
+                           min_age_min: float = 5.0,
+                           max_age_min: float = 120.0) -> dict | None:
+    """Most recent holder_count for tid whose age is between 5 and 120 minutes.
+
+    Fail open: missing tid, missing DB, or no in-window sample -> None.
+    """
+    if not tid:
+        return None
+    now = time.time() if now is None else float(now)
+    min_ts = now - float(max_age_min) * 60.0
+    max_ts = now - float(min_age_min) * 60.0
+    try:
+        row = _connect().execute(
+            """SELECT holder_count, ts FROM tokens
+               WHERE tid = ? AND holder_count IS NOT NULL
+                 AND ts >= ? AND ts <= ?
+               ORDER BY ts DESC LIMIT 1""",
+            (str(tid), min_ts, max_ts),
+        ).fetchone()
+    except Exception as e:
+        log.warning("previous holder sample failed: %s", safe_err(e))
+        return None
+    if row is None:
+        return None
+    count = _int(row["holder_count"])
+    ts = _num(row["ts"])
+    if count is None or ts is None:
+        return None
+    return {"holder_count": count, "ts": ts}
 
 
 def _tokens_since(since_ts: float, kind: str | None = None,

@@ -116,9 +116,18 @@ def _init_schema(db: sqlite3.Connection) -> None:
       address TEXT NOT NULL,
       payload_json TEXT NOT NULL,
       fetched_at REAL NOT NULL,
+      prev_payload_json TEXT,
+      prev_fetched_at REAL,
       PRIMARY KEY (chain, address)
     );
     """)
+    cols = {row[1] for row in db.execute("PRAGMA table_info(gt_info)")}
+    for name, decl in (
+        ("prev_payload_json", "TEXT"),
+        ("prev_fetched_at", "REAL"),
+    ):
+        if name not in cols:
+            db.execute(f"ALTER TABLE gt_info ADD COLUMN {name} {decl}")
     db.commit()
 
 
@@ -199,13 +208,46 @@ def put(chain: str, address: str, attrs: dict, now: float | None = None,
     ts = now if now is not None else current_time()
     try:
         db = _connect()
+        existing = db.execute(
+            "SELECT payload_json, fetched_at FROM gt_info WHERE chain = ? AND address = ?",
+            (chain_key, addr),
+        ).fetchone()
+        prev_json = None
+        prev_at = None
+        if existing is not None:
+            prev_json = existing["payload_json"]
+            prev_at = existing["fetched_at"]
         db.execute(
-            """INSERT OR REPLACE INTO gt_info (chain, address, payload_json, fetched_at)
-               VALUES (?, ?, ?, ?)""",
-            (chain_key, addr, json.dumps(attrs, default=str, sort_keys=True), float(ts)),
+            """INSERT OR REPLACE INTO gt_info
+               (chain, address, payload_json, fetched_at, prev_payload_json, prev_fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (chain_key, addr, json.dumps(attrs, default=str, sort_keys=True), float(ts),
+             prev_json, prev_at),
         )
         db.commit()
         return True
     except Exception as e:
         log.warning("gt info cache put failed: %s", safe_err(e))
         return False
+
+
+def get_previous(chain: str, address: str, now: float | None = None) -> tuple[dict, float] | None:
+    """Return (payload, fetched_at) for the snapshot overwritten by the last put, else None."""
+    chain_key, addr = normalize_key(chain, address)
+    if not chain_key or not addr:
+        return None
+    try:
+        db = _connect()
+        row = db.execute(
+            "SELECT prev_payload_json, prev_fetched_at FROM gt_info WHERE chain = ? AND address = ?",
+            (chain_key, addr),
+        ).fetchone()
+        if row is None or not row["prev_payload_json"] or row["prev_fetched_at"] is None:
+            return None
+        payload = json.loads(row["prev_payload_json"])
+        if not is_complete_attributes(payload):
+            return None
+        return payload, float(row["prev_fetched_at"])
+    except Exception as e:
+        log.warning("gt info cache get_previous failed: %s", safe_err(e))
+        return None

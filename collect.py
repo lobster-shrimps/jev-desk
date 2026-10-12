@@ -443,6 +443,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                     "h1": txns.get("h1", {}),
                     "h6": txns.get("h6", {}),
                     "h24": txns.get("h24", {}),
+                    "m5": txns.get("m5", {}),
                     "_liq_usd": liq_usd  # track for comparison
                 }
     
@@ -669,7 +670,8 @@ def normalise(tid: str, m: dict) -> dict:
             "change": {"5m": m["change"].get(300), "1h": m["change"].get(3600),
                        "4h": m["change"].get(14400), "24h": m["change"].get(86400)},
             "age_minutes": age_minutes(m["created"]),
-            "fomo_twitter": m.get("twitter")}
+            "fomo_twitter": m.get("twitter"),
+            "creator": m.get("creator")}
 
 
 def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
@@ -706,7 +708,28 @@ def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
 
 
 _EMPTY_TRADES = {"buys_h1": None, "sells_h1": None, "buys_h6": None, "sells_h6": None,
+                 "buys_m5": None, "sells_m5": None,
                  "trades_h24": None, "pair_address": None}
+
+
+def _trade_fields_from_txns(txns: dict) -> dict:
+    """buys/sells for h1, h6, m5 plus h24 trade count. Missing windows stay None."""
+    txns = txns or {}
+    h1 = txns.get("h1") or {}
+    h6 = txns.get("h6") or {}
+    h24 = txns.get("h24") or {}
+    m5 = txns.get("m5") or {}
+    buys_h24 = h24.get("buys") or 0
+    sells_h24 = h24.get("sells") or 0
+    return {
+        "buys_h1": h1.get("buys"),
+        "sells_h1": h1.get("sells"),
+        "buys_h6": h6.get("buys"),
+        "sells_h6": h6.get("sells"),
+        "buys_m5": m5.get("buys"),
+        "sells_m5": m5.get("sells"),
+        "trades_h24": buys_h24 + sells_h24,
+    }
 
 
 # Known liquid tokens for canary checks (Solana addresses)
@@ -826,19 +849,13 @@ def trade_counts(t: dict, gt_txns_cache: dict = None) -> tuple[dict, str]:
         t["dex_twitter"] = _dex_twitter_from_pair(best_pair)
         
         txns = best_pair.get("txns") or {}
-        h1 = txns.get("h1") or {}
-        h6 = txns.get("h6") or {}
-        h24 = txns.get("h24") or {}
-        
-        buys_h24 = h24.get("buys") or 0
-        sells_h24 = h24.get("sells") or 0
-        
+        fields = _trade_fields_from_txns(txns)
+        # Stash DexScreener windows on t so pick.summary / market state can use them
+        # without another call. m5 is omitted downstream when missing.
+        t.update({k: fields[k] for k in ("buys_h1", "sells_h1", "buys_h6", "sells_h6",
+                                         "buys_m5", "sells_m5")})
         return {
-            "buys_h1": h1.get("buys"), 
-            "sells_h1": h1.get("sells"),
-            "buys_h6": h6.get("buys"), 
-            "sells_h6": h6.get("sells"),
-            "trades_h24": buys_h24 + sells_h24,  # Always a number, never None
+            **fields,
             "pair_address": best_pair.get("pairAddress"),  # Store for EVM holder checks
             "dex_twitter": t.get("dex_twitter"),
         }, 'ok'
@@ -862,22 +879,16 @@ def _try_gt_fallback(t: dict, gt_txns_cache: dict, genuine_empty: bool = False) 
     
     if gt_txns and gt_txns.get("h24"):
         # GT has data, use it
-        h1 = gt_txns.get("h1", {})
-        h6 = gt_txns.get("h6", {})
-        h24 = gt_txns.get("h24", {})
-        
-        buys_h24 = h24.get("buys") or 0
-        sells_h24 = h24.get("sells") or 0
-        
-        log.info("Using GT fallback for %s: h24 buys=%s sells=%s (DexScreener %s)", 
-                 t["ticker"], buys_h24, sells_h24, "empty" if genuine_empty else "error")
-        
+        fields = _trade_fields_from_txns(gt_txns)
+        log.info("Using GT fallback for %s: h24 buys=%s sells=%s (DexScreener %s)",
+                 t["ticker"],
+                 (gt_txns.get("h24") or {}).get("buys") or 0,
+                 (gt_txns.get("h24") or {}).get("sells") or 0,
+                 "empty" if genuine_empty else "error")
+        t.update({k: fields[k] for k in ("buys_h1", "sells_h1", "buys_h6", "sells_h6",
+                                         "buys_m5", "sells_m5")})
         return {
-            "buys_h1": h1.get("buys"),
-            "sells_h1": h1.get("sells"),
-            "buys_h6": h6.get("buys"),
-            "sells_h6": h6.get("sells"),
-            "trades_h24": buys_h24 + sells_h24,  # Always a number, even if 0
+            **fields,
             "pair_address": None  # GT fallback has no pair info
         }, 'gt_fallback'
     
@@ -995,6 +1006,12 @@ def apply_wallet_concentration(t: dict) -> dict:
         t["evm_holder_excluded"] = result.excluded
         t["evm_holder_raw_top_wallet"] = result.raw_top_wallet
         t["evm_holder_raw_top_10"] = result.raw_top_10
+        if getattr(result, "creator", None) and not t.get("creator"):
+            t["creator"] = result.creator
+            if result.creator_balance is not None:
+                t["creator_balance"] = result.creator_balance
+            if result.creator_initial_balance is not None:
+                t["creator_initial_balance"] = result.creator_initial_balance
 
         if result.top_wallet is not None and result.top_wallet > 0.05:
             exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
@@ -1035,6 +1052,8 @@ def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict) -> dict:
     # Preserve RPC/EVM concentration — GT must not overwrite a real top_10 / top_wallet.
     preserved_top_wallet = d.get("top_wallet_percent")
     preserved_top_10 = d.get("top_10_percent")
+    gt_creator = (a.get("creator") or a.get("creator_address") or a.get("creatorAddress")
+                  or a.get("deployer") or a.get("deployer_address") or a.get("createdBy"))
     d = {**d, "chain": net,
          # GT first, FOMO as the fallback. On Robinhood GT is null and FOMO is all you get.
          "holder_count": holders.get("count") or t.get("holder_count"),
@@ -1047,7 +1066,8 @@ def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict) -> dict:
          "freeze_authority": freeze_auth_normalized,
          "freeze_authority_raw": freeze_auth_raw,
          "description": a.get("description"),
-         "x_handle": clean_handle(a.get("twitter_handle"))}
+         "x_handle": clean_handle(a.get("twitter_handle")),
+         "creator": gt_creator or t.get("creator") or d.get("creator")}
     if preserved_top_wallet is not None:
         d["top_wallet_percent"] = preserved_top_wallet
     if preserved_top_10 is not None:

@@ -364,6 +364,13 @@ class Fomo:
               or token_data.get("xUrl"))
         if tw is not None:
             updates["twitter"] = tw
+
+        creator = (token_data.get("creator") or token_data.get("creatorAddress")
+                   or token_data.get("creator_address") or token_data.get("creatorWallet")
+                   or token_data.get("deployer") or token_data.get("deployerAddress")
+                   or token_data.get("createdBy"))
+        if creator is not None:
+            updates["creator"] = creator
         
         flattened.update(updates)
         
@@ -387,7 +394,10 @@ class Fomo:
                 "change":  {sec: _f(m.get(k)) for k, sec in CHANGE_WINDOWS.items()},
                 "created": g("createdAt", "created", "pairCreatedAt"),
                 "twitter": g("twitter", "twitterUrl", "twitter_url",
-                             "twitterHandle", "twitter_handle", "x", "xUrl")}
+                             "twitterHandle", "twitter_handle", "x", "xUrl"),
+                "creator": g("creator", "creatorAddress", "creator_address",
+                             "creatorWallet", "deployer", "deployerAddress",
+                             "createdBy")}
 
 
 def _f(v):

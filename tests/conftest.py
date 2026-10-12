@@ -35,6 +35,29 @@ def isolate_gt_info_cache(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_cycle_history(tmp_path, monkeypatch):
+    """Point cycle-history at a per-test SQLite file so holder-growth cannot leak."""
+    monkeypatch.setenv("CYCLE_HISTORY_DB", str(tmp_path / "cycle_history.db"))
+    import cycle_history
+    cycle_history.reset()
+    yield
+    cycle_history.reset()
+
+
+@pytest.fixture(autouse=True)
+def isolate_judge_inputs(monkeypatch):
+    """Reset per-cycle RPC cap and injected RPC/clock between tests."""
+    import judge_inputs
+    judge_inputs.reset_cycle()
+    judge_inputs.set_rpc_fn(None)
+    judge_inputs.set_time_fn(None)
+    yield
+    judge_inputs.reset_cycle()
+    judge_inputs.set_rpc_fn(None)
+    judge_inputs.set_time_fn(None)
+
+
+@pytest.fixture(autouse=True)
 def isolate_x_cache(tmp_path, monkeypatch):
     """Point the X lookup cache at a per-test SQLite file. Reset the cycle cap."""
     monkeypatch.setenv("X_CACHE_DB", str(tmp_path / "x_cache.db"))
