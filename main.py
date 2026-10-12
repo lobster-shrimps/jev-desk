@@ -345,6 +345,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     
     # Use shared GT rate limiter (default to global singleton)
     if gt_limiter is None:
+        try:
+            import gt_api
+            gt_api.apply_desk_pacing(_gt_limiter)
+        except Exception:
+            pass
         gt_limiter = _gt_limiter
     
     # Reset cycle stats
@@ -1030,6 +1035,16 @@ def main(fomo, judge, desk, shadow=True, once=False):
                 "soft": {},
                 "tokens": []
             })
+        try:
+            import gt_api
+            gt_api.apply_desk_pacing(_gt_limiter)
+        except Exception as e:
+            log.warning("gt pro pacing: %s", safe_err(e))
+        try:
+            import outcomes
+            outcomes.maybe_start_worker()
+        except Exception as e:
+            log.warning("outcomes worker: %s", safe_err(e))
         try:
             import backtest_signals
             backtest_signals.maybe_start_weekly(now=_now())

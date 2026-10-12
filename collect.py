@@ -17,6 +17,7 @@ import requests
 
 from fomo_api import Fomo                      # Privy bearer out of Chrome over CDP
 from secret_utils import safe_err
+import gt_api
 import gt_info_cache
 import x_lookup
 
@@ -338,7 +339,16 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
             return None, True  # budget exhausted, but continue other feeds
     
     try:
-        resp = requests.get(url, params=params, headers=UA, timeout=20)
+        url = gt_api.prefer_onchain_url(url, purpose="desk")
+        resp = requests.get(
+            url, params=params, headers=gt_api.request_headers(url, purpose="desk"), timeout=20,
+        )
+        if resp.status_code in (401, 403):
+            free = gt_api.fallback_free_url(url)
+            if free:
+                gt_api.note_key_failed()
+                log.info("coingecko HTTP %s, falling back to free GT", resp.status_code)
+                resp = requests.get(free, params=params, headers=gt_api.UA, timeout=20)
         if resp.status_code == 429:
             # Extract Retry-After and record with limiter
             retry_after_sec = None
@@ -369,7 +379,10 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
                 time.sleep(backoff)
             
             # Retry
-            resp = requests.get(url, params=params, headers=UA, timeout=20)
+            url = gt_api.prefer_onchain_url(url, purpose="desk")
+            resp = requests.get(
+                url, params=params, headers=gt_api.request_headers(url, purpose="desk"), timeout=20,
+            )
             if resp.status_code == 429:
                 return None, False  # still 429 after retry, give up
         
@@ -1119,7 +1132,16 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
             raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
 
     _gt_info_cycle["attempts"] += 1
-    resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
+    info_url = gt_api.prefer_onchain_url(
+        f"{GT}/networks/{net}/tokens/{t['addr']}/info", purpose="desk",
+    )
+    resp = requests.get(info_url, headers=gt_api.request_headers(info_url, purpose="desk"), timeout=20)
+    if resp.status_code in (401, 403):
+        free = gt_api.fallback_free_url(info_url)
+        if free:
+            gt_api.note_key_failed()
+            log.info("coingecko HTTP %s on /info, falling back to free GT", resp.status_code)
+            resp = requests.get(free, headers=gt_api.UA, timeout=20)
     if resp.status_code == 429:
         # Extract Retry-After header if present
         retry_after_sec = None

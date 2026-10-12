@@ -76,6 +76,15 @@ def safe_err(e: Exception) -> str:
             return f"{param_name}=REDACTED"
         
         msg = re.sub(secret_pattern, redact_param, msg, flags=re.IGNORECASE)
+
+        # Redact raw env secret values (header-auth keys never appear as query params).
+        for env_name in (
+            "COINGECKO_API_KEY", "DESK_SECRET", "TYPESAFE_API_KEY",
+            "COINALYZE_API_KEY", "FOMO_BEARER",
+        ):
+            val = os.environ.get(env_name)
+            if val and len(val) >= 8 and val in msg:
+                msg = msg.replace(val, "REDACTED")
         
         return f"{exc_type}: {msg}"
     except Exception:

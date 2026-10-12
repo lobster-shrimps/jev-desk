@@ -3,7 +3,9 @@ Forward-price outcomes for shadow/backtest analysis.
 
 Resolves a DexScreener pool, pulls GT 5m OHLCV, and simulates two exits.
 LOG/ANALYSIS ONLY: never called from filter, judge, pick, or order paths.
-Own GT pacing (1 call / 7s); never the cycle GT limiter. Fail open.
+Own GT pacing; never the cycle GT limiter. Fail open.
+Bulk fetch in OUTCOMES_WINDOW (default 01:00-06:00 local); daytime trickle.
+Progress lives in outcomes.db (fetch_jobs) and resumes after timeout.
 Exceptions go through safe_err. Never logs secrets.
 """
 from __future__ import annotations
@@ -18,16 +20,14 @@ import time
 
 import requests
 
+import gt_api
 from secret_utils import safe_err
 
 log = logging.getLogger("outcomes")
 
 DEX_TOKENS = "https://api.dexscreener.com/tokens/v1"
-GT_API = "https://api.geckoterminal.com/api/v2"
-UA = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) desk/1.0",
-    "Accept": "application/json",
-}
+GT_API = gt_api.GT_FREE_BASE
+UA = gt_api.UA
 
 DEX_CHAIN = {1399811149: "solana", 56: "bsc", 8453: "base", 4663: "robinhood", 143: "monad"}
 GT_NET = {1399811149: "solana", 56: "bsc", 8453: "base", 4663: "robinhood", 143: "monad"}
@@ -54,6 +54,9 @@ _time_fn = time.time
 _gt_lock = threading.Lock()
 _last_gt_call = 0.0
 _gt_backoff_until = 0.0
+_trickle_mode = False
+_worker_lock = threading.Lock()
+_worker_thread: threading.Thread | None = None
 
 
 def set_get_fn(fn):
@@ -90,6 +93,7 @@ def db_path() -> pathlib.Path:
 def reset() -> None:
     """Close the cached connection and clear pacing. Tests call this."""
     global _conn, _conn_path, _last_gt_call, _gt_backoff_until
+    global _trickle_mode, _worker_thread
     if _conn is not None:
         try:
             _conn.close()
@@ -100,6 +104,14 @@ def reset() -> None:
     with _gt_lock:
         _last_gt_call = 0.0
         _gt_backoff_until = 0.0
+    _trickle_mode = False
+    with _worker_lock:
+        _worker_thread = None
+    try:
+        gt_api.set_demo_capped_fn(demo_month_capped)
+        gt_api.reset()
+    except Exception:
+        pass
 
 
 def _connect() -> sqlite3.Connection:
@@ -139,8 +151,27 @@ def _init_schema(db: sqlite3.Connection) -> None:
       sim_trail_reason TEXT,
       PRIMARY KEY (tid, entry_ts)
     );
+    CREATE TABLE IF NOT EXISTS fetch_jobs (
+      tid TEXT NOT NULL,
+      entry_ts REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt REAL,
+      last_error TEXT,
+      enqueued_at REAL NOT NULL,
+      PRIMARY KEY (tid, entry_ts)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fetch_jobs_status ON fetch_jobs(status);
+    CREATE TABLE IF NOT EXISTS cg_demo_calls (
+      yyyymm TEXT PRIMARY KEY,
+      calls INTEGER NOT NULL DEFAULT 0
+    );
     """)
     db.commit()
+    try:
+        gt_api.set_demo_capped_fn(demo_month_capped)
+    except Exception:
+        pass
 
 
 def _sleep(seconds: float) -> None:
@@ -153,7 +184,10 @@ def _sleep(seconds: float) -> None:
 
 def _http_get(url: str, params=None, timeout=HTTP_TIMEOUT):
     fn = _get_fn or requests.get
-    return fn(url, params=params, timeout=timeout, headers=UA)
+    return fn(
+        url, params=params, timeout=timeout,
+        headers=gt_api.request_headers(url, purpose="outcomes"),
+    )
 
 
 def parse_tid(tid) -> tuple[str | None, int | None]:
@@ -407,11 +441,12 @@ def put_cached(tid: str, entry_ts: float, payload: dict) -> None:
 
 
 def _pace_gt(deadline: float | None) -> bool:
-    """Wait for own 7s spacing and 429 backoff. False if the deadline would be missed."""
+    """Wait for own spacing and 429 backoff. False if the deadline would be missed."""
     global _last_gt_call
+    spacing = gt_api.outcomes_spacing_sec(trickle=_trickle_mode)
     with _gt_lock:
         now = current_time()
-        wait_until = max(_last_gt_call + GT_SPACING_SEC, _gt_backoff_until)
+        wait_until = max(_last_gt_call + spacing, _gt_backoff_until)
         wait = wait_until - now
     if wait > 0:
         if deadline is not None and current_time() + wait > deadline:
@@ -477,10 +512,55 @@ def resolve_pool(tid: str) -> tuple[str | None, str | None]:
         return None, chain
 
 
+def _yyyymm(now: float | None = None) -> str:
+    ts = current_time() if now is None else float(now)
+    lt = time.localtime(ts)
+    return f"{lt.tm_year:04d}-{lt.tm_mon:02d}"
+
+
+def demo_calls_this_month(now: float | None = None) -> int:
+    try:
+        db = _connect()
+        row = db.execute(
+            "SELECT calls FROM cg_demo_calls WHERE yyyymm = ?",
+            (_yyyymm(now),),
+        ).fetchone()
+        return int(row["calls"]) if row else 0
+    except Exception as e:
+        log.warning("demo call counter read failed: %s", safe_err(e))
+        return gt_api.DEMO_MONTHLY_CAP
+
+
+def record_demo_call(now: float | None = None) -> int:
+    """Count one Demo onchain request. Returns the new monthly total."""
+    month = _yyyymm(now)
+    try:
+        db = _connect()
+        db.execute(
+            """INSERT INTO cg_demo_calls (yyyymm, calls) VALUES (?, 1)
+               ON CONFLICT(yyyymm) DO UPDATE SET calls = calls + 1""",
+            (month,),
+        )
+        db.commit()
+        row = db.execute(
+            "SELECT calls FROM cg_demo_calls WHERE yyyymm = ?", (month,),
+        ).fetchone()
+        return int(row["calls"]) if row else 1
+    except Exception as e:
+        log.warning("demo call counter write failed: %s", safe_err(e))
+        return gt_api.DEMO_MONTHLY_CAP
+
+
+def demo_month_capped(now: float | None = None) -> bool:
+    return demo_calls_this_month(now) >= gt_api.DEMO_MONTHLY_CAP
+
+
 def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None = None):
-    """GT 5m OHLCV ending at entry+6h. Own limiter. None on 429/error."""
+    """GT / CoinGecko 5m OHLCV ending at entry+6h. Own limiter. None on 429/error."""
     net = chain
-    url = f"{GT_API}/networks/{net}/pools/{pool}/ohlcv/minute"
+    url = gt_api.prefer_onchain_url(
+        f"{GT_API}/networks/{net}/pools/{pool}/ohlcv/minute", purpose="outcomes",
+    )
     params = {
         "aggregate": 5,
         "before_timestamp": int(float(entry_ts) + WINDOW_SEC),
@@ -493,7 +573,18 @@ def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None =
         return None
     try:
         resp = _http_get(url, params=params, timeout=HTTP_TIMEOUT)
+        if gt_api.is_demo_url(url):
+            n = record_demo_call()
+            if n >= gt_api.DEMO_MONTHLY_CAP:
+                log.info("coingecko demo monthly cap reached (%d), falling back to free GT", n)
         status = getattr(resp, "status_code", None)
+        if status in (401, 403):
+            free = gt_api.fallback_free_url(url)
+            if free:
+                gt_api.note_key_failed()
+                log.info("outcomes coingecko HTTP %s, falling back to free GT", status)
+                resp = _http_get(free, params=params, timeout=HTTP_TIMEOUT)
+                status = getattr(resp, "status_code", None)
         if status == 429:
             _note_gt_429()
             return None
@@ -557,3 +648,217 @@ def fetch_outcome(tid: str, entry_ts: float, *, now: float | None = None,
             return get_cached(tid, entry_ts)
         except Exception:
             return None
+
+
+# ---------------------------------------------------------------------------
+# Resumable fetch queue (outcomes.db fetch_jobs)
+# ---------------------------------------------------------------------------
+
+def enqueue_job(tid: str, entry_ts: float, *, now: float | None = None) -> bool:
+    """Insert a pending job if missing. False if already complete/cached."""
+    try:
+        cached = get_cached(tid, entry_ts)
+        if cached and cached.get("complete"):
+            _upsert_job(tid, entry_ts, status="complete", now=now)
+            return False
+        db = _connect()
+        ts = current_time() if now is None else float(now)
+        db.execute(
+            """INSERT OR IGNORE INTO fetch_jobs
+               (tid, entry_ts, status, attempts, enqueued_at)
+               VALUES (?, ?, 'pending', 0, ?)""",
+            (str(tid), float(entry_ts), ts),
+        )
+        db.commit()
+        return True
+    except Exception as e:
+        log.warning("outcomes enqueue failed: %s", safe_err(e))
+        return False
+
+
+def _upsert_job(tid: str, entry_ts: float, *, status: str, now: float | None = None,
+                error: str | None = None, bump_attempt: bool = False) -> None:
+    try:
+        db = _connect()
+        ts = current_time() if now is None else float(now)
+        row = db.execute(
+            "SELECT attempts FROM fetch_jobs WHERE tid = ? AND ABS(entry_ts - ?) < 1e-6",
+            (str(tid), float(entry_ts)),
+        ).fetchone()
+        attempts = int(row["attempts"]) if row else 0
+        if bump_attempt:
+            attempts += 1
+        db.execute(
+            """INSERT INTO fetch_jobs
+               (tid, entry_ts, status, attempts, last_attempt, last_error, enqueued_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(tid, entry_ts) DO UPDATE SET
+                 status = excluded.status,
+                 attempts = excluded.attempts,
+                 last_attempt = excluded.last_attempt,
+                 last_error = excluded.last_error""",
+            (str(tid), float(entry_ts), status, attempts, ts, error, ts),
+        )
+        db.commit()
+    except Exception as e:
+        log.warning("outcomes job update failed: %s", safe_err(e))
+
+
+def list_jobs(status: str | None = "pending", limit: int = 500) -> list[dict]:
+    try:
+        db = _connect()
+        if status:
+            rows = db.execute(
+                """SELECT tid, entry_ts, status, attempts, last_attempt, last_error
+                   FROM fetch_jobs WHERE status = ?
+                   ORDER BY entry_ts, tid LIMIT ?""",
+                (status, int(limit)),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT tid, entry_ts, status, attempts, last_attempt, last_error
+                   FROM fetch_jobs ORDER BY entry_ts, tid LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.warning("outcomes job list failed: %s", safe_err(e))
+        return []
+
+
+def enqueue_from_history(*, days: int = 7, now: float | None = None) -> int:
+    """Queue shadow-kill rows that are old enough. Idempotent. Fail open."""
+    now = current_time() if now is None else float(now)
+    since = now - float(days) * 86400
+    n = 0
+    try:
+        import cycle_history
+        rows = cycle_history.shadow_kills_since(since, now)
+        for row in rows:
+            tid = row.get("tid")
+            entry_ts = row.get("entry_ts") if row.get("entry_ts") is not None else row.get("ts")
+            if not tid or entry_ts is None:
+                continue
+            if enqueue_job(str(tid), float(entry_ts), now=now):
+                n += 1
+    except Exception as e:
+        log.warning("outcomes enqueue from history: %s", safe_err(e))
+    return n
+
+
+def cycle_gt_paused(now: float | None = None) -> bool:
+    """True when the desk cycle limiter is in a 429 backoff or saw a 429 this cycle."""
+    now = current_time() if now is None else float(now)
+    try:
+        import main as shift
+        lim = getattr(shift, "_gt_limiter", None)
+        if lim is None:
+            return False
+        if float(getattr(lim, "backoff_until", 0) or 0) > now:
+            return True
+        if int(getattr(lim, "stats_429_count", 0) or 0) > 0:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def drain_jobs(*, now: float | None = None, deadline: float | None = None,
+               max_calls: int | None = None, trickle: bool | None = None) -> dict:
+    """Fetch pending jobs one at a time. Commits after each. Resumes later.
+
+    trickle=None means: trickle when outside OUTCOMES_WINDOW.
+    Pauses on cycle GT 429. Fail open.
+    """
+    global _trickle_mode
+    now = current_time() if now is None else float(now)
+    if trickle is None:
+        trickle = not gt_api.in_outcomes_window(now)
+    _trickle_mode = bool(trickle)
+    fetched = 0
+    complete = 0
+    paused = False
+    try:
+        jobs = list_jobs("pending")
+        for job in jobs:
+            if deadline is not None and current_time() >= deadline:
+                break
+            if cycle_gt_paused():
+                paused = True
+                log.info("outcomes fetch paused (cycle GT 429)")
+                break
+            tid = job["tid"]
+            entry_ts = float(job["entry_ts"])
+            if now < entry_ts + READY_AFTER_SEC:
+                continue
+            payload = fetch_outcome(tid, entry_ts, now=now, deadline=deadline)
+            fetched += 1
+            if payload and payload.get("complete"):
+                _upsert_job(tid, entry_ts, status="complete", now=now, bump_attempt=True)
+                complete += 1
+            else:
+                err = None if payload else "incomplete"
+                _upsert_job(tid, entry_ts, status="pending", now=now,
+                            error=err, bump_attempt=True)
+            if max_calls is not None and fetched >= int(max_calls):
+                break
+    except Exception as e:
+        log.warning("outcomes drain failed: %s", safe_err(e))
+    finally:
+        _trickle_mode = False
+    remaining = len(list_jobs("pending"))
+    log.info(
+        "outcomes drain fetched=%d complete=%d remaining=%d trickle=%s paused=%s",
+        fetched, complete, remaining, bool(trickle), paused,
+    )
+    return {
+        "fetched": fetched, "complete": complete, "remaining": remaining,
+        "trickle": bool(trickle), "paused": paused,
+    }
+
+
+def tick_fetch(*, now: float | None = None, days: int = 7,
+               deadline: float | None = None) -> dict:
+    """One worker slice: enqueue, then drain (bulk in-window, else 1 trickle call)."""
+    now = current_time() if now is None else float(now)
+    try:
+        enqueue_from_history(days=days, now=now)
+        if cycle_gt_paused(now):
+            log.info("outcomes fetch paused (cycle GT 429)")
+            return {"fetched": 0, "complete": 0, "remaining": len(list_jobs("pending")),
+                    "paused": True}
+        if gt_api.in_outcomes_window(now):
+            return drain_jobs(now=now, deadline=deadline, trickle=False)
+        return drain_jobs(now=now, deadline=deadline, trickle=True, max_calls=1)
+    except Exception as e:
+        log.warning("outcomes tick failed: %s", safe_err(e))
+        return {"fetched": 0, "error": safe_err(e)}
+
+
+def maybe_start_worker() -> threading.Thread | None:
+    """Background fetch worker. Fail open. Disabled by OUTCOMES_FETCH_DISABLE=1."""
+    if os.environ.get("OUTCOMES_FETCH_DISABLE") == "1":
+        return None
+    global _worker_thread
+    with _worker_lock:
+        if _worker_thread is not None and _worker_thread.is_alive():
+            return None
+
+        def _loop():
+            while True:
+                try:
+                    now = current_time()
+                    if gt_api.in_outcomes_window(now):
+                        tick_fetch(now=now, deadline=now + 60.0)
+                    else:
+                        tick_fetch(now=now, deadline=now + 30.0)
+                        _sleep(gt_api.outcomes_spacing_sec(trickle=True))
+                except Exception as e:
+                    log.warning("outcomes worker: %s", safe_err(e))
+                    _sleep(10.0)
+
+        t = threading.Thread(target=_loop, name="outcomes-fetch", daemon=True)
+        _worker_thread = t
+        t.start()
+        log.info("outcomes fetch worker started")
+        return t
