@@ -404,7 +404,7 @@ def test_market_seat_receives_new_keys(monkeypatch):
     class Desk:
         def bank(self):
             return 1000.0
-        def read_x(self, h):
+        def read_x(self, h, tid=None, token=None):
             return None
         def log_shadow(self, o, s, fomo_data=None):
             pass

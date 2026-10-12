@@ -35,6 +35,8 @@ def summary(d, ans) -> str:
     if "account_is_the_project" in ans:
         bits.append(f"official account {ans['account_is_the_project']['noul']:.2f}, "
                     f"effort {ans['effort']['score']:.1f}")
+    elif isinstance(d.get("x_account"), dict) and d["x_account"].get("x_kind") == "borrowed":
+        bits.append("linked X is unrelated big account")
     else:
         bits.append("no usable X account")
     # Optional richer inputs. Omitted when missing so the prefix stays parseable.

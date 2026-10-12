@@ -49,11 +49,12 @@ class Desk:
     def bank(self) -> float:
         return self.bank_usd
 
-    def read_x(self, handle: str, tid: str | None = None):
+    def read_x(self, handle: str, tid: str | None = None, token: dict | None = None):
         """X block for the SOCIAL question set. Missing is missing: never substitute.
 
         SOCIAL_URL still POSTs to the bot. Unset: fxtwitter via x_lookup.read_x.
         tid is the token id for the `x tid=` log line.
+        token is the dossier used to mark borrowed celebrity/unrelated accounts.
         """
         if not handle:
             return None
@@ -63,11 +64,17 @@ class Desk:
                 r.raise_for_status()
                 block = r.json()
                 x = block.get("x_account", block) if isinstance(block, dict) else None
-                return x or None
+                if not x:
+                    return None
+                try:
+                    return x_lookup.apply_x_kind(x, token, handle=handle)
+                except Exception as kind_e:
+                    log.warning("x_kind classify: %s", safe_err(kind_e))
+                    return x
             except Exception as e:
                 log.warning("SOCIAL read failed for @%s: %s", handle, safe_err(e))
                 return None
-        return x_lookup.read_x(handle, tid=tid)
+        return x_lookup.read_x(handle, tid=tid, token=token)
 
     # ---- outputs --------------------------------------------------------------
     def log_shadow(self, order: dict, stats: dict, fomo_data: dict = None):

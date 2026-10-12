@@ -803,7 +803,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                          d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("holder_count"))
 
             d["intended_ticket_usd"] = bank * 0.06   # the most SIZE could ever allow
-            d["x_account"] = desk.read_x(d["x_handle"], tid=d.get("tid")) if d["x_handle"] else None
+            d["x_account"] = desk.read_x(d["x_handle"], tid=d.get("tid"), token=d) if d["x_handle"] else None
             try:
                 judge_inputs.attach(d)
             except Exception as e:
@@ -813,7 +813,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             try:
                 ans |= judge("market", d)["answers"]                  # pass four
                 ans |= judge(CHAIN_SET[d["net"]], d)["answers"]
-                if d["x_account"]:
+                xa = d.get("x_account")
+                if xa and not (isinstance(xa, dict) and xa.get("x_kind") == "borrowed"):
                     ans |= judge("social", social_state(d))["answers"]
                 stats["judged"] += 1
             except RuntimeError as e:                # 422: the question is wrong and stays wrong
