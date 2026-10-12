@@ -13,6 +13,7 @@ No trade is a result. Log it with the reason, send it to Telegram, and stand dow
 import logging
 from secret_utils import safe_err
 from thresholds import PICK_MIN_WORTH, PICK_MIN_CONF, DARK_TICKET_CUT, NO_SOCIAL_CUT
+from judge_inputs import format_flow
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,14 @@ def summary(d, ans) -> str:
                     f"effort {ans['effort']['score']:.1f}")
     else:
         bits.append("no usable X account")
+    # Optional richer inputs. Omitted when missing so the prefix stays parseable.
+    flow = d.get("flow") or format_flow(d)
+    if flow:
+        bits.append(flow)
+    if d.get("holder_growth"):
+        bits.append(d["holder_growth"])
+    if d.get("dev_sells"):
+        bits.append(d["dev_sells"])
     return "; ".join(bits)
 
 

@@ -33,6 +33,7 @@ from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
 from pick import pick, size_factor_for, summary
 from secret_utils import safe_err
+import judge_inputs
 import shadow_ledger
 import collect  # For fallback access
 from thresholds import HARD, SOFT, PICK_MIN_WORTH, PICK_MIN_CONF
@@ -309,6 +310,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     _clear_sol_owner_cache()
     reset_gt_info_cycle_stats()
     x_lookup.reset_cycle()
+    judge_inputs.reset_cycle()
     
     # Item #13: Prune old EVM holder cache entries
     try:
@@ -802,6 +804,10 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
 
             d["intended_ticket_usd"] = bank * 0.06   # the most SIZE could ever allow
             d["x_account"] = desk.read_x(d["x_handle"], tid=d.get("tid")) if d["x_handle"] else None
+            try:
+                judge_inputs.attach(d)
+            except Exception as e:
+                log.warning("judge inputs: %s", safe_err(e))
 
             ans = {}
             try:
