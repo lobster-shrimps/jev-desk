@@ -90,6 +90,28 @@ def _route(profile=None, statuses=None, profile_exc=None, statuses_exc=None):
     return get, calls
 
 
+def _project_route(handle="tokacct", ticker="XTK", followers=1200, joined=None):
+    """Profile that mentions the token — not a borrowed celebrity account."""
+    joined = joined or "2026-10-11T00:00:00Z"
+    posts = {
+        "code": 200,
+        "results": [{
+            "type": "status",
+            "created_at": "2026-10-12T00:00:00Z",
+            "text": f"${ticker} launching now",
+            "likes": 1, "replies": 1, "views": 10,
+            "author": {"screen_name": handle},
+        }],
+    }
+    return _route(
+        profile=_resp(200, _profile_body(
+            handle=handle, followers=followers, name=f"{ticker} Token",
+            description=f"the official ${ticker} token", joined=joined,
+        )),
+        statuses=_resp(200, posts),
+    )
+
+
 # ---- handle normalization ----------------------------------------------------
 
 @pytest.mark.parametrize("raw,want", [
@@ -147,6 +169,7 @@ def test_success_builds_x_account_block():
     assert block["screen_name"] == "tokacct"
     assert block["name"] == "Token Acct"
     assert block["followers"] == 1200
+    assert block["x_kind"] == "official"
     assert block["following"] == 10
     assert block["tweets"] == 40
     assert block["protected"] is False
@@ -508,6 +531,13 @@ def test_info_line_format(caplog):
     assert "source=fxtwitter" in line
     assert "err=-" in line
     assert "tid=Addr:1399811149" in line
+    assert " x_kind=" in line
+    assert line.index(" err=") < line.index(" x_kind=")
+    prefix = line.split(" x_kind=")[0]
+    assert prefix.startswith("x tid=")
+    assert all(k in prefix for k in (
+        "handle=", "ok=", "followers=", "own_posts=", "source=", "err=",
+    ))
 
 
 # ---- handle sources: GT, DexScreener, FOMO -----------------------------------
@@ -619,7 +649,24 @@ def test_desk_read_x_keeps_social_url_path(monkeypatch):
         with patch("x_lookup.requests.get", side_effect=AssertionError("no fxtwitter")):
             block = desk.read_x("tokacct")
     assert posted == [("http://social.test/x", {"x_handle": "tokacct"})]
-    assert block == {"handle": "bot", "followers": 9}
+    assert block["handle"] == "bot"
+    assert block["followers"] == 9
+    assert block["x_kind"] == "official"
+
+
+def test_desk_social_url_marks_famous_borrowed(monkeypatch):
+    monkeypatch.setenv("SOCIAL_URL", "http://social.test/x")
+    desk = Desk()
+
+    def fake_post(url, json=None, timeout=None):
+        r = Mock()
+        r.raise_for_status = Mock()
+        r.json.return_value = {"x_account": {"handle": "elonmusk", "followers": 9}}
+        return r
+
+    with patch("desk.requests.post", side_effect=fake_post):
+        block = desk.read_x("elonmusk", token=_casino_token())
+    assert block["x_kind"] == "borrowed"
 
 
 def test_desk_read_x_social_url_failure_uses_safe_err(monkeypatch, caplog):
@@ -753,7 +800,7 @@ def test_social_judge_only_when_x_account_truthy(monkeypatch):
 
     monkeypatch.delenv("SOCIAL_URL", raising=False)
     desk = _RecDesk()
-    get, _ = _route()
+    get, _ = _project_route(handle="tokacct", ticker="XTK")
     with patch("x_lookup.requests.get", side_effect=get):
         shift.run_once(type("F", (), {"token": lambda self: None})(),
                        judge_ok, desk, 1000.0, shadow=True, gt_dossier_reserve=3)
@@ -868,6 +915,225 @@ def test_cycle_soft_unevaluated_judge_format_strings_unchanged():
 def test_main_still_desk_read_x_with_tid():
     src = (ROOT / "main.py").read_text()
     assert (
-        'd["x_account"] = desk.read_x(d["x_handle"], tid=d.get("tid")) '
+        'd["x_account"] = desk.read_x(d["x_handle"], tid=d.get("tid"), token=d) '
         'if d["x_handle"] else None'
     ) in src
+    xsrc = (ROOT / "x_lookup.py").read_text()
+    assert (
+        '"x tid=%s handle=%s ok=%s followers=%s own_posts=%s source=%s err=%s"'
+    ) in xsrc
+    assert "x_kind=%s" in xsrc
+
+
+# ---- borrowed / celebrity accounts -------------------------------------------
+
+def _casino_token(**extra):
+    return {
+        "ticker": "casino",
+        "name": "Casino Coin",
+        "addr": "CasAddr111111111111111111111111111111",
+        "age_minutes": 42,
+        **extra,
+    }
+
+
+def test_famous_handle_is_borrowed():
+    get, _ = _route(
+        profile=_resp(200, _profile_body(
+            handle="elonmusk", followers=200_000_000, name="Elon Musk",
+            description="Mars", joined="2009-06-02T00:00:00Z",
+        )),
+        statuses=_resp(200, _statuses_body(handle="elonmusk", n=2)),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("elonmusk", token=_casino_token())
+    assert block["x_kind"] == "borrowed"
+
+
+def test_famous_handle_case_insensitive_and_without_token():
+    get, _ = _route(
+        profile=_resp(200, _profile_body(handle="CZ_Binance", followers=9000)),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("CZ_Binance")
+    assert block["x_kind"] == "borrowed"
+    assert "cz_binance" in x_lookup.FAMOUS_HANDLES
+    assert "elonmusk" in x_lookup.FAMOUS_HANDLES
+
+
+def test_followers_over_1m_is_borrowed_even_if_mentions_token():
+    get, _ = _project_route(handle="hugeacct", ticker="casino", followers=1_000_001)
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("hugeacct", token=_casino_token())
+    assert block["x_kind"] == "borrowed"
+    get2, _ = _project_route(handle="almost", ticker="casino", followers=1_000_000)
+    x_lookup.reset()
+    with patch("x_lookup.requests.get", side_effect=get2):
+        block2 = x_lookup.read_x("almost", token=_casino_token())
+    assert block2["x_kind"] == "official"
+
+
+def test_old_account_no_mention_is_borrowed():
+    get, _ = _route(
+        profile=_resp(200, _profile_body(
+            handle="oldacct", followers=50_000, name="Random Person",
+            description="just vibes", joined="2020-01-01T00:00:00Z",
+        )),
+        statuses=_resp(200, _statuses_body(handle="oldacct", n=3)),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("oldacct", token=_casino_token())
+    assert block["account_age_days"] is not None
+    assert block["account_age_days"] >= 90
+    assert block["x_kind"] == "borrowed"
+
+
+def test_old_account_mentioning_ticker_is_official():
+    get, _ = _route(
+        profile=_resp(200, _profile_body(
+            handle="oldproj", followers=8000, name="Casino Token",
+            description="the official $casino launch", joined="2020-01-01T00:00:00Z",
+        )),
+        statuses=_resp(200, _statuses_body(handle="oldproj", n=2)),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("oldproj", token=_casino_token())
+    assert block["x_kind"] == "official"
+
+
+def test_old_account_mentioning_contract_is_official():
+    addr = "CasAddr111111111111111111111111111111"
+    get, _ = _route(
+        profile=_resp(200, _profile_body(
+            handle="oldproj", followers=8000, name="A Wallet",
+            description=f"ca {addr}", joined="2020-01-01T00:00:00Z",
+        )),
+        statuses=_resp(200, _statuses_body(handle="oldproj", n=1)),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("oldproj", token=_casino_token())
+    assert block["x_kind"] == "official"
+
+
+def test_young_account_no_mention_is_official():
+    get, _ = _route(
+        profile=_resp(200, _profile_body(
+            handle="newacct", followers=200, name="New Acct",
+            description="just launched", joined="2026-10-11T12:00:00Z",
+        )),
+        statuses=_resp(200, _statuses_body(handle="newacct", n=2)),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("newacct", token=_casino_token())
+    assert block["x_kind"] == "official"
+
+
+def test_x_kind_not_cached_is_token_specific():
+    get, calls = _route(
+        profile=_resp(200, _profile_body(
+            handle="shared", followers=4000, name="Foo Desk",
+            description="the official $FOO token", joined="2020-01-01T00:00:00Z",
+        )),
+        statuses=_resp(200, _statuses_body(handle="shared", n=2)),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        foo = x_lookup.read_x("shared", token={
+            "ticker": "FOO", "age_minutes": 42, "addr": "FooAddr11111111111111111111111111",
+        })
+        bar = x_lookup.read_x("shared", token=_casino_token())
+    assert foo["x_kind"] == "official"
+    assert bar["x_kind"] == "borrowed"
+    assert sum("/statuses" in u for u in calls) == 1  # second read is cache
+
+
+def test_x_tid_line_appends_x_kind_borrowed(caplog):
+    caplog.set_level(logging.INFO)
+    get, _ = _route(
+        profile=_resp(200, _profile_body(
+            handle="elonmusk", followers=200_000_000, name="Elon Musk",
+            description="Mars",
+        )),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        x_lookup.read_x("elonmusk", tid="Cas:1399811149", token=_casino_token())
+    lines = [r.message for r in caplog.records if r.message.startswith("x tid=")]
+    assert lines
+    line = lines[0]
+    assert line.startswith(
+        "x tid=Cas:1399811149 handle=elonmusk ok=True followers=200000000"
+    )
+    assert "source=fxtwitter" in line
+    assert "err=-" in line
+    assert line.endswith("x_kind=borrowed") or " x_kind=borrowed" in line
+    assert line.index(" err=") < line.index(" x_kind=")
+
+
+def test_summary_borrowed_not_official():
+    d = {
+        "chain": "solana", "age_minutes": 42, "mcap_usd": 1,
+        "liquidity_usd": 1, "holder_count": 10, "ticker": "casino",
+        "x_account": {"handle": "elonmusk", "x_kind": "borrowed"},
+    }
+    ans = {
+        "shape": {"probabilities": {"crowd": 0.7}},
+        "concentration_is_exit_risk": {"noul": 0.2},
+    }
+    s = summary(d, ans)
+    assert "linked X is unrelated big account" in s
+    assert "official account" not in s
+    assert "no usable X account" not in s
+    assert size_factor_for(ans) == NO_SOCIAL_CUT
+
+
+def test_classify_fail_open_is_official():
+    block = {"handle": "tokacct", "followers": "not-a-number",
+             "account_age_days": "also-bad"}
+    assert x_lookup.classify_x_kind(block, _casino_token()) == "official"
+    stamped = x_lookup.apply_x_kind(None)
+    assert stamped is None
+
+
+def test_social_judge_skipped_for_borrowed_elonmusk(monkeypatch):
+    _wire_judge_token(monkeypatch, x_handle="elonmusk")
+    sets_called = []
+
+    def judge(qs, state):
+        sets_called.append(qs)
+        if qs == "social":
+            raise AssertionError("borrowed account must not go to social judge")
+        if qs == "pick":
+            ticker = state["candidates"][0]["ticker"]
+            return {"model": "test", "answers": {
+                "best": {"type": "choice", "choice": ticker, "confidence": 0.9,
+                         "probabilities": {ticker: 0.9}},
+                "worth_trading_at_all": {"type": "noul", "noul": 0.8},
+            }, "usage": {}}
+        return {"model": "test", "answers": _pass_market(), "usage": {}}
+
+    monkeypatch.delenv("SOCIAL_URL", raising=False)
+    desk = _RecDesk()
+    get, _ = _route(
+        profile=_resp(200, _profile_body(
+            handle="elonmusk", followers=200_000_000, name="Elon Musk",
+            description="Mars",
+        )),
+    )
+    with patch("x_lookup.requests.get", side_effect=get):
+        monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
+            **t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+            "developer_holding_percentage": 2, "gt_score_details": None,
+            "is_honeypot": None, "mint_authority": False, "freeze_authority": False,
+            "description": "casino coin", "x_handle": "elonmusk", "net": 1399811149,
+            "ticker": "casino"})
+        shift.run_once(type("F", (), {"token": lambda self: None})(),
+                       judge, desk, 1000.0, shadow=True, gt_dossier_reserve=3)
+    assert "social" not in sets_called
+    assert desk.shadow
+    assert "account_is_the_project" not in desk.shadow[0]["why"]
+    assert desk.shadow[0]["size_factor"] == NO_SOCIAL_CUT
+    s = summary({"chain": "solana", "age_minutes": 42, "mcap_usd": 1,
+                 "liquidity_usd": 1, "holder_count": 10, "ticker": "casino",
+                 "x_account": {"handle": "elonmusk", "x_kind": "borrowed"}},
+                desk.shadow[0]["why"])
+    assert "linked X is unrelated big account" in s
+    assert "official account" not in s
