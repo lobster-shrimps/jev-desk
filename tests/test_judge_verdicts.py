@@ -44,7 +44,7 @@ class _Desk:
     def bank(self):
         return 1000.0
 
-    def read_x(self, h):
+    def read_x(self, h, tid=None):
         return None
 
     def log_shadow(self, o, s, fomo_data=None):

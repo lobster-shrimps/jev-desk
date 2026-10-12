@@ -5,8 +5,10 @@ safe_err and the caller sees None, which is today's NO_SOCIAL_CUT path.
 
 Cache lives under outbox/ (default outbox/x_cache.db). Positive hits last
 30 minutes; negative hits last 10. Per-cycle HTTP lookups are capped by
-X_LOOKUPS_PER_CYCLE (default 15). Only tokens that reached the judge step
-should call this.
+X_LOOKUPS_PER_CYCLE (default 15) and a wall-clock budget X_LOOKUP_BUDGET_SEC
+(default 60). Only tokens that reached the judge step should call this.
+Statuses 404s are retried (the fxtwitter timeline flaps); a statuses 404
+never negative-caches a good profile.
 """
 from __future__ import annotations
 
@@ -32,8 +34,11 @@ TIMEOUT_SEC = 10
 POSITIVE_TTL_SEC = 30 * 60
 NEGATIVE_TTL_SEC = 10 * 60
 DEFAULT_LOOKUPS_PER_CYCLE = 15
+DEFAULT_BUDGET_SEC = 60.0
 LOCK_TIMEOUT_SEC = 0.2
 STATUSES_COUNT = 10
+STATUSES_404_RETRIES = 2          # extra tries after the first 404
+STATUSES_404_GAP_SEC = 1.5        # pause between statuses 404 retries
 
 HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 RESERVED_PATHS = {
@@ -45,13 +50,21 @@ TWITTER_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com"}
 _conn: sqlite3.Connection | None = None
 _conn_path: str | None = None
 _time_fn = time.time
+_sleep_fn = time.sleep
 _lookups_this_cycle = 0
+_window_start: float | None = None
 
 
 def set_time_fn(fn):
     """Inject a clock for deterministic tests. Pass None to restore time.time."""
     global _time_fn
     _time_fn = time.time if fn is None else fn
+
+
+def set_sleep_fn(fn):
+    """Inject sleep for tests. Pass None to restore time.sleep."""
+    global _sleep_fn
+    _sleep_fn = time.sleep if fn is None else fn
 
 
 def current_time() -> float:
@@ -79,10 +92,21 @@ def lookups_per_cycle() -> int:
         return DEFAULT_LOOKUPS_PER_CYCLE
 
 
+def lookup_budget_sec() -> float:
+    raw = os.environ.get("X_LOOKUP_BUDGET_SEC")
+    if raw is None or raw == "":
+        return DEFAULT_BUDGET_SEC
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_BUDGET_SEC
+
+
 def reset_cycle() -> None:
-    """Clear the per-cycle HTTP lookup counter. main.run_once calls this."""
-    global _lookups_this_cycle
+    """Clear the per-cycle HTTP counter and wall-clock window. main.run_once calls this."""
+    global _lookups_this_cycle, _window_start
     _lookups_this_cycle = 0
+    _window_start = None
 
 
 def cycle_lookups() -> int:
@@ -188,6 +212,15 @@ def read_x(handle: str, tid: str | None = None) -> dict | None:
             _log_lookup(tid, handle, False, None, None, "cache", "-")
             return None
 
+        if _over_budget():
+            elapsed = 0.0 if _window_start is None else current_time() - _window_start
+            log.info(
+                "x budget exceeded elapsed=%.1fs budget=%s tid=%s handle=%s",
+                elapsed, lookup_budget_sec(), tid or "-", handle,
+            )
+            _log_lookup(tid, handle, False, None, None, "none", "budget")
+            return None
+
         cap = lookups_per_cycle()
         if _lookups_this_cycle >= cap:
             _log_lookup(tid, handle, False, None, None, "none", "cap")
@@ -276,24 +309,24 @@ def _fetch_account(handle: str) -> dict | None:
     }
 
 
-def _fetch_statuses(handle: str) -> list:
-    """Last ~10 posts. Best-effort: failure yields [] so a profile still ships."""
-    url = FX_STATUSES_URL.format(handle=quote(handle, safe="")) + f"?count={STATUSES_COUNT}"
-    try:
-        resp = _get_with_retry(url)
-        if resp.status_code != 200:
-            log.warning("x statuses HTTP %s for @%s: %s", resp.status_code, handle,
-                        safe_err(RuntimeError(f"HTTP {resp.status_code}")))
-            return []
-        try:
-            payload = resp.json()
-        except Exception as e:
-            log.warning("x statuses JSON for @%s: %s", handle, safe_err(e))
-            return []
-    except Exception as e:
-        log.warning("x statuses failed for @%s: %s", handle, safe_err(e))
-        return []
+def _over_budget() -> bool:
+    """True when this cycle's X-lookup wall-clock window is exhausted.
 
+    The window opens on the first uncached HTTP lookup. Cache hits do not
+    start it. budget<=0 skips every HTTP lookup (fail open).
+    """
+    global _window_start
+    budget = lookup_budget_sec()
+    now = current_time()
+    if _window_start is None:
+        if budget <= 0:
+            return True
+        _window_start = now
+        return False
+    return (now - _window_start) >= budget
+
+
+def _parse_statuses_payload(payload) -> list:
     results = []
     if isinstance(payload, dict):
         results = payload.get("results") or payload.get("tweets") or []
@@ -301,13 +334,53 @@ def _fetch_statuses(handle: str) -> list:
         results = payload
     if not isinstance(results, list):
         return []
-
     posts = []
     for item in results[:STATUSES_COUNT]:
         post = _shape_post(item)
         if post is not None:
             posts.append(post)
     return posts
+
+
+def _fetch_statuses(handle: str) -> list:
+    """Last ~10 posts. Best-effort: failure yields [] so a profile still ships.
+
+    fxtwitter's statuses endpoint flaps 200/404 within seconds. Retry a 404
+    up to STATUSES_404_RETRIES extra times with a short gap. A statuses 404
+    must not fail (or negative-cache) the profile.
+    """
+    url = FX_STATUSES_URL.format(handle=quote(handle, safe="")) + f"?count={STATUSES_COUNT}"
+    last_status = None
+    for attempt in range(1 + STATUSES_404_RETRIES):
+        try:
+            resp = _get_with_retry(url)
+        except Exception as e:
+            log.warning("x statuses failed for @%s: %s", handle, safe_err(e))
+            return []
+        last_status = getattr(resp, "status_code", 0) or 0
+        if last_status == 200:
+            try:
+                payload = resp.json()
+            except Exception as e:
+                log.warning("x statuses JSON for @%s: %s", handle, safe_err(e))
+                return []
+            return _parse_statuses_payload(payload)
+        if last_status == 404 and attempt < STATUSES_404_RETRIES:
+            log.info(
+                "x statuses 404 retry %s/%s handle=%s",
+                attempt + 1, STATUSES_404_RETRIES, handle,
+            )
+            try:
+                _sleep_fn(STATUSES_404_GAP_SEC)
+            except Exception as e:
+                log.warning("x statuses sleep: %s", safe_err(e))
+            continue
+        log.warning("x statuses HTTP %s for @%s: %s", last_status, handle,
+                    safe_err(RuntimeError(f"HTTP {last_status}")))
+        return []
+    log.warning("x statuses HTTP %s for @%s: %s", last_status, handle,
+                safe_err(RuntimeError(f"HTTP {last_status}")))
+    return []
 
 
 def _shape_post(item) -> dict | None:

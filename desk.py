@@ -49,10 +49,11 @@ class Desk:
     def bank(self) -> float:
         return self.bank_usd
 
-    def read_x(self, handle: str):
+    def read_x(self, handle: str, tid: str | None = None):
         """X block for the SOCIAL question set. Missing is missing: never substitute.
 
         SOCIAL_URL still POSTs to the bot. Unset: fxtwitter via x_lookup.read_x.
+        tid is the token id for the `x tid=` log line.
         """
         if not handle:
             return None
@@ -66,7 +67,7 @@ class Desk:
             except Exception as e:
                 log.warning("SOCIAL read failed for @%s: %s", handle, safe_err(e))
                 return None
-        return x_lookup.read_x(handle)
+        return x_lookup.read_x(handle, tid=tid)
 
     # ---- outputs --------------------------------------------------------------
     def log_shadow(self, order: dict, stats: dict, fomo_data: dict = None):

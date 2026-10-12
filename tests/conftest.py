@@ -41,9 +41,11 @@ def isolate_x_cache(tmp_path, monkeypatch):
     import x_lookup
     x_lookup.reset()
     x_lookup.set_time_fn(None)
+    x_lookup.set_sleep_fn(lambda _d: None)
     yield
     x_lookup.reset()
     x_lookup.set_time_fn(None)
+    x_lookup.set_sleep_fn(None)
 
 
 @pytest.fixture
