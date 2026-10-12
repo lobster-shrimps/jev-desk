@@ -275,6 +275,101 @@ def test_per_cycle_cap_is_respected():
                    or "/profile/two/" in u for u in monkey_calls)
 
 
+def test_statuses_404_retries_then_succeeds():
+    """fxtwitter statuses flaps 404; retry up to 2 more times with a gap."""
+    slept = []
+    x_lookup.set_sleep_fn(lambda d: slept.append(d))
+    status_calls = []
+
+    def get(url, timeout=None, **kw):
+        if "/statuses" in url:
+            status_calls.append(url)
+            if len(status_calls) < 3:
+                return _resp(404, {"code": 404, "message": "NOT_FOUND"})
+            return _resp(200, _statuses_body(n=4))
+        return _resp(200, _profile_body())
+
+    with patch("x_lookup.requests.get", side_effect=get):
+        block = x_lookup.read_x("tokacct")
+    assert block is not None
+    assert block["followers"] == 1200
+    assert block["own_posts_count"] == 4
+    assert len(status_calls) == 3
+    assert slept == [x_lookup.STATUSES_404_GAP_SEC, x_lookup.STATUSES_404_GAP_SEC]
+    assert 1.0 <= x_lookup.STATUSES_404_GAP_SEC <= 2.0
+
+
+def test_statuses_404_does_not_negative_cache_profile(caplog):
+    """Statuses 404 after retries still ships the profile and positive-caches it."""
+    caplog.set_level(logging.INFO)
+    calls = []
+
+    def get(url, timeout=None, **kw):
+        calls.append(url)
+        if "/statuses" in url:
+            return _resp(404, {"code": 404, "message": "NOT_FOUND"})
+        return _resp(200, _profile_body(followers=777))
+
+    with patch("x_lookup.requests.get", side_effect=get):
+        first = x_lookup.read_x("tokacct")
+        n = len(calls)
+        second = x_lookup.read_x("tokacct")
+    assert first is not None
+    assert first["followers"] == 777
+    assert first["own_posts_count"] == 0
+    assert second is not None
+    assert second["followers"] == 777
+    assert len(calls) == n  # cache hit, not a negative miss
+    assert any("source=cache" in r.message and "ok=True" in r.message
+               for r in caplog.records if r.message.startswith("x "))
+    statuses = [u for u in calls if "/statuses" in u]
+    assert len(statuses) == 1 + x_lookup.STATUSES_404_RETRIES
+
+
+def test_lookup_budget_skips_remaining_and_logs(caplog):
+    caplog.set_level(logging.INFO)
+    clock = [1_000.0]
+    x_lookup.set_time_fn(lambda: clock[0])
+    calls = []
+
+    def get(url, timeout=None, **kw):
+        calls.append(url)
+        if "/statuses" not in url:
+            clock[0] += 35.0  # one lookup ≈ 35s wall-clock
+        if "/statuses" in url:
+            return _resp(200, _statuses_body(n=1))
+        handle = url.rstrip("/").split("/")[-1]
+        return _resp(200, _profile_body(handle=handle))
+
+    with patch.dict(os.environ, {"X_LOOKUP_BUDGET_SEC": "60"}):
+        x_lookup.reset_cycle()
+        with patch("x_lookup.requests.get", side_effect=get):
+            a = x_lookup.read_x("one", tid="t1")
+            b = x_lookup.read_x("two", tid="t2")
+            c = x_lookup.read_x("three", tid="t3")
+    assert a is not None
+    assert b is not None
+    assert c is None
+    assert not any("three" in u for u in calls)
+    assert any("x budget exceeded" in r.message for r in caplog.records)
+    skip = [r.message for r in caplog.records if r.message.startswith("x tid=t3")]
+    assert skip and "err=budget" in skip[0] and "ok=False" in skip[0]
+
+
+def test_lookup_budget_zero_skips_all_http():
+    calls = []
+
+    def get(url, timeout=None, **kw):
+        calls.append(url)
+        return _resp(200, _profile_body())
+
+    with patch.dict(os.environ, {"X_LOOKUP_BUDGET_SEC": "0"}):
+        x_lookup.reset_cycle()
+        with patch("x_lookup.requests.get", side_effect=get):
+            assert x_lookup.read_x("one") is None
+    assert calls == []
+
+
 def test_cache_hit_does_not_consume_cap():
     get, calls = _route()
     with patch.dict(os.environ, {"X_LOOKUPS_PER_CYCLE": "1"}):
@@ -396,6 +491,19 @@ def test_desk_read_x_uses_fxtwitter_when_social_url_unset(monkeypatch):
     assert block["followers"] == 1200
 
 
+def test_desk_read_x_passes_tid_into_log(monkeypatch, caplog):
+    monkeypatch.delenv("SOCIAL_URL", raising=False)
+    desk = Desk()
+    caplog.set_level(logging.INFO)
+    get, _ = _route()
+    with patch("x_lookup.requests.get", side_effect=get):
+        desk.read_x("tokacct", tid="XTok:1399811149")
+    lines = [r.message for r in caplog.records if r.message.startswith("x tid=")]
+    assert lines
+    assert "tid=XTok:1399811149" in lines[0]
+    assert "handle=tokacct" in lines[0]
+
+
 def test_desk_read_x_keeps_social_url_path(monkeypatch):
     monkeypatch.setenv("SOCIAL_URL", "http://social.test/x")
     desk = Desk()
@@ -505,6 +613,24 @@ def _wire_judge_token(monkeypatch, x_handle="tokacct"):
          "trades_h24": 4000}, "ok"))
     monkeypatch.setattr(shift, "dossier", fake_dossier)
     return tid
+
+
+def test_run_once_x_log_includes_token_tid(monkeypatch, caplog):
+    monkeypatch.delenv("SOCIAL_URL", raising=False)
+    _wire_judge_token(monkeypatch, x_handle="tokacct")
+    caplog.set_level(logging.INFO)
+    desk = _RecDesk()
+    get, _ = _route()
+
+    def judge(qs, state):
+        return {"model": "test", "answers": _pass_market(), "usage": {}}
+
+    with patch("x_lookup.requests.get", side_effect=get):
+        shift.run_once(type("F", (), {"token": lambda self: None})(),
+                       judge, desk, 1000.0, shadow=True, gt_dossier_reserve=3)
+    lines = [r.message for r in caplog.records if r.message.startswith("x tid=")]
+    assert lines
+    assert "tid=XTok:1399811149" in lines[0]
 
 
 def test_social_judge_only_when_x_account_truthy(monkeypatch):
@@ -640,6 +766,9 @@ def test_cycle_soft_unevaluated_judge_format_strings_unchanged():
     ) in src
 
 
-def test_main_788_still_desk_read_x():
+def test_main_still_desk_read_x_with_tid():
     src = (ROOT / "main.py").read_text()
-    assert 'd["x_account"] = desk.read_x(d["x_handle"]) if d["x_handle"] else None' in src
+    assert (
+        'd["x_account"] = desk.read_x(d["x_handle"], tid=d.get("tid")) '
+        'if d["x_handle"] else None'
+    ) in src

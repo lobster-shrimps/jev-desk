@@ -510,7 +510,7 @@ def test_run_once_writes_history_and_keeps_log_lines(hist, monkeypatch, caplog):
 
     class Desk:
         def bank(self): return 1000.0
-        def read_x(self, h): return None
+        def read_x(self, h, tid=None): return None
         def log_shadow(self, o, s, fomo_data=None): pass
         def report(self, o, s): pass
         def send_to_seats(self, o): pass
@@ -776,7 +776,7 @@ def test_run_once_records_limiter_gt_429(hist, monkeypatch):
 
     class Desk:
         def bank(self): return 1000.0
-        def read_x(self, h): return None
+        def read_x(self, h, tid=None): return None
         def log_shadow(self, o, s, fomo_data=None): pass
         def report(self, o, s): pass
         def send_to_seats(self, o): pass
