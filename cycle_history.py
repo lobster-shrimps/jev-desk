@@ -1089,6 +1089,21 @@ def _regime_dict(r: sqlite3.Row) -> dict:
     }
 
 
+def latest_regime() -> str | None:
+    """Most recent market_regimes.regime. No HTTP. Fail open."""
+    try:
+        db = _connect()
+        row = db.execute(
+            "SELECT regime FROM market_regimes WHERE regime IS NOT NULL "
+            "ORDER BY ts DESC LIMIT 1",
+        ).fetchone()
+        if row and row["regime"]:
+            return str(row["regime"])
+    except Exception as e:
+        log.info("cycle history latest regime: %s", safe_err(e))
+    return None
+
+
 def _regimes_since(since_ts: float, until_ts: float | None = None) -> list[dict]:
     try:
         if until_ts is None:

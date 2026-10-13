@@ -138,8 +138,26 @@ def _connect() -> sqlite3.Connection:
     return _conn
 
 
+def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
+    """One schema change. Failure is logged and does not skip later steps."""
+    try:
+        fn()
+        db.commit()
+    except Exception as e:
+        log.warning("outcomes schema %s: %s", name, safe_err(e))
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 def _init_schema(db: sqlite3.Connection) -> None:
-    db.executescript("""
+    """Idempotent. ALTER priority before any index that names it.
+
+    Each step commits on its own so a failure (e.g. index on a missing
+    column on a live pre-#60 DB) cannot abort cg_demo_calls_daily / gt_pacing.
+    """
+    _schema_step(db, "outcomes", lambda: db.execute("""
     CREATE TABLE IF NOT EXISTS outcomes (
       tid TEXT NOT NULL,
       entry_ts REAL NOT NULL,
@@ -156,7 +174,8 @@ def _init_schema(db: sqlite3.Connection) -> None:
       sim_trail_pnl REAL,
       sim_trail_reason TEXT,
       PRIMARY KEY (tid, entry_ts)
-    );
+    )"""))
+    _schema_step(db, "fetch_jobs", lambda: db.execute("""
     CREATE TABLE IF NOT EXISTS fetch_jobs (
       tid TEXT NOT NULL,
       entry_ts REAL NOT NULL,
@@ -167,47 +186,45 @@ def _init_schema(db: sqlite3.Connection) -> None:
       enqueued_at REAL NOT NULL,
       priority INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (tid, entry_ts)
-    );
-    CREATE INDEX IF NOT EXISTS idx_fetch_jobs_status ON fetch_jobs(status);
-    CREATE INDEX IF NOT EXISTS idx_fetch_jobs_drain
-      ON fetch_jobs(status, priority, attempts, last_attempt);
+    )"""))
+    _schema_step(db, "priority", lambda: _ensure_fetch_job_priority(db))
+    _schema_step(db, "idx_status", lambda: db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fetch_jobs_status ON fetch_jobs(status)"
+    ))
+    _schema_step(db, "idx_drain", lambda: db.execute(
+        """CREATE INDEX IF NOT EXISTS idx_fetch_jobs_drain
+           ON fetch_jobs(status, priority, attempts, last_attempt)"""
+    ))
+    _schema_step(db, "cg_demo_calls", lambda: db.execute("""
     CREATE TABLE IF NOT EXISTS cg_demo_calls (
       yyyymm TEXT PRIMARY KEY,
       calls INTEGER NOT NULL DEFAULT 0
-    );
+    )"""))
+    _schema_step(db, "cg_demo_calls_daily", lambda: db.execute("""
     CREATE TABLE IF NOT EXISTS cg_demo_calls_daily (
       yyyymmdd TEXT PRIMARY KEY,
       calls INTEGER NOT NULL DEFAULT 0
-    );
+    )"""))
+    _schema_step(db, "gt_pacing", lambda: db.execute("""
     CREATE TABLE IF NOT EXISTS gt_pacing (
       k TEXT PRIMARY KEY,
       v REAL NOT NULL
-    );
-    """)
-    db.commit()
-    _ensure_fetch_job_priority(db)
-    try:
-        _retire_overlimit_jobs(db)
-    except Exception as e:
-        log.warning("outcomes retire overlimit failed: %s", safe_err(e))
+    )"""))
+    _schema_step(db, "retire_overlimit", lambda: _retire_overlimit_jobs(db))
     try:
         gt_api.set_demo_capped_fn(demo_budget_capped)
     except Exception:
         pass
-    _load_pacing(db)
+    _schema_step(db, "load_pacing", lambda: _load_pacing(db))
 
 
 def _ensure_fetch_job_priority(db: sqlite3.Connection) -> None:
-    """Existing DBs created before priority: default 0 (live)."""
-    try:
-        cols = {row[1] for row in db.execute("PRAGMA table_info(fetch_jobs)")}
-        if "priority" not in cols:
-            db.execute(
-                "ALTER TABLE fetch_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
-            )
-            db.commit()
-    except Exception as e:
-        log.warning("outcomes priority migrate: %s", safe_err(e))
+    """Existing DBs created before priority: default 0 (live). Raises on failure."""
+    cols = {row[1] for row in db.execute("PRAGMA table_info(fetch_jobs)")}
+    if "priority" not in cols:
+        db.execute(
+            "ALTER TABLE fetch_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _load_pacing(db: sqlite3.Connection | None = None) -> None:

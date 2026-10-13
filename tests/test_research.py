@@ -653,3 +653,111 @@ def test_backfill_streams_gzip_logs_not_whole_read(rs, tmp_path, monkeypatch):
     assert sum(n.values()) >= 1
     rows = rs.run_sql("SELECT ticker, origin FROM token_snapshots")
     assert any(r["ticker"] == "GZZ" for r in rows)
+
+
+def test_regime_now_uses_last_regime_not_latest(rs, caplog):
+    import coinalyze
+    caplog.set_level(logging.INFO)
+    assert not hasattr(coinalyze, "latest")
+    coinalyze._last_snap = {"regime": "risk_on"}
+    try:
+        assert rs._regime_now() == "risk_on"
+    finally:
+        coinalyze._last_snap = None
+    assert "has no attribute latest" not in caplog.text
+
+
+def test_regime_now_falls_back_to_market_regimes(rs, tmp_path, monkeypatch):
+    import coinalyze
+    import cycle_history
+    monkeypatch.setenv("CYCLE_HISTORY_DB", str(tmp_path / "ch_reg2.db"))
+    cycle_history.reset()
+    coinalyze._last_snap = None
+    t0 = ts(2026, 10, 12, 8)
+    db = cycle_history._connect()
+    db.execute(
+        "INSERT INTO market_regimes (cycle_id, ts, ts_iso, regime, metrics_json, symbols_json) "
+        "VALUES (?,?,?,?,?,?)",
+        (1, t0, "2026-10-12T08:00:00Z", "long_flush", "{}", "{}"),
+    )
+    db.commit()
+    assert rs._regime_now() == "long_flush"
+    cycle_history.reset()
+
+
+def test_snapshot_wires_dex_txns_volume_and_x_cache(rs, tmp_path, monkeypatch):
+    import x_lookup
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    x_lookup.reset()
+    t0 = ts(2026, 10, 13, 12)
+    xdb = x_lookup._connect()
+    xdb.execute(
+        "INSERT OR REPLACE INTO x_cache (handle, payload_json, ok, fetched_at) VALUES (?,?,?,?)",
+        ("tokacct", json.dumps({"followers": 4242, "x_kind": "official"}), 1, t0),
+    )
+    xdb.commit()
+    stats = _stats(tokens=[{
+        "tid": "Dex:1399811149", "ticker": "DEX", "stage": "trade",
+        "reason": "trades", "age_minutes": 18,
+    }])
+    shortlist = [{
+        "tid": "Dex:1399811149", "ticker": "DEX", "net": 1399811149,
+        "fomo_twitter": "tokacct",
+        "txns": {"h1": {"buys": 80, "sells": 40}, "m5": {"buys": 12, "sells": 9}},
+        "volume": {"h1": 12345.0, "m5": 100.0},
+    }]
+    n = rs.on_cycle(stats, tokens=shortlist, now=t0)
+    assert n == 1
+    row = rs.run_sql("SELECT * FROM token_snapshots")[0]
+    assert row["buys_1h"] == pytest.approx(80)
+    assert row["sells_1h"] == pytest.approx(40)
+    assert row["vol_1h"] == pytest.approx(12345.0)
+    assert row["vol_5m"] == pytest.approx(100.0)
+    assert row["x_handle"] == "tokacct"
+    assert row["x_followers"] == 4242
+    assert row["x_kind"] == "official"
+    x_lookup.reset()
+
+
+def test_backfill_x_followers_and_buys_from_logs(rs, tmp_path, monkeypatch):
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    t0 = ts(2026, 10, 2, 8)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "Lg:1399811149", "ticker": "LG", "stage": "trade",
+        "reason": "trades", "age_minutes": 20,
+    }]), now=t0, origin="backfill:run.log", skip_labels=True)
+    p = tmp_path / "run.log"
+    p.write_text(
+        "2026-10-02 08:00:00 desk INFO x tid=Lg:1399811149 handle=tokacct "
+        "ok=True followers=777 own_posts=4 source=cache err=- x_kind=official\n"
+        "2026-10-02 08:00:01 desk INFO trade tid=Lg:1399811149 ticker=LG "
+        "reason=trades age_minutes=20 trades_h24=400 buys_h1=54 sells_h1=12 "
+        "dex_status=ok trades_source=dex\n"
+    )
+    n = rs.backfill_from_run_log()
+    assert sum(n.values()) >= 1
+    row = rs.run_sql("SELECT x_followers, x_handle, x_kind, buys_1h FROM token_snapshots")[0]
+    assert row["x_followers"] == 777
+    assert row["x_handle"] == "tokacct"
+    assert row["x_kind"] == "official"
+    assert row["buys_1h"] == pytest.approx(54)
+
+
+def test_on_cycle_merges_shortlist_buys_vol_followers(rs):
+    t0 = ts(2026, 10, 13, 12)
+    stats = _stats(tokens=[{
+        "tid": "HelLo:1399811149", "ticker": "hellop", "stage": "soft",
+        "reason": "momentum_already_spent", "age_minutes": 22,
+        "x_followers": 1200,
+    }])
+    shortlist = [{
+        "tid": "HelLo:1399811149",
+        "buys_h1": 80, "vol_1h": 5000.0,
+        "x_handle": "hellopcoin",
+        "x_account": {"followers": 1200, "x_kind": "official"},
+    }]
+    rs.on_cycle(stats, tokens=shortlist, now=t0)
+    r = rs.run_sql("SELECT buys_1h, vol_1h, x_followers FROM token_snapshots")[0]
+    assert r["buys_1h"] == pytest.approx(80)
+    assert r["vol_1h"] == pytest.approx(5000.0)
+    assert r["x_followers"] == 1200
