@@ -1806,6 +1806,38 @@ def _render_regime_md(bundle: dict) -> list[str]:
     return lines
 
 
+def _young_trail_md_lines(yt: dict) -> list[str]:
+    """One briefing block. Paper ledger; never live orders."""
+    sm = (yt or {}).get("summary") or yt or {}
+    wr = sm.get("win_rate")
+    wr_s = "—" if wr is None else f"{float(wr):.0%}"
+    realized = float(sm.get("realized_pnl_usd") or 0)
+    until = yt.get("until_iso") or ""
+    until_bit = f" until {until}" if until else ""
+    flag = "on" if yt.get("enabled", True) else "off"
+    return [
+        f"- Paper $50 · SL -30% · trail 30% from peak · 6h time · no live orders ({flag}{until_bit})",
+        f"- Open: {sm.get('open_count', 0)} · Closed: {sm.get('closed_count', 0)} · "
+        f"Win rate: {wr_s} · Realized: ${realized:+.2f}",
+    ]
+
+
+def _young_trail_briefing() -> dict:
+    try:
+        import young_trail
+        return young_trail.ops_payload()
+    except Exception as e:
+        log.warning("young_trail briefing: %s", safe_err(e))
+        return {
+            "paper": True, "simulated": True, "live_orders": False,
+            "error": "unavailable",
+            "summary": {
+                "open_count": 0, "closed_count": 0, "win_rate": 0.0,
+                "realized_pnl_usd": 0.0,
+            },
+        }
+
+
 def render_briefing_md(payload: dict) -> str:
     w = payload.get("last_24h") or {}
     up = w.get("uptime") or {}
@@ -1940,6 +1972,9 @@ def render_briefing_md(payload: dict) -> str:
         f"({sh.get('closed_trades', 0)} closed, {sh.get('winning_trades', 0)}W/{sh.get('losing_trades', 0)}L)",
         f"- Open positions: {sh.get('open_positions', 0)}",
         "",
+        "## Young trail (paper, simulated)",
+        *_young_trail_md_lines(payload.get("young_trail") or {}),
+        "",
         "## Market regime (log-only)",
     ]
     lines.extend(_render_regime_md(w.get("regime") or {}))
@@ -2023,6 +2058,7 @@ def build_briefing(now: float | None = None, *, localtime: Callable | None = Non
         "last_24h": window,
         "trends": trends,
         "persisted": False,
+        "young_trail": _young_trail_briefing(),
     }
     payload["markdown"] = render_briefing_md(payload)
     return payload

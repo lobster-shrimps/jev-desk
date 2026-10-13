@@ -636,6 +636,8 @@ tr:hover td { background: #151515; }
   <div id="briefing-young"></div>
   <div class="section-title">Picks / fills / shadow P&amp;L</div>
   <div id="briefing-shadow"></div>
+  <div class="section-title">Young trail (paper, simulated)</div>
+  <div id="briefing-young-trail"></div>
   <div class="section-title">Desk uptime</div>
   <div id="briefing-uptime"></div>
   <details>
@@ -748,6 +750,14 @@ tr:hover td { background: #151515; }
     These are hypothetical positions using $50 entry tickets. Shadow picks are not fills. Only realized PnL from filled closes counts.
   </div>
   <div id="shadow-ledger-section"></div>
+</div>
+
+<div class="section" id="young-trail-panel">
+  <div class="section-title">Young trail (paper, simulated)</div>
+  <div class="shadow-disclaimer">
+    SIMULATED paper ledger. $50 tickets on young free-pass (&lt;60m), first tid only. SL -30%, 30% trail from peak, 6h time. Does not change judging, picks, thresholds, cutoff, or ticket size. No live orders. Realized P&amp;L counts closed rows only.
+  </div>
+  <div id="young-trail-section"></div>
 </div>
 
 <div class="section">
@@ -1459,6 +1469,78 @@ function makeTokenLinks(tid, ticker, chain) {
   return links.join(' ');
 }
 
+function renderYoungTrail(data) {
+  const section = document.getElementById('young-trail-section');
+  if (!section) return;
+  if (!data) {
+    section.innerHTML = '<div class="empty">Loading young trail...</div>';
+    return;
+  }
+  const sm = data.summary || {};
+  const opens = data.open_positions || [];
+  const closes = data.closed_trades || [];
+  const realized = sm.realized_pnl_usd || 0;
+  let html = '<div class="pnl-grid">';
+  html += `
+    <div class="pnl-stat">
+      <div class="pnl-label">Realized PnL (closed only)</div>
+      <div class="pnl-value ${realized >= 0 ? 'positive' : 'negative'}">$${Number(realized).toFixed(2)}</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Closed trades</div>
+      <div class="pnl-value">${sm.closed_count || 0}</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Win rate</div>
+      <div class="pnl-value">${((sm.win_rate || 0) * 100).toFixed(1)}%</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Open positions</div>
+      <div class="pnl-value">${sm.open_count || 0}</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Until</div>
+      <div class="pnl-value" style="font-size:12px">${esc(data.until_iso || '—')}</div>
+    </div>
+  `;
+  html += '</div>';
+  if (opens.length) {
+    html += '<h3 style="font-size:13px;margin:20px 0 10px;color:#fff;">Open (unrealized)</h3>';
+    html += '<table><thead><tr><th>Ticker</th><th>Chain</th><th>Entry</th><th>Peak</th><th>Last</th><th>Links</th></tr></thead><tbody>';
+    opens.forEach(p => {
+      const links = makeTokenLinks(p.tid, p.ticker, p.chain);
+      html += `<tr>
+        <td>${esc(p.ticker || '—')}${links}</td>
+        <td>${esc(p.chain || '—')}</td>
+        <td>$${Number(p.entry_price || 0).toFixed(6)}</td>
+        <td>$${Number(p.peak || 0).toFixed(6)}</td>
+        <td>${p.last_price == null ? '—' : '$' + Number(p.last_price).toFixed(6)}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  if (closes.length) {
+    html += '<h3 style="font-size:13px;margin:20px 0 10px;color:#fff;">Closed (realized)</h3>';
+    html += '<table><thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL USD</th><th>Reason</th><th>Links</th></tr></thead><tbody>';
+    closes.forEach(p => {
+      const links = makeTokenLinks(p.tid, p.ticker, p.chain);
+      const pnl = p.pnl_usd == null ? 0 : Number(p.pnl_usd);
+      html += `<tr>
+        <td>${esc(p.ticker || '—')}${links}</td>
+        <td>$${Number(p.entry_price || 0).toFixed(6)}</td>
+        <td>${p.exit_price == null ? '—' : '$' + Number(p.exit_price).toFixed(6)}</td>
+        <td class="${pnl >= 0 ? 'positive' : 'negative'}">$${pnl.toFixed(2)}</td>
+        <td>${esc(p.exit_reason || '—')}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  if (!opens.length && !closes.length) {
+    html += '<div class="empty">No young-trail paper trades yet</div>';
+  }
+  section.innerHTML = html;
+}
+
 function renderShadowLedger(ledger) {
   const section = document.getElementById('shadow-ledger-section');
   
@@ -1758,6 +1840,15 @@ async function refresh() {
     }
 
     try {
+      const ytResp = await fetch('/ops/young_trail');
+      if (ytResp.ok) {
+        renderYoungTrail(await ytResp.json());
+      }
+    } catch (e) {
+      console.warn('Could not fetch young trail:', e);
+    }
+
+    try {
       const briefResp = await fetch('/ops/briefing');
       if (briefResp.ok) {
         renderBriefing(await briefResp.json());
@@ -2005,6 +2096,20 @@ function renderBriefing(data) {
     <div class="pnl-stat"><div class="pnl-label">Closed</div><div class="pnl-value">${sh.closed_trades||0}</div></div>
     <div class="pnl-stat"><div class="pnl-label">Open</div><div class="pnl-value">${sh.open_positions||0}</div></div>
   </div><div class="shadow-disclaimer">${esc(sh.fills_note||'shadow only — picks are not fills')}</div>`;
+
+  const ytEl = document.getElementById('briefing-young-trail');
+  if (ytEl) {
+    const yt = data.young_trail || {};
+    const yts = yt.summary || {};
+    const yReal = yts.realized_pnl_usd || 0;
+    ytEl.innerHTML = `<div class="pnl-grid">
+      <div class="pnl-stat"><div class="pnl-label">Open</div><div class="pnl-value">${yts.open_count||0}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Closed</div><div class="pnl-value">${yts.closed_count||0}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Win rate</div><div class="pnl-value">${((yts.win_rate||0)*100).toFixed(1)}%</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Realized</div>
+        <div class="pnl-value ${yReal>=0?'positive':'negative'}">$${Number(yReal).toFixed(2)}</div></div>
+    </div><div class="shadow-disclaimer">Paper only. $50 · SL -30% · trail 30% · 6h. No live orders. Until ${esc(yt.until_iso||'—')}.</div>`;
+  }
 
   document.getElementById('briefing-uptime').innerHTML =
     `${up.cycles||0} cycles / ${up.expected_cycles||0} expected (${(up.uptime_pct||0).toFixed(1)}%)`;
