@@ -32,6 +32,7 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 
 import requests
@@ -61,6 +62,8 @@ SEEN_WINDOW_SEC = 3 * 3600
 LOCK_TIMEOUT_SEC = 0.2
 VACUUM_INTERVAL_SEC = 7 * 86400
 SQL_ROW_LIMIT = 500
+LABELS_INTERVAL_SEC = 600.0
+QUEUE_MAX_DEFAULT = 200
 HORIZONS_SEC = (("ret_15m", 15 * 60), ("ret_1h", 3600),
                 ("ret_3h", 3 * 3600), ("ret_6h", 6 * 3600))
 FREE_STAGES = frozenset({
@@ -79,6 +82,8 @@ _sleep_fn = None
 _time_fn = time.time
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
+_db_lock = threading.RLock()
+_last_labels_at = 0.0
 
 
 def set_get_fn(fn):
@@ -114,7 +119,7 @@ def db_path() -> pathlib.Path:
 
 def reset() -> None:
     """Close the cached connection. Tests call this between cases."""
-    global _conn, _conn_path, _worker_thread
+    global _conn, _conn_path, _worker_thread, _last_labels_at
     if _conn is not None:
         try:
             _conn.close()
@@ -122,8 +127,16 @@ def reset() -> None:
             pass
     _conn = None
     _conn_path = None
+    _last_labels_at = 0.0
     with _worker_lock:
         _worker_thread = None
+
+
+@contextmanager
+def _locked():
+    """Serialize research.db writes across the cycle thread and sampler thread."""
+    with _db_lock:
+        yield _connect()
 
 
 def _connect() -> sqlite3.Connection:
@@ -444,10 +457,14 @@ def _regime_now() -> str | None:
 def on_cycle(stats: dict | None = None, tokens=None, now: float | None = None,
              source: str = "live", origin: str | None = None,
              skip_labels: bool = False) -> int:
-    """Write one snapshot per recorded token this cycle. Never raises; never blocks."""
+    """Write one snapshot per recorded token this cycle. Never raises; never blocks.
+
+    skip_labels is accepted for backfill callers; labels never run on this thread.
+    """
     if not stats or "held" in stats:
         return 0
     origin = _as_origin(origin or source, default="live")
+    _ = skip_labels
     ts = current_time() if now is None else float(now)
     shortlist = {}
     for t in tokens or []:
@@ -460,35 +477,29 @@ def on_cycle(stats: dict | None = None, tokens=None, now: float | None = None,
         regime = None
     n = 0
     try:
-        db = _connect()
-        seen = set()
-        rows = list(stats.get("tokens") or [])
-        for y in stats.get("young_free") or []:
-            if isinstance(y, dict) and y.get("tid"):
-                rows.append({**y, "stage": y.get("stage") or "trade", "reason": y.get("reason") or "pass"})
-        for raw in rows:
-            if not isinstance(raw, dict) or not raw.get("tid"):
-                continue
-            tid = raw["tid"]
-            src = dict(shortlist.get(tid) or {})
-            src.update({k: v for k, v in raw.items() if v is not None})
-            stage = src.get("stage") or ""
-            key = (int(ts), tid, stage)
-            if key in seen:
-                continue
-            seen.add(key)
-            if _insert_snapshot(db, _row_from_token(
-                src, ts, stage=stage, regime=regime, origin=origin,
-            )):
-                n += 1
-        db.commit()
-        if not skip_labels:
-            try:
-                tids = [tid for (_ts, tid, _st) in seen]
-                if tids:
-                    compute_labels(tids=tids, now=ts)
-            except Exception as e:
-                log.warning("research labels: %s", safe_err(e))
+        with _locked() as db:
+            seen = set()
+            rows = list(stats.get("tokens") or [])
+            for y in stats.get("young_free") or []:
+                if isinstance(y, dict) and y.get("tid"):
+                    rows.append({**y, "stage": y.get("stage") or "trade", "reason": y.get("reason") or "pass"})
+            for raw in rows:
+                if not isinstance(raw, dict) or not raw.get("tid"):
+                    continue
+                tid = raw["tid"]
+                src = dict(shortlist.get(tid) or {})
+                src.update({k: v for k, v in raw.items() if v is not None})
+                stage = src.get("stage") or ""
+                key = (int(ts), tid, stage)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if _insert_snapshot(db, _row_from_token(
+                    src, ts, stage=stage, regime=regime, origin=origin,
+                )):
+                    n += 1
+            db.commit()
+        # Labels run on the sampler thread (maybe_compute_labels), not the desk cycle.
         if not str(origin).startswith("backfill"):
             try:
                 maybe_vacuum(now=ts)
@@ -542,16 +553,16 @@ def sampler_candidates(now: float | None = None, cap: int = BATCH_CAP) -> list[s
     for tid in _open_young_trail_tids():
         add(tid)
     try:
-        db = _connect()
-        rows = db.execute(
-            """SELECT tid, MIN(age_min) AS age
-               FROM token_snapshots
-               WHERE ts >= ?
-               GROUP BY tid
-               HAVING age IS NULL OR age < ?
-               ORDER BY MAX(ts) DESC""",
-            (now - SEEN_WINDOW_SEC, YOUNG_AGE_MAX_MIN),
-        ).fetchall()
+        with _locked() as db:
+            rows = db.execute(
+                """SELECT tid, MIN(age_min) AS age
+                   FROM token_snapshots
+                   WHERE ts >= ?
+                   GROUP BY tid
+                   HAVING age IS NULL OR age < ?
+                   ORDER BY MAX(ts) DESC""",
+                (now - SEEN_WINDOW_SEC, YOUNG_AGE_MAX_MIN),
+            ).fetchall()
         for r in rows:
             add(r["tid"])
     except Exception as e:
@@ -656,30 +667,30 @@ def tick_sampler(now: float | None = None) -> dict:
         if not tids:
             return empty
         prices = fetch_dex_batch(tids)
-        db = _connect()
         n = 0
-        for tid in tids:
-            mark = prices.get(tid)
-            if not mark or not mark.get("price_usd"):
-                continue
-            if _insert_mark(db, {
-                "ts": ts, "ts_sec": int(ts), "tid": tid,
-                "chain": mark.get("chain") or chain_of(tid=tid),
-                "ticker": mark.get("ticker"),
-                "price_usd": mark.get("price_usd"),
-                "liq_usd": mark.get("liq_usd"),
-                "fdv": mark.get("fdv"),
-                "vol_5m": mark.get("vol_5m"),
-                "vol_1h": mark.get("vol_1h"),
-                "vol_h24": mark.get("vol_h24"),
-                "source": "dex_batch",
-                "origin": "live",
-            }):
-                n += 1
-        db.commit()
+        with _locked() as db:
+            for tid in tids:
+                mark = prices.get(tid)
+                if not mark or not mark.get("price_usd"):
+                    continue
+                if _insert_mark(db, {
+                    "ts": ts, "ts_sec": int(ts), "tid": tid,
+                    "chain": mark.get("chain") or chain_of(tid=tid),
+                    "ticker": mark.get("ticker"),
+                    "price_usd": mark.get("price_usd"),
+                    "liq_usd": mark.get("liq_usd"),
+                    "fdv": mark.get("fdv"),
+                    "vol_5m": mark.get("vol_5m"),
+                    "vol_1h": mark.get("vol_1h"),
+                    "vol_h24": mark.get("vol_h24"),
+                    "source": "dex_batch",
+                    "origin": "live",
+                }):
+                    n += 1
+            db.commit()
         log.info("research sampler n=%d marks=%d", len(tids), n)
         try:
-            compute_labels(tids=tids, now=ts)
+            maybe_compute_labels(tids=tids, now=ts)
         except Exception as e:
             log.warning("research labels: %s", safe_err(e))
         return {"n": len(tids), "marks": n}
@@ -824,103 +835,122 @@ def _outcomes_overlay(tid: str) -> dict:
     return out
 
 
+def maybe_compute_labels(tids: list[str] | None = None,
+                         now: float | None = None) -> int:
+    """Throttle labels to every 10 min on the sampler thread. Logs elapsed."""
+    global _last_labels_at
+    now = current_time() if now is None else float(now)
+    if _last_labels_at and (now - _last_labels_at) < LABELS_INTERVAL_SEC:
+        return 0
+    t0 = time.perf_counter()
+    n = 0
+    try:
+        n = compute_labels(tids=tids, now=now)
+    except Exception as e:
+        log.warning("research labels: %s", safe_err(e))
+    elapsed = time.perf_counter() - t0
+    _last_labels_at = now
+    log.info("research labels n=%d elapsed=%.3fs", n, elapsed)
+    return n
+
+
 def compute_labels(tids: list[str] | None = None, now: float | None = None) -> int:
     """Peak, horizons, rug flag from snapshots + fast_marks + outcomes.db."""
     now = current_time() if now is None else float(now)
-    db = _connect()
-    if tids is None:
-        tids = [r["tid"] for r in db.execute("SELECT DISTINCT tid FROM token_snapshots")]
-        extra = [r["tid"] for r in db.execute("SELECT DISTINCT tid FROM fast_marks")]
-        for t in extra:
-            if t not in tids:
-                tids.append(t)
-    n = 0
-    for tid in tids:
-        try:
-            first = db.execute(
-                "SELECT * FROM token_snapshots WHERE tid = ? ORDER BY ts ASC LIMIT 1",
-                (tid,),
-            ).fetchone()
-            free = _first_free(tid)
-            if first is None and free is None:
-                continue
-            first_seen = float((first or free)["ts"])
-            first_free_ts = float(free["ts"]) if free is not None else first_seen
-            ticker = (free or first)["ticker"] if (free or first) else None
-            chain = (free or first)["chain"] if (free or first) else None
-            series = _price_series(tid)
-            entry = None
-            if free is not None:
-                entry = _num(free["price_usd"])
-            if entry is None:
-                entry = _price_at_or_before(series, first_free_ts + 1, after_ts=first_seen)
-            overlay = _outcomes_overlay(tid)
-            if entry is None and overlay.get("entry_ts"):
-                entry = _price_at_or_before(series, overlay["entry_ts"] + 1)
-            peak_px = None
-            peak_ts = None
-            max_liq = None
-            rug_ts = None
-            for ts, px, liq in series:
-                if ts < first_free_ts:
+    with _locked() as db:
+        if tids is None:
+            tids = [r["tid"] for r in db.execute("SELECT DISTINCT tid FROM token_snapshots")]
+            extra = [r["tid"] for r in db.execute("SELECT DISTINCT tid FROM fast_marks")]
+            for t in extra:
+                if t not in tids:
+                    tids.append(t)
+        n = 0
+        for tid in tids:
+            try:
+                first = db.execute(
+                    "SELECT * FROM token_snapshots WHERE tid = ? ORDER BY ts ASC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                free = _first_free(tid)
+                if first is None and free is None:
+                    continue
+                first_seen = float((first or free)["ts"])
+                first_free_ts = float(free["ts"]) if free is not None else first_seen
+                ticker = (free or first)["ticker"] if (free or first) else None
+                chain = (free or first)["chain"] if (free or first) else None
+                series = _price_series(tid)
+                entry = None
+                if free is not None:
+                    entry = _num(free["price_usd"])
+                if entry is None:
+                    entry = _price_at_or_before(series, first_free_ts + 1, after_ts=first_seen)
+                overlay = _outcomes_overlay(tid)
+                if entry is None and overlay.get("entry_ts"):
+                    entry = _price_at_or_before(series, overlay["entry_ts"] + 1)
+                peak_px = None
+                peak_ts = None
+                max_liq = None
+                rug_ts = None
+                for ts, px, liq in series:
+                    if ts < first_free_ts:
+                        if liq is not None:
+                            max_liq = liq if max_liq is None else max(max_liq, liq)
+                        continue
                     if liq is not None:
                         max_liq = liq if max_liq is None else max(max_liq, liq)
-                    continue
-                if liq is not None:
-                    max_liq = liq if max_liq is None else max(max_liq, liq)
-                    if max_liq and max_liq > 0 and liq <= 0.20 * max_liq and rug_ts is None:
-                        rug_ts = ts
-                if px is not None and px > 0:
-                    if peak_px is None or px > peak_px:
-                        peak_px = px
-                        peak_ts = ts
-                    if entry and entry > 0 and px <= 0.01 * entry and rug_ts is None:
-                        rug_ts = ts
-            peak_x = (peak_px / entry) if (peak_px and entry and entry > 0) else overlay.get("peak_x")
-            if peak_x is None:
-                peak_x = overlay.get("peak_x")
-            rets = {}
-            for name, delta in HORIZONS_SEC:
-                if now < first_free_ts + delta:
-                    rets[name] = None
-                    continue
-                px = _price_at_or_before(series, first_free_ts + delta, after_ts=first_free_ts)
-                if px is None or not entry or entry <= 0:
-                    rets[name] = overlay.get(name) if name == "ret_6h" else None
-                    if name == "ret_6h" and rets[name] is None:
-                        rets[name] = overlay.get("ret_6h")
-                else:
-                    rets[name] = (px / entry) - 1.0
-            runner = 0
-            if peak_x is not None and peak_x >= 2.0:
-                if rug_ts is None or (peak_ts is not None and peak_ts <= rug_ts):
-                    runner = 1
-            db.execute(
-                """INSERT OR REPLACE INTO token_labels (
-                     tid, ticker, chain, first_seen_ts, first_free_ts,
-                     minutes_from_first_sighting, entry_price, peak_x, peak_ts,
-                     time_to_peak_min, ret_15m, ret_1h, ret_3h, ret_6h,
-                     rugged, rug_ts, time_to_rug_min, runner, updated_ts, origin
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    tid, ticker, chain, first_seen, first_free_ts,
-                    (first_free_ts - first_seen) / 60.0,
-                    entry, peak_x, peak_ts,
-                    ((peak_ts - first_free_ts) / 60.0) if peak_ts is not None else None,
-                    rets.get("ret_15m"), rets.get("ret_1h"),
-                    rets.get("ret_3h"), rets.get("ret_6h"),
-                    1 if rug_ts is not None else 0,
-                    rug_ts,
-                    ((rug_ts - first_free_ts) / 60.0) if rug_ts is not None else None,
-                    runner, now,
-                    _label_origin(free or first),
-                ),
-            )
-            n += 1
-        except Exception as e:
-            log.warning("research label %s: %s", tid, safe_err(e))
-    db.commit()
-    return n
+                        if max_liq and max_liq > 0 and liq <= 0.20 * max_liq and rug_ts is None:
+                            rug_ts = ts
+                    if px is not None and px > 0:
+                        if peak_px is None or px > peak_px:
+                            peak_px = px
+                            peak_ts = ts
+                        if entry and entry > 0 and px <= 0.01 * entry and rug_ts is None:
+                            rug_ts = ts
+                peak_x = (peak_px / entry) if (peak_px and entry and entry > 0) else overlay.get("peak_x")
+                if peak_x is None:
+                    peak_x = overlay.get("peak_x")
+                rets = {}
+                for name, delta in HORIZONS_SEC:
+                    if now < first_free_ts + delta:
+                        rets[name] = None
+                        continue
+                    px = _price_at_or_before(series, first_free_ts + delta, after_ts=first_free_ts)
+                    if px is None or not entry or entry <= 0:
+                        rets[name] = overlay.get(name) if name == "ret_6h" else None
+                        if name == "ret_6h" and rets[name] is None:
+                            rets[name] = overlay.get("ret_6h")
+                    else:
+                        rets[name] = (px / entry) - 1.0
+                runner = 0
+                if peak_x is not None and peak_x >= 2.0:
+                    if rug_ts is None or (peak_ts is not None and peak_ts <= rug_ts):
+                        runner = 1
+                db.execute(
+                    """INSERT OR REPLACE INTO token_labels (
+                         tid, ticker, chain, first_seen_ts, first_free_ts,
+                         minutes_from_first_sighting, entry_price, peak_x, peak_ts,
+                         time_to_peak_min, ret_15m, ret_1h, ret_3h, ret_6h,
+                         rugged, rug_ts, time_to_rug_min, runner, updated_ts, origin
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        tid, ticker, chain, first_seen, first_free_ts,
+                        (first_free_ts - first_seen) / 60.0,
+                        entry, peak_x, peak_ts,
+                        ((peak_ts - first_free_ts) / 60.0) if peak_ts is not None else None,
+                        rets.get("ret_15m"), rets.get("ret_1h"),
+                        rets.get("ret_3h"), rets.get("ret_6h"),
+                        1 if rug_ts is not None else 0,
+                        rug_ts,
+                        ((rug_ts - first_free_ts) / 60.0) if rug_ts is not None else None,
+                        runner, now,
+                        _label_origin(free or first),
+                    ),
+                )
+                n += 1
+            except Exception as e:
+                log.warning("research label %s: %s", tid, safe_err(e))
+        db.commit()
+        return n
 
 
 def _label_origin(row) -> str:
@@ -931,19 +961,20 @@ def _label_origin(row) -> str:
 
 
 def _meta_get(key: str) -> str | None:
-    row = _connect().execute(
-        "SELECT value FROM research_meta WHERE key = ?", (key,),
-    ).fetchone()
+    with _locked() as db:
+        row = db.execute(
+            "SELECT value FROM research_meta WHERE key = ?", (key,),
+        ).fetchone()
     return None if row is None else row["value"]
 
 
 def _meta_set(key: str, value) -> None:
-    db = _connect()
-    db.execute(
-        "INSERT OR REPLACE INTO research_meta (key, value) VALUES (?, ?)",
-        (key, str(value)),
-    )
-    db.commit()
+    with _locked() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO research_meta (key, value) VALUES (?, ?)",
+            (key, str(value)),
+        )
+        db.commit()
 
 
 def maybe_vacuum(now: float | None = None) -> bool:
@@ -953,14 +984,14 @@ def maybe_vacuum(now: float | None = None) -> bool:
     last = _num(raw)
     if last is not None and now - last < VACUUM_INTERVAL_SEC:
         return False
-    db = _connect()
-    db.commit()
-    isolation = db.isolation_level
-    db.isolation_level = None
-    try:
-        db.execute("VACUUM")
-    finally:
-        db.isolation_level = isolation
+    with _locked() as db:
+        db.commit()
+        isolation = db.isolation_level
+        db.isolation_level = None
+        try:
+            db.execute("VACUUM")
+        finally:
+            db.isolation_level = isolation
     _meta_set("last_vacuum", now)
     log.info("research vacuum ok")
     return True
@@ -1012,6 +1043,20 @@ def _read_text_file(path: pathlib.Path) -> str:
         with bz2.open(path, "rt", errors="replace") as f:
             return f.read()
     return path.read_text(errors="replace")
+
+
+def _iter_log_lines(path: pathlib.Path):
+    """Stream a run.log (plain, .gz, or .bz2) line by line. Never slurp."""
+    name = path.name.lower()
+    if name.endswith(".gz"):
+        ctx = gzip.open(path, "rt", errors="replace")
+    elif name.endswith(".bz2"):
+        ctx = bz2.open(path, "rt", errors="replace")
+    else:
+        ctx = open(path, "rt", errors="replace")
+    with ctx as f:
+        for line in f:
+            yield line
 
 
 def _snap(dst, token, ts, *, stage, origin, regime=None) -> bool:
@@ -1148,26 +1193,32 @@ def backfill_from_run_log(path=None) -> dict:
     try:
         import cycle_history
         paths = discover_run_logs(extra=path)
-        seen_text = set()
+        seen_sig = set()
         for log_path in paths:
             try:
-                text = _read_text_file(log_path)
-            except Exception as e:
+                st = log_path.stat()
+                sig = (log_path.name, st.st_size, int(st.st_mtime))
+            except OSError as e:
                 log.warning("research read log %s: %s", log_path.name, safe_err(e))
                 continue
-            sig = (len(text), hash(text[:4096]))
-            if sig in seen_text:
+            if sig in seen_sig:
                 continue
-            seen_text.add(sig)
+            seen_sig.add(sig)
             origin = f"backfill:{log_path.name}"
             n = 0
-            parsed, _meta = cycle_history.parse_run_log(text)
+            try:
+                parsed, _meta = cycle_history.parse_run_log_lines(
+                    _iter_log_lines(log_path),
+                )
+            except Exception as e:
+                log.warning("research parse log %s: %s", log_path.name, safe_err(e))
+                continue
             for item in parsed:
                 n += on_cycle(
                     item.get("stats") or {}, now=item.get("ts"),
                     origin=origin, skip_labels=True,
                 )
-            n += backfill_judge_from_text(text, origin=origin)
+            n += backfill_judge_from_lines(_iter_log_lines(log_path), origin=origin)
             counts[origin] = counts.get(origin, 0) + n
     except Exception as e:
         log.warning("research backfill log: %s", safe_err(e))
@@ -1176,12 +1227,17 @@ def backfill_from_run_log(path=None) -> dict:
 
 def backfill_judge_from_text(text: str, origin: str) -> int:
     """Catch judge tid= lines even when a cycle: summary was missing."""
+    return backfill_judge_from_lines(str(text or "").splitlines(), origin)
+
+
+def backfill_judge_from_lines(lines, origin: str) -> int:
+    """Catch judge tid= lines even when a cycle: summary was missing."""
     n = 0
     try:
         import cycle_history
         last_ts = None
         dst = _connect()
-        for raw in text.splitlines():
+        for raw in lines:
             ts = cycle_history.parse_log_ts(raw)
             if ts is not None:
                 last_ts = ts
@@ -1519,40 +1575,85 @@ def backfill_from_x_cache() -> int:
     return n
 
 
-def queue_missing_prices(now: float | None = None) -> int:
-    """Enqueue outcomes jobs for tids with no post-sighting price. Off-peak fill."""
+def queue_max() -> int:
+    raw = os.environ.get("RESEARCH_QUEUE_MAX")
+    if raw is None or str(raw).strip() == "":
+        return QUEUE_MAX_DEFAULT
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return QUEUE_MAX_DEFAULT
+
+
+def queue_missing_prices(now: float | None = None) -> dict:
+    """Enqueue backfill outcomes jobs for tids with no post-sighting price.
+
+    Cap RESEARCH_QUEUE_MAX (default 200) newest-first. Skip tids that already
+    have an outcomes row or fetch_jobs row. Jobs are priority=backfill.
+    """
     now = current_time() if now is None else float(now)
-    n = 0
+    empty = {"queued": 0, "skipped_by_cap": 0, "skipped_existing": 0}
     try:
         import outcomes
-        db = _connect()
-        rows = db.execute(
-            "SELECT tid, MIN(ts) AS first_ts FROM token_snapshots GROUP BY tid"
-        ).fetchall()
-        for r in rows:
-            tid, first = r["tid"], r["first_ts"]
-            if not tid or first is None:
+        with _locked() as db:
+            rows = db.execute(
+                """SELECT tid, MIN(ts) AS first_ts FROM token_snapshots
+                   GROUP BY tid ORDER BY first_ts DESC"""
+            ).fetchall()
+            missing = []
+            for r in rows:
+                tid, first = r["tid"], r["first_ts"]
+                if not tid or first is None:
+                    continue
+                later = db.execute(
+                    """SELECT 1 FROM token_snapshots
+                       WHERE tid = ? AND ts > ? AND price_usd IS NOT NULL AND price_usd > 0
+                       UNION ALL
+                       SELECT 1 FROM fast_marks
+                       WHERE tid = ? AND ts > ? AND price_usd IS NOT NULL AND price_usd > 0
+                       LIMIT 1""",
+                    (tid, float(first), tid, float(first)),
+                ).fetchone()
+                if later:
+                    continue
+                missing.append((str(tid), float(first)))
+        existing = set()
+        try:
+            existing = outcomes.queued_or_fetched_tids()
+        except Exception as e:
+            log.warning("research existing jobs: %s", safe_err(e))
+        skipped_existing = 0
+        to_queue = []
+        for tid, first in missing:
+            if tid in existing:
+                skipped_existing += 1
                 continue
-            later = db.execute(
-                """SELECT 1 FROM token_snapshots
-                   WHERE tid = ? AND ts > ? AND price_usd IS NOT NULL AND price_usd > 0
-                   UNION ALL
-                   SELECT 1 FROM fast_marks
-                   WHERE tid = ? AND ts > ? AND price_usd IS NOT NULL AND price_usd > 0
-                   LIMIT 1""",
-                (tid, float(first), tid, float(first)),
-            ).fetchone()
-            if later:
-                continue
+            to_queue.append((tid, first))
+        cap = queue_max()
+        skipped_by_cap = max(0, len(to_queue) - cap)
+        to_queue = to_queue[:cap]
+        n = 0
+        for tid, first in to_queue:
             try:
-                if outcomes.enqueue_job(str(tid), float(first), now=now):
+                if outcomes.enqueue_job(
+                    tid, first, now=now, priority=outcomes.PRIORITY_BACKFILL,
+                ):
                     n += 1
+                    existing.add(tid)
             except Exception as e:
                 log.warning("research enqueue %s: %s", tid, safe_err(e))
-        log.info("research queued outcomes jobs=%d", n)
+        log.info(
+            "research queued outcomes jobs=%d skipped_existing=%d skipped_by_cap=%d cap=%d",
+            n, skipped_existing, skipped_by_cap, cap,
+        )
+        return {
+            "queued": n,
+            "skipped_by_cap": skipped_by_cap,
+            "skipped_existing": skipped_existing,
+        }
     except Exception as e:
         log.warning("research queue prices: %s", safe_err(e))
-    return n
+        return empty
 
 
 def coverage_report() -> dict:
@@ -1637,8 +1738,14 @@ def backfill(log_path=None) -> dict:
         log.warning("research backfill labels: %s", safe_err(e))
         labels = 0
     queued = 0
+    skipped_by_cap = 0
     try:
-        queued = queue_missing_prices()
+        q = queue_missing_prices()
+        if isinstance(q, dict):
+            queued = int(q.get("queued") or 0)
+            skipped_by_cap = int(q.get("skipped_by_cap") or 0)
+        else:
+            queued = int(q or 0)
     except Exception as e:
         log.warning("research queue: %s", safe_err(e))
     cov = coverage_report()
@@ -1651,14 +1758,15 @@ def backfill(log_path=None) -> dict:
         "fast_marks": cov.get("fast_marks", 0),
         "token_labels": labels if labels else cov.get("token_labels", 0),
         "queued_outcomes": queued,
+        "skipped_by_cap": skipped_by_cap,
         "labels": labels,
     }
     log.info(
-        "research backfill span=%s..%s days=%s snapshots=%s marks=%s labels=%s queued=%s sources=%s",
+        "research backfill span=%s..%s days=%s snapshots=%s marks=%s labels=%s queued=%s skipped_by_cap=%s sources=%s",
         (cov.get("span") or {}).get("min_iso"), (cov.get("span") or {}).get("max_iso"),
         (cov.get("span") or {}).get("days"),
         result["token_snapshots"], result["fast_marks"], result["token_labels"],
-        queued, per_source,
+        queued, skipped_by_cap, per_source,
     )
     return result
 

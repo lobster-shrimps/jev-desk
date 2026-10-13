@@ -50,7 +50,7 @@ def reset() -> None:
 
 
 def set_demo_capped_fn(fn) -> None:
-    """outcomes.db wires the monthly Demo cap. None restores."""
+    """outcomes.db wires the Demo budget cap (monthly or daily share). None restores."""
     global _demo_capped_fn
     _demo_capped_fn = fn
 

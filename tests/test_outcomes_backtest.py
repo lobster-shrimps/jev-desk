@@ -1025,14 +1025,15 @@ def test_weekly_backtest_does_not_hit_network(hist, tmp_path, monkeypatch):
 
 
 def _seed_job(outcomes, tid, entry_ts, *, attempts=0, last_attempt=None,
-              last_error=None, status="pending", now=None):
+              last_error=None, status="pending", now=None, priority=0):
     db = outcomes._connect()
     db.execute(
         """INSERT OR REPLACE INTO fetch_jobs
-           (tid, entry_ts, status, attempts, last_attempt, last_error, enqueued_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           (tid, entry_ts, status, attempts, last_attempt, last_error,
+            enqueued_at, priority)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (tid, float(entry_ts), status, int(attempts), last_attempt, last_error,
-         float(now or entry_ts)),
+         float(now or entry_ts), int(priority)),
     )
     db.commit()
 
@@ -1135,3 +1136,268 @@ def test_resolvable_pool_not_killed_after_incomplete(hist):
     assert outcomes.list_jobs("dead") == []
     cached = outcomes.get_cached(tid, entry)
     assert cached and cached.get("pool") == "PoolX"
+
+
+def test_fetch_jobs_priority_column_defaults_live(hist):
+    import outcomes
+    now = ts(2026, 10, 12, 15)
+    entry = now - 8 * 3600
+    outcomes.enqueue_job("live:1399811149", entry, now=now)
+    outcomes.enqueue_job(
+        "bf:1399811149", entry, now=now, priority=outcomes.PRIORITY_BACKFILL,
+    )
+    jobs = {j["tid"]: j for j in outcomes.list_jobs(None)}
+    assert jobs["live:1399811149"]["priority"] == outcomes.PRIORITY_LIVE
+    assert jobs["bf:1399811149"]["priority"] == outcomes.PRIORITY_BACKFILL
+    cols = {row[1] for row in outcomes._connect().execute("PRAGMA table_info(fetch_jobs)")}
+    assert "priority" in cols
+
+
+def test_new_backfill_does_not_jump_live_pending(hist):
+    """0-attempt backfill jobs must not jump a live job with attempts under #55 order."""
+    import outcomes
+    now = ts(2026, 10, 12, 3)  # inside 01:00-06:00
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    live = "live:1399811149"
+    bf = "backfill:1399811149"
+    entry = now - 8 * 3600
+    _seed_job(outcomes, live, entry, attempts=4, last_attempt=now - 60,
+              last_error="incomplete", now=now, priority=outcomes.PRIORITY_LIVE)
+    _seed_job(outcomes, bf, entry, attempts=0, last_attempt=None,
+              now=now, priority=outcomes.PRIORITY_BACKFILL)
+    seen = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        if "dexscreener.com" in url:
+            addr = url.rstrip("/").rsplit("/", 1)[-1]
+            seen.append(addr)
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(entry + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    result = outcomes.drain_jobs(now=now, trickle=False, max_calls=1)
+    assert result["fetched"] == 1
+    assert any(s.startswith("live") for s in seen)
+    assert not any(s.startswith("backfill") for s in seen)
+    pending = outcomes.list_jobs("pending")
+    assert any(j["tid"] == bf for j in pending)
+
+
+def test_backfill_jobs_only_drained_in_window(hist):
+    import outcomes
+    now_day = ts(2026, 10, 12, 15)
+    now_night = ts(2026, 10, 12, 3)
+    outcomes.set_sleep_fn(lambda d: None)
+    live = "livex:1399811149"
+    bf = "bfx:1399811149"
+    entry = now_night - 8 * 3600
+    _seed_job(outcomes, live, entry, attempts=0, now=now_day,
+              priority=outcomes.PRIORITY_LIVE)
+    _seed_job(outcomes, bf, entry, attempts=0, now=now_day,
+              priority=outcomes.PRIORITY_BACKFILL)
+    seen = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        if "dexscreener.com" in url:
+            seen.append(url.rstrip("/").rsplit("/", 1)[-1])
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(entry + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    outcomes.set_time_fn(lambda: now_day)
+    day = outcomes.drain_jobs(now=now_day, trickle=True, max_calls=10)
+    assert day["fetched"] >= 1
+    assert any(s.startswith("livex") for s in seen)
+    assert not any(s.startswith("bfx") for s in seen)
+    pending = outcomes.list_jobs("pending")
+    assert any(j["tid"] == bf for j in pending)
+
+    seen.clear()
+    outcomes.set_time_fn(lambda: now_night)
+    night = outcomes.drain_jobs(now=now_night, trickle=False, max_calls=10)
+    assert night["fetched"] >= 1
+    assert any(s.startswith("bfx") for s in seen)
+
+
+def test_demo_daily_cap_spreads_remaining(hist, monkeypatch):
+    import calendar
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    last = calendar.monthrange(2026, 10)[1]
+    days_left = last - 12 + 1
+    assert outcomes.days_left_in_month(now) == days_left
+    assert outcomes.demo_calls_this_month(now) == 0
+    assert outcomes.demo_daily_cap(now) == max(1, gt_api.DEMO_MONTHLY_CAP // days_left)
+    db = outcomes._connect()
+    db.execute(
+        "INSERT OR REPLACE INTO cg_demo_calls (yyyymm, calls) VALUES (?, ?)",
+        (outcomes._yyyymm(now), 2000),
+    )
+    db.execute(
+        "INSERT OR REPLACE INTO cg_demo_calls_daily (yyyymmdd, calls) VALUES (?, ?)",
+        (outcomes._yyyymmdd(now), 50),
+    )
+    db.commit()
+    # remaining before today = 9000 - (2000-50) = 7050; cap = 7050 // days_left
+    assert outcomes.demo_daily_cap(now) == max(1, 7050 // days_left)
+    assert outcomes.demo_day_capped(now) is False
+
+
+def test_demo_daily_cap_stops_key_for_rest_of_day(hist, monkeypatch):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    cap = outcomes.demo_daily_cap(now)
+    db = outcomes._connect()
+    db.execute(
+        "INSERT OR REPLACE INTO cg_demo_calls (yyyymm, calls) VALUES (?, ?)",
+        (outcomes._yyyymm(now), cap),
+    )
+    db.execute(
+        "INSERT OR REPLACE INTO cg_demo_calls_daily (yyyymmdd, calls) VALUES (?, ?)",
+        (outcomes._yyyymmdd(now), cap),
+    )
+    db.commit()
+    assert outcomes.demo_month_capped(now) is False
+    assert outcomes.demo_day_capped(now) is True
+    assert outcomes.demo_budget_capped(now) is True
+    assert gt_api.using_demo() is False
+    url = gt_api.prefer_onchain_url(
+        "https://api.geckoterminal.com/api/v2/networks/solana/pools/x/ohlcv/minute",
+        purpose="outcomes",
+    )
+    assert url.startswith("https://api.geckoterminal.com/api/v2/")
+
+
+def test_demo_counts_actual_http_only_one_page(hist, monkeypatch):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    demo_urls = []
+    all_urls = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        all_urls.append(url)
+        if "api.coingecko.com" in url:
+            demo_urls.append((url, params))
+            return Resp(429, {"error": "rate limited"})
+        if "dexscreener.com" in url:
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        return Resp(200, {"data": {}})
+
+    outcomes.set_get_fn(get)
+    before = outcomes.demo_calls_this_month(now)
+    got = outcomes.fetch_outcome("tok:1399811149", now - 8 * 3600, now=now)
+    assert got is None or got.get("complete") in (0, False, None)
+    after = outcomes.demo_calls_this_month(now)
+    assert after - before == 1
+    assert len(demo_urls) == 1
+    assert demo_urls[0][1].get("limit") == outcomes.OHLCV_LIMIT
+    assert not any("api.coingecko.com" in u and u != demo_urls[0][0] for u in all_urls)
+    dex = [u for u in all_urls if "dexscreener.com" in u]
+    assert dex  # Dex is not counted as Demo
+
+
+def test_demo_pace_skip_does_not_count(hist, monkeypatch):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    now = 5_000.0
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    with outcomes._gt_lock:
+        outcomes._last_gt_call = now
+        outcomes._gt_backoff_until = 0.0
+    hits = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        hits.append(url)
+        return Resp(200, {"data": {}})
+
+    outcomes.set_get_fn(get)
+    before = outcomes.demo_calls_this_month(now)
+    candles = outcomes.fetch_ohlcv("solana", "PoolX", now - 8 * 3600, deadline=now + 0.5)
+    assert candles is None
+    assert hits == []
+    assert outcomes.demo_calls_this_month(now) == before
+
+
+def test_demo_401_fallback_counts_one_demo_http(hist, monkeypatch):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    now = ts(2026, 10, 12, 12)
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    seen = []
+
+    def get(url, params=None, timeout=None, headers=None):
+        seen.append(url)
+        if "api.coingecko.com" in url:
+            return Resp(401, {"error": "unauthorized"})
+        candles = [_candle(now - 8 * 3600 + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    before = outcomes.demo_calls_this_month(now)
+    candles = outcomes.fetch_ohlcv("solana", "PoolX", now - 8 * 3600)
+    assert candles
+    assert outcomes.demo_calls_this_month(now) - before == 1
+    assert sum(1 for u in seen if "api.coingecko.com" in u) == 1
+    assert sum(1 for u in seen if "api.geckoterminal.com" in u) == 1
+
+
+def test_gt_pacing_survives_reconnect(hist, monkeypatch):
+    import gt_api
+    import outcomes
+    monkeypatch.setenv("COINGECKO_API_KEY", "CG-DEMOSECRET99")
+    monkeypatch.delenv("COINGECKO_PLAN", raising=False)
+    gt_api.reset()
+    now = 1000.0
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+    with outcomes._gt_lock:
+        outcomes._last_gt_call = 0.0
+        outcomes._gt_backoff_until = 0.0
+    assert outcomes._pace_gt(None) is True
+    saved = outcomes._last_gt_call
+    assert saved > 0
+    row = outcomes._connect().execute(
+        "SELECT v FROM gt_pacing WHERE k = ?", ("last_gt_call",),
+    ).fetchone()
+    assert float(row["v"]) == pytest.approx(saved)
+    if outcomes._conn is not None:
+        outcomes._conn.close()
+    outcomes._conn = None
+    outcomes._conn_path = None
+    outcomes._pacing_loaded = False
+    with outcomes._gt_lock:
+        outcomes._last_gt_call = 0.0
+        outcomes._gt_backoff_until = 0.0
+    outcomes._connect()
+    assert outcomes._last_gt_call == pytest.approx(saved)
+    slept = []
+    outcomes.set_sleep_fn(lambda d: slept.append(d))
+    assert outcomes._pace_gt(None) is True
+    assert slept and slept[0] == pytest.approx(2.0)

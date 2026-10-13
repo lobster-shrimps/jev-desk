@@ -2,12 +2,14 @@
 
 No network. No real sleeps. thresholds/questions/pick/filter and 0.6 untouched.
 """
+import gzip
 import json
 import logging
 import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 from unittest.mock import Mock, patch
 
@@ -398,14 +400,16 @@ def test_backfill_outcomes_candles_and_queue_missing(rs, tmp_path, monkeypatch):
     }]), now=t1, origin="backfill:shadow_kills", skip_labels=True)
     queued = []
 
-    def capture(tid, entry_ts, now=None):
-        queued.append((tid, entry_ts))
+    def capture(tid, entry_ts, now=None, priority=0):
+        queued.append((tid, entry_ts, priority))
         return True
 
     monkeypatch.setattr(outcomes, "enqueue_job", capture)
     nq = rs.queue_missing_prices(now=t1 + 3600)
-    assert nq >= 1
+    assert nq["queued"] >= 1
+    assert "skipped_by_cap" in nq
     assert any(q[0] == "NeedPx:1399811149" for q in queued)
+    assert any(q[2] == outcomes.PRIORITY_BACKFILL for q in queued)
 
 
 def test_backfill_x_cache_and_coinalyze(rs, tmp_path, monkeypatch):
@@ -465,3 +469,187 @@ def test_coverage_report_span_and_per_source(rs):
     assert cov["snapshots_by_origin"]["live"] >= 1
     assert cov["snapshots_by_origin"]["backfill:run.log"] >= 1
     assert cov["token_snapshots"] >= 2
+
+
+def _need_px_token(i, t0):
+    return {
+        "tid": f"Cap{i}:1399811149", "ticker": f"C{i}", "stage": "chain",
+        "reason": "top_wallet", "age_minutes": 20,
+    }
+
+
+def test_queue_missing_caps_newest_skips_existing_reports_cap(rs, tmp_path, monkeypatch):
+    import outcomes
+    monkeypatch.setenv("RESEARCH_QUEUE_MAX", "2")
+    monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
+    outcomes.reset()
+    t_old = ts(2026, 10, 1, 1)
+    t_mid = ts(2026, 10, 10, 1)
+    t_new = ts(2026, 10, 12, 3)
+    for i, t in enumerate((t_old, t_mid, t_new, t_new + 60, t_new + 120)):
+        rs.on_cycle(_stats(tokens=[{
+            "tid": f"Cap{i}:1399811149", "ticker": f"C{i}", "stage": "chain",
+            "reason": "top_wallet", "age_minutes": 20,
+        }]), now=t, origin="backfill:shadow_kills", skip_labels=True)
+
+    exist_tid = "Cap0:1399811149"
+    odb = outcomes._connect()
+    odb.execute(
+        """INSERT INTO outcomes (tid, entry_ts, candles_json, complete)
+           VALUES (?,?,?,?)""",
+        (exist_tid, t_old, "[]", 0),
+    )
+    odb.commit()
+
+    queued = []
+
+    def capture(tid, entry_ts, now=None, priority=0):
+        queued.append((tid, entry_ts, priority))
+        return True
+
+    monkeypatch.setattr(outcomes, "enqueue_job", capture)
+    out = rs.queue_missing_prices(now=t_new + 3600)
+    assert out["queued"] == 2
+    assert out["skipped_by_cap"] >= 1
+    assert out["skipped_existing"] >= 1
+    assert exist_tid not in [q[0] for q in queued]
+    assert all(q[2] == outcomes.PRIORITY_BACKFILL for q in queued)
+    # newest first: Cap4 then Cap3 (t_new+120, t_new+60)
+    assert queued[0][0] == "Cap4:1399811149"
+    assert queued[1][0] == "Cap3:1399811149"
+    result = rs.backfill()
+    assert "skipped_by_cap" in result
+    outcomes.reset()
+
+
+def test_queue_skips_existing_fetch_jobs(rs, tmp_path, monkeypatch):
+    import outcomes
+    monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
+    monkeypatch.setenv("RESEARCH_QUEUE_MAX", "50")
+    outcomes.reset()
+    t0 = ts(2026, 10, 11, 2)
+    tid = "Jobbed:1399811149"
+    rs.on_cycle(_stats(tokens=[{
+        "tid": tid, "ticker": "JB", "stage": "chain", "reason": "top_wallet",
+        "age_minutes": 15,
+    }]), now=t0, origin="backfill:run.log", skip_labels=True)
+    assert outcomes.enqueue_job(tid, t0, now=t0, priority=outcomes.PRIORITY_LIVE)
+    queued = []
+
+    def capture(tid, entry_ts, now=None, priority=0):
+        queued.append(tid)
+        return True
+
+    monkeypatch.setattr(outcomes, "enqueue_job", capture)
+    out = rs.queue_missing_prices(now=t0 + 3600)
+    assert tid not in queued
+    assert out["queued"] == 0
+    assert out["skipped_existing"] >= 1
+    outcomes.reset()
+
+
+def test_on_cycle_does_not_compute_labels(rs, monkeypatch):
+    called = []
+    monkeypatch.setattr(rs, "compute_labels", lambda *a, **k: called.append(1) or 0)
+    monkeypatch.setattr(rs, "maybe_compute_labels", lambda *a, **k: called.append(2) or 0)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "L:1399811149", "ticker": "LL", "stage": "soft", "price_usd": 1,
+    }]), now=ts(2026, 10, 13, 12))
+    assert called == []
+
+
+def test_sampler_throttles_and_times_labels(rs, caplog):
+    caplog.set_level(logging.INFO)
+    t0 = ts(2026, 10, 13, 11)
+    rs.set_time_fn(lambda: t0)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "Tok0:1399811149", "ticker": "T0", "stage": "trade", "reason": "pass",
+        "age_minutes": 10, "price_usd": 1.0, "liquidity_usd": 5000,
+    }]), now=t0)
+    times = []
+    real = rs.compute_labels
+
+    def wrapped(*a, **k):
+        times.append(k.get("now") or (a[0] if a else None))
+        return real(*a, **k)
+
+    rs.compute_labels = wrapped
+
+    def get(url, timeout=None, headers=None, **kw):
+        return _resp(200, {"pairs": [{
+            "chainId": "solana", "priceUsd": "1.1",
+            "liquidity": {"usd": 9_000},
+            "baseToken": {"address": "Tok0", "symbol": "T0"},
+        }]})
+
+    rs.set_get_fn(get)
+    rs.tick_sampler(now=t0)
+    rs.tick_sampler(now=t0 + 60)
+    assert len(times) == 1
+    rs.tick_sampler(now=t0 + rs.LABELS_INTERVAL_SEC + 1)
+    assert len(times) == 2
+    assert "elapsed=" in caplog.text
+    assert "research labels n=" in caplog.text
+
+
+def test_sqlite_lock_serializes_cycle_and_sampler_writes(rs):
+    t0 = ts(2026, 10, 13, 12)
+    errors = []
+
+    def cycle_writer(i):
+        try:
+            rs.on_cycle(_stats(tokens=[{
+                "tid": f"Cyc{i}:1399811149", "ticker": f"C{i}", "stage": "soft",
+                "price_usd": 1,
+            }]), now=t0 + i)
+        except Exception as e:
+            errors.append(e)
+
+    def sampler_writer(i):
+        try:
+            with rs._locked() as db:
+                rs._insert_mark(db, {
+                    "ts": t0 + i, "ts_sec": int(t0 + i),
+                    "tid": f"Sam{i}:1399811149", "price_usd": 1.2,
+                    "source": "dex_batch", "origin": "live",
+                })
+                db.commit()
+        except Exception as e:
+            errors.append(e)
+
+    threads = []
+    for i in range(12):
+        threads.append(threading.Thread(target=cycle_writer, args=(i,)))
+        threads.append(threading.Thread(target=sampler_writer, args=(i,)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    snaps = rs.run_sql("SELECT tid FROM token_snapshots")
+    marks = rs.run_sql("SELECT tid FROM fast_marks")
+    assert len(snaps) == 12
+    assert len(marks) == 12
+    assert rs._db_lock is not None
+
+
+def test_backfill_streams_gzip_logs_not_whole_read(rs, tmp_path, monkeypatch):
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    p = tmp_path / "run.log.gz"
+    text = (
+        "2026-10-02 08:00:00 desk INFO judge tid=Gz:1399811149 ticker=GZZ "
+        "verdict=yes score=0.7 confidence=0.6 reason=x mode=live\n"
+        "2026-10-02 08:00:01 desk INFO cycle: 1 seen, 0 benched, free {}, trade {}, "
+        "chain {}, soft {}, judged 1, requeued 0\n"
+    )
+    with gzip.open(p, "wt") as f:
+        f.write(text)
+
+    def boom(path):
+        raise AssertionError("must stream log files, not read() whole files")
+
+    monkeypatch.setattr(rs, "_read_text_file", boom)
+    n = rs.backfill_from_run_log()
+    assert sum(n.values()) >= 1
+    rows = rs.run_sql("SELECT ticker, origin FROM token_snapshots")
+    assert any(r["ticker"] == "GZZ" for r in rows)

@@ -2238,6 +2238,11 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
     Soft / free-pass / 429 lines that appear before a `cycle:` line belong to
     that cycle (the live logger emits the cycle summary last).
     """
+    return parse_run_log_lines(str(text or "").splitlines())
+
+
+def parse_run_log_lines(lines) -> tuple[list[dict], dict]:
+    """Same as parse_run_log, streaming a line iterable (plain or decompressed)."""
     cycles: list[dict] = []
     pending_soft: list[dict] = []
     pending_young: dict[str, dict] = {}
@@ -2303,7 +2308,7 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
         unevaluated = 0
         pending_gt_429 = 0
 
-    for raw in text.splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line:
             continue
