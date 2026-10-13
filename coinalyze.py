@@ -62,6 +62,7 @@ _time_fn: Callable[[], float] = time.time
 _get_fn = None
 _last_attempt_ts: float | None = None
 _memory_cache: dict | None = None
+_last_snap: dict | None = None
 
 
 def set_time_fn(fn: Callable[[], float] | None) -> None:
@@ -86,12 +87,27 @@ def reset(*, hooks: bool = True) -> None:
     hooks=False keeps injected get_fn/time_fn so cycle_history.reset() does not
     undo a test double.
     """
-    global _last_attempt_ts, _memory_cache, _time_fn, _get_fn
+    global _last_attempt_ts, _memory_cache, _time_fn, _get_fn, _last_snap
     _last_attempt_ts = None
     _memory_cache = None
+    _last_snap = None
     if hooks:
         _time_fn = time.time
         _get_fn = None
+
+
+def last_snapshot() -> dict | None:
+    """Most recent successful maybe_capture payload, or None. No HTTP."""
+    return dict(_last_snap) if isinstance(_last_snap, dict) else None
+
+
+def last_regime() -> str | None:
+    """Regime tag from the last successful capture. No HTTP."""
+    snap = last_snapshot()
+    if not snap:
+        return None
+    tag = snap.get("regime")
+    return str(tag) if tag else None
 
 
 def api_key() -> str | None:
@@ -348,7 +364,7 @@ def _aggregates(assets: dict) -> dict:
 
 def maybe_capture(now: float | None = None, cache: dict | None = None) -> dict | None:
     """Fetch one snapshot or skip. Never raises. Never logs the API key."""
-    global _last_attempt_ts, _memory_cache
+    global _last_attempt_ts, _memory_cache, _last_snap
     wall = current_time()
     stamp = wall if now is None else float(now)
     key = api_key()
@@ -431,7 +447,7 @@ def maybe_capture(now: float | None = None, cache: dict | None = None) -> dict |
         metrics["reason"] = reason
         _memory_cache = dict(working_cache)
         log.info("coinalyze: regime=%s calls=%s", tag, calls)
-        return {
+        _last_snap = {
             "ts": stamp,
             "regime": tag,
             "reason": reason,
@@ -439,6 +455,7 @@ def maybe_capture(now: float | None = None, cache: dict | None = None) -> dict |
             "metrics": metrics,
             "http_calls": calls,
         }
+        return dict(_last_snap)
     except Exception as e:
         _skip(safe_err(e))
         return None

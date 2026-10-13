@@ -74,6 +74,13 @@ WRITE_RE = re.compile(
     r"VACUUM|REINDEX|INTO)\b",
     re.I,
 )
+X_LOG_RE = re.compile(
+    r"x tid=(\S+) handle=(\S+) ok=(\S+) followers=(\S+) "
+    r"own_posts=(\S+) source=(\S+) err=(\S+)(?: x_kind=(\S+))?"
+)
+TRADE_BUYS_RE = re.compile(
+    r"trade tid=(\S+)\b.*?buys_h1=(\S+)"
+)
 
 _conn: sqlite3.Connection | None = None
 _conn_path: str | None = None
@@ -351,6 +358,87 @@ def _pct_from_text(text) -> float | None:
     return _num(m.group(1))
 
 
+def _window_block(token: dict, *names):
+    for name in names:
+        block = token.get(name)
+        if isinstance(block, dict):
+            return block
+    return None
+
+
+def _vol_from_token(token: dict, window: str) -> float | None:
+    alias = {"h1": ("vol_1h", "volume_h1"), "m5": ("vol_5m", "volume_m5")}
+    for key in alias.get(window, ()):
+        n = _num(token.get(key))
+        if n is not None:
+            return n
+    vol = _window_block(token, "volume")
+    if vol:
+        raw = vol.get(window) or vol.get("1h" if window == "h1" else window)
+        if isinstance(raw, dict):
+            return _num(raw.get("usd") or raw.get("h1"))
+        n = _num(raw)
+        if n is not None:
+            return n
+    pair = _window_block(token, "pair", "best_pair", "dex_pair")
+    if pair:
+        inner = pair.get("volume")
+        if isinstance(inner, dict):
+            return _num(inner.get(window))
+    return None
+
+
+def _buys_from_token(token: dict, window: str) -> float | None:
+    alias = {"h1": ("buys_h1", "buys_1h"), "m5": ("buys_m5", "buys_5m")}
+    for key in alias.get(window, ()):
+        n = _num(token.get(key))
+        if n is not None:
+            return n
+    txns = _window_block(token, "txns", "transactions")
+    if txns:
+        raw = txns.get(window) or txns.get("1h" if window == "h1" else window)
+        if isinstance(raw, dict):
+            return _num(raw.get("buys"))
+    return None
+
+
+def _sells_from_token(token: dict, window: str) -> float | None:
+    alias = {"h1": ("sells_h1", "sells_1h"), "m5": ("sells_m5", "sells_5m")}
+    for key in alias.get(window, ()):
+        n = _num(token.get(key))
+        if n is not None:
+            return n
+    txns = _window_block(token, "txns", "transactions")
+    if txns:
+        raw = txns.get(window) or txns.get("1h" if window == "h1" else window)
+        if isinstance(raw, dict):
+            return _num(raw.get("sells"))
+    return None
+
+
+def _x_cache_lookup(handle: str) -> tuple:
+    """(followers, x_kind) from x_cache.db. No HTTP, ignore TTL. Fail open."""
+    key = (handle or "").strip().lstrip("@").lower()
+    if not key:
+        return None, None
+    try:
+        import x_lookup
+        db = x_lookup._connect()
+        row = db.execute(
+            "SELECT payload_json FROM x_cache WHERE handle = ? AND ok = 1",
+            (key,),
+        ).fetchone()
+        if not row or not row["payload_json"]:
+            return None, None
+        payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
+        if not isinstance(payload, dict):
+            return None, None
+        return _int(payload.get("followers")), payload.get("x_kind")
+    except Exception as e:
+        log.info("research x_cache: %s", safe_err(e))
+        return None, None
+
+
 def _x_fields(token: dict) -> tuple:
     handle = token.get("x_handle") or token.get("fomo_twitter") or token.get("dex_twitter")
     followers = token.get("x_followers")
@@ -363,6 +451,11 @@ def _x_fields(token: dict) -> tuple:
         kind = kind or xa.get("x_kind")
     if isinstance(handle, str):
         handle = handle.lstrip("@") or None
+    if followers is None and handle:
+        cached_followers, cached_kind = _x_cache_lookup(handle)
+        if followers is None:
+            followers = cached_followers
+        kind = kind or cached_kind
     return handle, _int(followers), kind
 
 
@@ -387,12 +480,12 @@ def _row_from_token(token: dict, ts: float, *, stage=None, regime=None,
         "price_usd": _num(t.get("price_usd") or t.get("price") or t.get("priceUsd")),
         "liq_usd": _num(t.get("liquidity_usd") or t.get("liq_usd") or t.get("liq")),
         "mcap_usd": _num(t.get("mcap_usd") or t.get("mcap")),
-        "vol_5m": _num(t.get("vol_5m") or t.get("volume_m5")),
-        "vol_1h": _num(t.get("vol_1h") or t.get("volume_h1")),
-        "buys_5m": _num(t.get("buys_m5") or t.get("buys_5m")),
-        "sells_5m": _num(t.get("sells_m5") or t.get("sells_5m")),
-        "buys_1h": _num(t.get("buys_h1") or t.get("buys_1h")),
-        "sells_1h": _num(t.get("sells_h1") or t.get("sells_1h")),
+        "vol_5m": _vol_from_token(t, "m5"),
+        "vol_1h": _vol_from_token(t, "h1"),
+        "buys_5m": _buys_from_token(t, "m5"),
+        "sells_5m": _sells_from_token(t, "m5"),
+        "buys_1h": _buys_from_token(t, "h1"),
+        "sells_1h": _sells_from_token(t, "h1"),
         "holders": _int(t.get("holder_count") or t.get("holders")),
         "holder_growth": t.get("holder_growth"),
         "top_wallet_pct": _num(t.get("top_wallet_percent") or t.get("top_wallet_pct")),
@@ -444,11 +537,19 @@ def _insert_snapshot(db: sqlite3.Connection, row: dict) -> bool:
 
 
 def _regime_now() -> str | None:
+    """Last Coinalyze tag: in-process snap, else cycle_history.market_regimes."""
     try:
         import coinalyze
-        snap = coinalyze.latest()
-        if isinstance(snap, dict):
-            return snap.get("regime")
+        tag = coinalyze.last_regime()
+        if tag:
+            return tag
+    except Exception as e:
+        log.info("research regime: %s", safe_err(e))
+    try:
+        import cycle_history
+        tag = cycle_history.latest_regime()
+        if tag:
+            return tag
     except Exception as e:
         log.info("research regime: %s", safe_err(e))
     return None
@@ -1133,6 +1234,8 @@ def backfill_from_cycle_history() -> dict:
                         "reason": row.get("reason"),
                         "stage": row.get("stage") or "chain",
                         "regime": row.get("regime"),
+                        "x_followers": row.get("x_followers"),
+                        "x_handle": row.get("x_handle"),
                     }
                     ts = float(row["ts"]) if row.get("ts") is not None else current_time()
                     if _snap(dst, token, ts, stage=token["stage"],
@@ -1219,10 +1322,57 @@ def backfill_from_run_log(path=None) -> dict:
                     origin=origin, skip_labels=True,
                 )
             n += backfill_judge_from_lines(_iter_log_lines(log_path), origin=origin)
+            n += backfill_x_and_trades_from_lines(
+                _iter_log_lines(log_path), origin=origin,
+            )
             counts[origin] = counts.get(origin, 0) + n
     except Exception as e:
         log.warning("research backfill log: %s", safe_err(e))
     return counts
+
+
+def backfill_x_and_trades_from_lines(lines, origin: str) -> int:
+    """Fill x_followers / buys_1h on existing snapshots from desk log lines."""
+    n = 0
+    try:
+        dst = _connect()
+        for raw in lines:
+            xm = X_LOG_RE.search(raw)
+            if xm:
+                tid = xm.group(1)
+                handle = (xm.group(2) or "").lstrip("@")
+                if handle in ("-", "", "None"):
+                    handle = None
+                ok = str(xm.group(3)).lower() in ("true", "1", "yes")
+                followers = _int(xm.group(4)) if ok else None
+                kind = xm.group(8)
+                if kind in ("-", "None", ""):
+                    kind = None
+                if tid and tid != "-":
+                    cur = dst.execute(
+                        """UPDATE token_snapshots
+                           SET x_followers = COALESCE(x_followers, ?),
+                               x_handle = COALESCE(x_handle, ?),
+                               x_kind = COALESCE(x_kind, ?)
+                           WHERE tid = ?""",
+                        (followers, handle, kind, tid),
+                    )
+                    n += int(cur.rowcount or 0)
+            tm = TRADE_BUYS_RE.search(raw)
+            if tm:
+                tid, buys = tm.group(1), _num(tm.group(2))
+                if tid and buys is not None:
+                    cur = dst.execute(
+                        """UPDATE token_snapshots
+                           SET buys_1h = COALESCE(buys_1h, ?)
+                           WHERE tid = ?""",
+                        (buys, tid),
+                    )
+                    n += int(cur.rowcount or 0)
+        dst.commit()
+    except Exception as e:
+        log.warning("research backfill x/trades log: %s", safe_err(e))
+    return n
 
 
 def backfill_judge_from_text(text: str, origin: str) -> int:
@@ -1563,8 +1713,9 @@ def backfill_from_x_cache() -> int:
                        SET x_followers = COALESCE(x_followers, ?),
                            x_kind = COALESCE(x_kind, ?),
                            x_handle = COALESCE(x_handle, ?)
-                       WHERE lower(x_handle) = ?""",
-                    (followers, kind, handle, handle),
+                       WHERE lower(COALESCE(x_handle, '')) = ?
+                          OR lower(COALESCE(x_handle, '')) = ?""",
+                    (followers, kind, handle, handle, "@" + handle),
                 )
                 n += int(cur.rowcount or 0)
             dst.commit()

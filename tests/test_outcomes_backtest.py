@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1401,3 +1402,89 @@ def test_gt_pacing_survives_reconnect(hist, monkeypatch):
     outcomes.set_sleep_fn(lambda d: slept.append(d))
     assert outcomes._pace_gt(None) is True
     assert slept and slept[0] == pytest.approx(2.0)
+
+
+def test_pre_priority_db_migrates_column_index_and_new_tables(tmp_path, monkeypatch):
+    """Live DBs created before #60 must ALTER priority before idx_fetch_jobs_drain."""
+    import outcomes
+    path = tmp_path / "legacy_outcomes.db"
+    raw = sqlite3.connect(str(path))
+    raw.executescript("""
+    CREATE TABLE outcomes (
+      tid TEXT NOT NULL,
+      entry_ts REAL NOT NULL,
+      pool TEXT,
+      chain TEXT,
+      candles_json TEXT,
+      fetched_at REAL,
+      complete INTEGER NOT NULL DEFAULT 0,
+      peak_x REAL,
+      trough_x REAL,
+      ret_6h REAL,
+      sim_current_pnl REAL,
+      sim_current_reason TEXT,
+      sim_trail_pnl REAL,
+      sim_trail_reason TEXT,
+      PRIMARY KEY (tid, entry_ts)
+    );
+    CREATE TABLE fetch_jobs (
+      tid TEXT NOT NULL,
+      entry_ts REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt REAL,
+      last_error TEXT,
+      enqueued_at REAL NOT NULL,
+      PRIMARY KEY (tid, entry_ts)
+    );
+    CREATE INDEX idx_fetch_jobs_status ON fetch_jobs(status);
+    CREATE TABLE cg_demo_calls (
+      yyyymm TEXT PRIMARY KEY,
+      calls INTEGER NOT NULL DEFAULT 0
+    );
+    """)
+    now = ts(2026, 10, 12, 3)
+    entry = now - 8 * 3600
+    raw.execute(
+        """INSERT INTO fetch_jobs (tid, entry_ts, status, attempts, enqueued_at)
+           VALUES (?, ?, 'pending', 0, ?)""",
+        ("legacy:1399811149", entry, now),
+    )
+    raw.commit()
+    raw.close()
+
+    monkeypatch.setenv("OUTCOMES_DB", str(path))
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    outcomes.reset()
+    db = outcomes._connect()
+    cols = {row[1] for row in db.execute("PRAGMA table_info(fetch_jobs)")}
+    assert "priority" in cols
+    idx = {row[1] for row in db.execute("PRAGMA index_list(fetch_jobs)")}
+    assert "idx_fetch_jobs_drain" in idx
+    tables = {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    assert "cg_demo_calls_daily" in tables
+    assert "gt_pacing" in tables
+    pri = db.execute(
+        "SELECT COALESCE(priority, -1) AS p FROM fetch_jobs WHERE tid = ?",
+        ("legacy:1399811149",),
+    ).fetchone()
+    assert int(pri["p"]) == 0
+
+    outcomes.set_time_fn(lambda: now)
+    outcomes.set_sleep_fn(lambda d: None)
+
+    def get(url, params=None, timeout=None, headers=None):
+        if "dexscreener.com" in url:
+            return Resp(200, [{"pairAddress": "PoolX", "liquidity": {"usd": 80_000}}])
+        candles = [_candle(entry + i * 300, 1.0, 1.01, 0.99, 1.0) for i in range(80)]
+        return Resp(200, _ohlcv_list(candles))
+
+    outcomes.set_get_fn(get)
+    result = outcomes.drain_jobs(now=now, trickle=False, max_calls=1)
+    assert result["fetched"] == 1
+    assert result["complete"] == 1
+    cached = outcomes.get_cached("legacy:1399811149", entry)
+    assert cached and cached.get("complete") is True
+    outcomes.reset()

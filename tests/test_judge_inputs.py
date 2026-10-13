@@ -114,6 +114,7 @@ def test_trade_counts_stashes_m5_from_dex():
     pairs = [{
         "liquidity": {"usd": 50_000},
         "pairAddress": "pair1",
+        "volume": {"m5": 111.0, "h1": 2222.0, "h24": 9000.0},
         "txns": {
             "m5": {"buys": 4, "sells": 2},
             "h1": {"buys": 10, "sells": 8},
@@ -128,6 +129,8 @@ def test_trade_counts_stashes_m5_from_dex():
     assert data["buys_m5"] == 4 and data["sells_m5"] == 2
     assert token["buys_m5"] == 4 and token["sells_m5"] == 2
     assert data["buys_h1"] == 10
+    assert token["vol_1h"] == pytest.approx(2222.0)
+    assert token["vol_5m"] == pytest.approx(111.0)
 
 
 def test_trade_counts_omits_m5_when_absent():

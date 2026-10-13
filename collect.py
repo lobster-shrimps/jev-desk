@@ -867,6 +867,11 @@ def trade_counts(t: dict, gt_txns_cache: dict = None) -> tuple[dict, str]:
         # without another call. m5 is omitted downstream when missing.
         t.update({k: fields[k] for k in ("buys_h1", "sells_h1", "buys_h6", "sells_h6",
                                          "buys_m5", "sells_m5")})
+        vol = best_pair.get("volume") if isinstance(best_pair.get("volume"), dict) else {}
+        if vol.get("m5") is not None and t.get("vol_5m") is None:
+            t["vol_5m"] = vol.get("m5")
+        if vol.get("h1") is not None and t.get("vol_1h") is None:
+            t["vol_1h"] = vol.get("h1")
         return {
             **fields,
             "pair_address": best_pair.get("pairAddress"),  # Store for EVM holder checks
