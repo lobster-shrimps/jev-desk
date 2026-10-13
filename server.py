@@ -13,6 +13,8 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
   GET  /ops/backtest   latest weekly signal-backtest JSON
   GET  /ops/young_trail paper young-trail ledger (simulated, no live orders)
   GET  /ops/young_trail_variants paper exit-variant ranking (same marks)
+  GET  /ops/research/query?sql=  read-only SELECT on research.db (limit 500)
+  GET  /ops/research/report?kind= rugs|runners|features
   GET  /api/state      outbox/state.json for ops panel
 """
 import json
@@ -129,6 +131,35 @@ async def ops_young_trail_variants():
             "closed_trades": [],
             "entry_stats": [],
         })
+
+
+@app.get("/ops/research/query")
+async def ops_research_query(sql: str = ""):
+    """Read-only SELECT on research.db. Local-only (bind 127.0.0.1). Limit 500."""
+    try:
+        import research
+        if not sql or not str(sql).strip():
+            return JSONResponse({"error": "sql required", "rows": [], "n": 0, "limit": 500},
+                                status_code=400)
+        result = research.ops_query(sql)
+        status = 400 if result.get("error") else 200
+        return JSONResponse(result, status_code=status)
+    except Exception as e:
+        log.warning("ops research query: %s", safe_err(e))
+        return JSONResponse({"error": "query failed", "rows": [], "n": 0, "limit": 500})
+
+
+@app.get("/ops/research/report")
+async def ops_research_report(kind: str = "features"):
+    """Canned rugs|runners|features. Local-only. Fail open."""
+    try:
+        import research
+        return JSONResponse(research.report(kind))
+    except ValueError as e:
+        return JSONResponse({"error": str(e), "kind": kind}, status_code=400)
+    except Exception as e:
+        log.warning("ops research report: %s", safe_err(e))
+        return JSONResponse({"error": "report unavailable", "kind": kind})
 
 
 @app.get("/ops/backtest")

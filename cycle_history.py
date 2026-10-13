@@ -1848,6 +1848,24 @@ def _young_trail_briefing() -> dict:
         }
 
 
+def _early_signals_briefing() -> dict:
+    try:
+        import research
+        return research.early_signals()
+    except Exception as e:
+        log.warning("research briefing payload: %s", safe_err(e))
+        return {}
+
+
+def _early_signals_md_lines(payload: dict | None = None) -> list[str]:
+    try:
+        import research
+        return list(research.briefing_lines(payload) or [])
+    except Exception as e:
+        log.warning("research briefing: %s", safe_err(e))
+        return ["- Research store unavailable."]
+
+
 def _young_trail_variants_briefing() -> dict:
     try:
         import young_trail_variants
@@ -1994,6 +2012,9 @@ def render_briefing_md(payload: dict) -> str:
         "## Young trail (paper, simulated)",
         *_young_trail_md_lines(payload.get("young_trail") or {}),
         "",
+        "## Early signals (research)",
+        *_early_signals_md_lines(payload.get("early_signals") or {}),
+        "",
         "## Market regime (log-only)",
     ]
     lines.extend(_render_regime_md(w.get("regime") or {}))
@@ -2079,6 +2100,7 @@ def build_briefing(now: float | None = None, *, localtime: Callable | None = Non
         "persisted": False,
         "young_trail": _young_trail_briefing(),
         "young_trail_variants": _young_trail_variants_briefing(),
+        "early_signals": _early_signals_briefing(),
     }
     payload["markdown"] = render_briefing_md(payload)
     return payload
