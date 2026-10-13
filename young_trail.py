@@ -147,6 +147,11 @@ def _init_schema(db: sqlite3.Connection) -> None:
     );
     """)
     db.commit()
+    try:
+        import young_trail_variants
+        young_trail_variants.init_schema(db)
+    except Exception as e:
+        log.warning("young_trail variants schema: %s", safe_err(e))
 
 
 def enabled() -> bool:
@@ -446,6 +451,11 @@ def enter(tid: str, token: dict | None, price: float, now: float | None = None) 
                 "young_trail entry tid=%s ticker=%s price=%s ticket=%s paper=1",
                 tid, ticker, price, TICKET_USD,
             )
+            try:
+                import young_trail_variants
+                young_trail_variants.on_entry(tid, float(price), ts)
+            except Exception as e:
+                log.warning("young_trail variants entry: %s", safe_err(e))
             return True
         return False
     except Exception as e:
@@ -565,6 +575,11 @@ def mark_open(prices: dict[str, float] | None = None, now: float | None = None) 
     if opens:
         log.info("young_trail mark: %d marked, %d closed, %d stale paper=1",
                  marked, closed, stale)
+    try:
+        import young_trail_variants
+        young_trail_variants.on_marks(prices, ts)
+    except Exception as e:
+        log.warning("young_trail variants: %s", safe_err(e))
     return {"marked": marked, "closed": closed, "stale": stale}
 
 

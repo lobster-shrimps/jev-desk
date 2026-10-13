@@ -1819,7 +1819,17 @@ def _young_trail_md_lines(yt: dict) -> list[str]:
         f"- Paper $50 · SL -30% · trail 30% from peak · 6h time · no live orders ({flag}{until_bit})",
         f"- Open: {sm.get('open_count', 0)} · Closed: {sm.get('closed_count', 0)} · "
         f"Win rate: {wr_s} · Realized: ${realized:+.2f}",
+        *_young_trail_variant_md_lines(),
     ]
+
+
+def _young_trail_variant_md_lines() -> list[str]:
+    try:
+        import young_trail_variants
+        return list(young_trail_variants.briefing_lines() or [])
+    except Exception as e:
+        log.warning("young_trail variants briefing: %s", safe_err(e))
+        return []
 
 
 def _young_trail_briefing() -> dict:
@@ -1836,6 +1846,15 @@ def _young_trail_briefing() -> dict:
                 "realized_pnl_usd": 0.0,
             },
         }
+
+
+def _young_trail_variants_briefing() -> dict:
+    try:
+        import young_trail_variants
+        return young_trail_variants.ops_payload()
+    except Exception as e:
+        log.warning("young_trail variants briefing payload: %s", safe_err(e))
+        return {"top3": [], "caveat": "Marks are only every ~15 min cycle (intra-cycle moves missed)."}
 
 
 def render_briefing_md(payload: dict) -> str:
@@ -2059,6 +2078,7 @@ def build_briefing(now: float | None = None, *, localtime: Callable | None = Non
         "trends": trends,
         "persisted": False,
         "young_trail": _young_trail_briefing(),
+        "young_trail_variants": _young_trail_variants_briefing(),
     }
     payload["markdown"] = render_briefing_md(payload)
     return payload
