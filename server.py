@@ -12,6 +12,7 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
   GET  /ops/briefing   last-24h briefing + 7-day trends
   GET  /ops/backtest   latest weekly signal-backtest JSON
   GET  /ops/young_trail paper young-trail ledger (simulated, no live orders)
+  GET  /ops/young_trail_variants paper exit-variant ranking (same marks)
   GET  /api/state      outbox/state.json for ops panel
 """
 import json
@@ -106,6 +107,27 @@ async def ops_young_trail():
                 "open_count": 0, "closed_count": 0, "win_rate": 0.0,
                 "realized_pnl_usd": 0.0, "winning_trades": 0, "losing_trades": 0,
             },
+        })
+
+
+@app.get("/ops/young_trail_variants")
+async def ops_young_trail_variants():
+    """Paper exit-variant ranking on the same young_trail marks. Fail open."""
+    try:
+        import young_trail_variants
+        return JSONResponse(young_trail_variants.ops_payload())
+    except Exception as e:
+        log.warning("ops young_trail_variants: %s", safe_err(e))
+        return JSONResponse({
+            "paper": True,
+            "simulated": True,
+            "live_orders": False,
+            "error": "young_trail_variants unavailable",
+            "caveat": "Marks are only every ~15 min cycle (intra-cycle moves missed).",
+            "ranking": [],
+            "top3": [],
+            "closed_trades": [],
+            "entry_stats": [],
         })
 
 

@@ -760,6 +760,14 @@ tr:hover td { background: #151515; }
   <div id="young-trail-section"></div>
 </div>
 
+<div class="section" id="young-trail-variants-panel">
+  <div class="section-title">Young trail exit variants (paper)</div>
+  <div class="shadow-disclaimer">
+    Same entries and per-cycle marks as young_trail. Does not change live paper rules. Marks are only every ~15 min cycle; intra-cycle moves are missed. Realized P&amp;L on closed variant rows only. No live orders.
+  </div>
+  <div id="young-trail-variants-section"></div>
+</div>
+
 <div class="section">
   <div class="section-title">Held Positions (Live)</div>
   <div id="held-section"></div>
@@ -1469,6 +1477,36 @@ function makeTokenLinks(tid, ticker, chain) {
   return links.join(' ');
 }
 
+function renderYoungTrailVariants(data) {
+  const section = document.getElementById('young-trail-variants-section');
+  if (!section) return;
+  if (!data) {
+    section.innerHTML = '<div class="empty">Loading exit variants...</div>';
+    return;
+  }
+  const rank = data.ranking || [];
+  const caveat = data.caveat || 'Marks are only every ~15 min cycle (intra-cycle moves missed).';
+  if (!rank.length) {
+    section.innerHTML = `<div class="empty">No variant trades yet</div><div class="shadow-disclaimer">${esc(caveat)}</div>`;
+    return;
+  }
+  let html = `<table><thead><tr>
+    <th>Variant</th><th>n</th><th>Win rate</th><th>Realized P&amp;L</th><th>Open</th>
+  </tr></thead><tbody>`;
+  rank.forEach(r => {
+    const pnl = Number(r.realized_pnl_usd || 0);
+    html += `<tr>
+      <td>${esc(r.label || r.variant)}</td>
+      <td>${r.n || 0}</td>
+      <td>${((r.win_rate || 0) * 100).toFixed(1)}%</td>
+      <td class="${pnl >= 0 ? 'positive' : 'negative'}">$${pnl.toFixed(2)}</td>
+      <td>${r.open || 0}</td>
+    </tr>`;
+  });
+  html += `</tbody></table><div class="shadow-disclaimer">${esc(caveat)}</div>`;
+  section.innerHTML = html;
+}
+
 function renderYoungTrail(data) {
   const section = document.getElementById('young-trail-section');
   if (!section) return;
@@ -1849,6 +1887,15 @@ async function refresh() {
     }
 
     try {
+      const ytvResp = await fetch('/ops/young_trail_variants');
+      if (ytvResp.ok) {
+        renderYoungTrailVariants(await ytvResp.json());
+      }
+    } catch (e) {
+      console.warn('Could not fetch young trail variants:', e);
+    }
+
+    try {
       const briefResp = await fetch('/ops/briefing');
       if (briefResp.ok) {
         renderBriefing(await briefResp.json());
@@ -2109,6 +2156,12 @@ function renderBriefing(data) {
       <div class="pnl-stat"><div class="pnl-label">Realized</div>
         <div class="pnl-value ${yReal>=0?'positive':'negative'}">$${Number(yReal).toFixed(2)}</div></div>
     </div><div class="shadow-disclaimer">Paper only. $50 · SL -30% · trail 30% · 6h. No live orders. Until ${esc(yt.until_iso||'—')}.</div>`;
+    const ytv = data.young_trail_variants || {};
+    const top = ytv.top3 || [];
+    if (top.length) {
+      const bits = top.map((r, i) => `${i+1}) ${esc(r.variant)} $${Number(r.realized_pnl_usd||0).toFixed(2)} ${(Number(r.win_rate||0)*100).toFixed(0)}% n=${r.n||0}`);
+      ytEl.innerHTML += `<div class="shadow-disclaimer">Exit variants top 3: ${bits.join(' · ')}. ${esc(ytv.caveat || 'Marks are only every ~15 min cycle (intra-cycle moves missed).')}</div>`;
+    }
   }
 
   document.getElementById('briefing-uptime').innerHTML =
