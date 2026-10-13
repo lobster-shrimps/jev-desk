@@ -478,6 +478,37 @@ def test_lookup_budget_skips_remaining_and_logs(caplog):
     assert skip and "err=budget" in skip[0] and "ok=False" in skip[0]
 
 
+def test_lookup_budget_checked_before_each_http_and_8s_timeout(caplog):
+    """Elapsed is checked before every GET; a long first request skips the rest."""
+    caplog.set_level(logging.INFO)
+    clock = [1_000.0]
+    x_lookup.set_time_fn(lambda: clock[0])
+    calls = []
+    timeouts = []
+
+    def get(url, timeout=None, **kw):
+        timeouts.append(timeout)
+        calls.append(url)
+        clock[0] += 70.0  # one GET blows the 60s budget
+        if "/statuses" in url:
+            return _resp(200, _statuses_body(n=1))
+        handle = url.rstrip("/").split("/")[-1]
+        return _resp(200, _profile_body(handle=handle))
+
+    assert x_lookup.TIMEOUT_SEC == 8.0
+    with patch.dict(os.environ, {"X_LOOKUP_BUDGET_SEC": "60"}):
+        x_lookup.reset_cycle()
+        with patch("x_lookup.requests.get", side_effect=get):
+            a = x_lookup.read_x("one", tid="t1")
+            b = x_lookup.read_x("two", tid="t2")
+    assert a is not None  # profile landed; statuses skipped after budget
+    assert b is None
+    assert not any("two" in u for u in calls)
+    assert not any("/statuses" in u for u in calls)
+    assert timeouts and all(t is not None and t <= 8.0 for t in timeouts)
+    assert any("x budget exceeded" in r.message for r in caplog.records)
+
+
 def test_lookup_budget_zero_skips_all_http():
     calls = []
 

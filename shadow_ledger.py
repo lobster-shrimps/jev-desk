@@ -14,6 +14,8 @@ import os
 import pathlib
 import time
 
+from secret_utils import safe_err
+
 log = logging.getLogger("shadow_ledger")
 
 OUTBOX = pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox"))
@@ -34,19 +36,74 @@ SHADOW_STOP_LOSS_PCT = -30.0       # Stop loss at -30% (conservative)
 SHADOW_TAKE_PROFIT_PCT = 100.0     # Take profit at +100% (let winners run)
 
 
-def entry(order: dict, fomo_data: dict) -> dict:
+def _as_price(v):
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _price_from(bag, keys) -> float | None:
+    if not isinstance(bag, dict):
+        return None
+    for key in keys:
+        px = _as_price(bag.get(key))
+        if px:
+            return px
+    return None
+
+
+def resolve_entry_price(order: dict | None, fomo_data: dict | None = None,
+                        token_row: dict | None = None) -> tuple[float | None, str | None]:
+    """Same chain as young_trail: FOMO/shortlist price_usd, dossier priceUsd, Dex fetch.
+
+    One-off DexScreener lookup uses young_trail's 5s timeout. Fail open.
+    """
+    bags = (fomo_data, token_row, (order or {}).get("token"))
+    for bag in bags:
+        px = _price_from(bag, ("price_usd", "price"))
+        if px:
+            return px, "fomo"
+    for bag in bags:
+        px = _price_from(bag, ("priceUsd",))
+        if px:
+            return px, "dex"
+    token = (order or {}).get("token") or {}
+    addr = token.get("address") or token.get("addr")
+    net = token.get("network_id") if token.get("network_id") is not None else token.get("net")
+    tid = None
+    if isinstance(token_row, dict) and token_row.get("tid"):
+        tid = token_row["tid"]
+    elif addr is not None and net is not None:
+        tid = f"{addr}:{net}"
+    if tid:
+        try:
+            import young_trail
+            px = young_trail.fetch_dex_price(tid)
+            if px:
+                return float(px), "dexscreener"
+        except Exception as e:
+            log.warning("shadow dex price: %s", safe_err(e))
+    return None, None
+
+
+def entry(order: dict, fomo_data: dict = None, token_row: dict | None = None) -> dict:
     """
     Record a hypothetical entry when the desk would have traded in shadow mode.
     
     Args:
         order: The shadow order dict from pick/single-survivor
-        fomo_data: Current FOMO data for this token (has price, volume, etc.)
+        fomo_data: Shortlist/FOMO row or {price, price_usd, ...}
+        token_row: Optional dossier/shortlist token (Dex priceUsd, tid)
     
     Returns:
         Entry record dict
     """
     token = order["token"]
-    entry_price = fomo_data.get("price")
+    entry_price, source = resolve_entry_price(order, fomo_data, token_row)
     
     if entry_price is None or entry_price <= 0:
         log.warning("cannot record shadow entry for %s: missing or invalid price", token["ticker"])
@@ -70,11 +127,12 @@ def entry(order: dict, fomo_data: dict) -> dict:
         "confidence": order.get("confidence"),
         "model": order.get("model"),
         "order_id": order.get("order_id"),
+        "price_source": source,
     }
     
     _append(entry_record)
-    log.info("shadow entry %s at $%.6f, %s tokens, $%.2f ticket",
-             token["ticker"], entry_price, f"{size_tokens:.2f}", SHADOW_TICKET_USD)
+    log.info("shadow entry %s at $%.6f source=%s, %s tokens, $%.2f ticket",
+             token["ticker"], entry_price, source or "-", f"{size_tokens:.2f}", SHADOW_TICKET_USD)
     return entry_record
 
 

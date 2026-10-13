@@ -974,20 +974,29 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         return None, stats
     order["order_id"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if shadow:
-        # Get current FOMO data for the picked token to pass to shadow ledger
+        # Same price chain as young_trail: shortlist/FOMO price_usd, dossier, Dex.
         picked_token = order["token"]
-        # Find the token in shortlist_result to get FOMO data
-        picked_fomo_data = None
+        picked_row = None
+        addr = picked_token.get("address")
+        net = picked_token.get("network_id")
         for t in shortlist_result:
-            if t.get("addr") == picked_token["address"] and t.get("net") == picked_token["network_id"]:
-                picked_fomo_data = {
-                    "price": t.get("price"),
-                    "vol24": t.get("volume_h24"),
-                    "mcap": t.get("mcap_usd"),
-                }
+            if t.get("addr") == addr and t.get("net") == net:
+                picked_row = t
                 break
-        desk.log_shadow(order, stats, fomo_data=picked_fomo_data)  # written, never sent
-        return None, stats
+        if picked_row is None:
+            for item in survivors or []:
+                d = item[0] if isinstance(item, (tuple, list)) and item else item
+                if isinstance(d, dict) and d.get("addr") == addr and d.get("net") == net:
+                    picked_row = d
+                    break
+        recorded = None
+        try:
+            recorded = desk.log_shadow(order, stats, fomo_data=picked_row)
+        except Exception as e:
+            log.warning("log_shadow: %s", safe_err(e))
+        stats["shadow_order"] = order
+        stats["shadow_recorded"] = bool(recorded)
+        return None, stats  # never send; report() uses shadow_order / shadow_recorded
 
     book.take(order)          # the desk is now held. No scan until RISK calls release().
     return order, stats

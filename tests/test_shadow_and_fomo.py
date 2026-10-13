@@ -92,6 +92,108 @@ def test_shadow_ledger_entry_missing_price():
     assert len(opens) == 0
 
 
+def _shadow_order(ticker="hellop"):
+    return {
+        "token": {
+            "ticker": ticker,
+            "address": "HelLoPAddr111",
+            "network_id": 1399811149,
+            "chain": "solana",
+        },
+        "size_factor": 1.0,
+        "confidence": 0.7,
+        "model": "jev-test",
+        "order_id": "2026-10-13T09:03:27Z",
+    }
+
+
+def test_shadow_entry_uses_price_usd_from_shortlist(caplog):
+    caplog.set_level("INFO")
+    rec = shadow_ledger.entry(_shadow_order(), {"price_usd": 0.0042, "price": None})
+    assert rec is not None
+    assert rec["entry_price_usd"] == pytest.approx(0.0042)
+    assert rec["price_source"] == "fomo"
+    assert "source=fomo" in caplog.text
+
+
+def test_shadow_entry_uses_dossier_priceusd():
+    rec = shadow_ledger.entry(
+        _shadow_order(),
+        {"price": None},
+        token_row={"tid": "HelLoPAddr111:1399811149", "priceUsd": "0.0015"},
+    )
+    assert rec is not None
+    assert rec["entry_price_usd"] == pytest.approx(0.0015)
+    assert rec["price_source"] == "dex"
+
+
+def test_shadow_entry_dexscreener_fallback(monkeypatch):
+    import young_trail
+    class Resp:
+        status_code = 200
+        def json(self):
+            return [{"liquidity": {"usd": 80_000}, "priceUsd": "0.0099"}]
+    young_trail.set_get_fn(lambda *a, **k: Resp())
+    rec = shadow_ledger.entry(_shadow_order(), {"price": None, "price_usd": None})
+    assert rec is not None
+    assert rec["entry_price_usd"] == pytest.approx(0.0099)
+    assert rec["price_source"] == "dexscreener"
+    young_trail.set_get_fn(lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("young_trail tests must not use the network")
+    ))
+
+
+def test_shadow_entry_gives_up_only_when_all_fail():
+    rec = shadow_ledger.entry(_shadow_order(), {"price": None})
+    assert rec is None
+    assert shadow_ledger.open_positions() == []
+
+
+def test_report_shadow_traded_not_no_trade(caplog, tmp_path, monkeypatch):
+    import desk as desk_mod
+    monkeypatch.setattr(desk_mod, "OUTBOX", tmp_path)
+    caplog.set_level("INFO")
+    d = desk_mod.Desk()
+    order = _shadow_order()
+    stats = {"seen": 10, "benched": 0, "judged": 1, "tokens": [],
+             "shadow_order": order, "shadow_recorded": True}
+    d.report(None, stats)
+    assert any("SHADOW " in r.message and "hellop" in r.message and "NO TRADE" not in r.message
+               for r in caplog.records)
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["cycle"]["outcome"] == "SHADOW"
+    assert state["pick"]["token"]["ticker"] == "hellop"
+
+
+def test_main_shadow_path_passes_shortlist_row_and_records_flag():
+    src = pathlib.Path(__file__).resolve().parent.parent.joinpath("main.py").read_text()
+    assert "fomo_data=picked_row" in src
+    assert 'stats["shadow_recorded"]' in src
+    assert 'stats["shadow_order"]' in src
+    # Must not rebuild a dict that only reads t.get("price") (the hellop miss).
+    shadow_block = src.split("if shadow:")[1].split("book.take")[0]
+    assert 't.get("price")' not in shadow_block
+    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py"):
+        r = pathlib.Path(__file__).resolve().parent.parent.joinpath(name).read_text()
+        if name == "thresholds.py":
+            assert "PICK_MIN_WORTH  = 0.60" in r
+
+
+def test_report_shadow_pick_lost_not_no_trade(caplog, tmp_path, monkeypatch):
+    import desk as desk_mod
+    monkeypatch.setattr(desk_mod, "OUTBOX", tmp_path)
+    caplog.set_level("INFO")
+    d = desk_mod.Desk()
+    stats = {"seen": 10, "benched": 0, "judged": 1, "tokens": [],
+             "shadow_order": _shadow_order(), "shadow_recorded": False}
+    d.report(None, stats)
+    assert any("SHADOW pick lost: hellop no price" in r.message for r in caplog.records)
+    assert not any(r.message.startswith("NO TRADE") for r in caplog.records)
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["cycle"]["outcome"] == "SHADOW"
+    assert "no price" in (state["cycle"].get("error") or "")
+
+
 def test_shadow_ledger_mark_and_pnl():
     """Test marking a position to market and calculating PnL."""
     # Create entry
