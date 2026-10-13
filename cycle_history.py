@@ -1848,6 +1848,24 @@ def _young_trail_briefing() -> dict:
         }
 
 
+def _early_signals_briefing() -> dict:
+    try:
+        import research
+        return research.early_signals()
+    except Exception as e:
+        log.warning("research briefing payload: %s", safe_err(e))
+        return {}
+
+
+def _early_signals_md_lines(payload: dict | None = None) -> list[str]:
+    try:
+        import research
+        return list(research.briefing_lines(payload) or [])
+    except Exception as e:
+        log.warning("research briefing: %s", safe_err(e))
+        return ["- Research store unavailable."]
+
+
 def _young_trail_variants_briefing() -> dict:
     try:
         import young_trail_variants
@@ -1994,6 +2012,9 @@ def render_briefing_md(payload: dict) -> str:
         "## Young trail (paper, simulated)",
         *_young_trail_md_lines(payload.get("young_trail") or {}),
         "",
+        "## Early signals (research)",
+        *_early_signals_md_lines(payload.get("early_signals") or {}),
+        "",
         "## Market regime (log-only)",
     ]
     lines.extend(_render_regime_md(w.get("regime") or {}))
@@ -2079,6 +2100,7 @@ def build_briefing(now: float | None = None, *, localtime: Callable | None = Non
         "persisted": False,
         "young_trail": _young_trail_briefing(),
         "young_trail_variants": _young_trail_variants_briefing(),
+        "early_signals": _early_signals_briefing(),
     }
     payload["markdown"] = render_briefing_md(payload)
     return payload
@@ -2216,6 +2238,11 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
     Soft / free-pass / 429 lines that appear before a `cycle:` line belong to
     that cycle (the live logger emits the cycle summary last).
     """
+    return parse_run_log_lines(str(text or "").splitlines())
+
+
+def parse_run_log_lines(lines) -> tuple[list[dict], dict]:
+    """Same as parse_run_log, streaming a line iterable (plain or decompressed)."""
     cycles: list[dict] = []
     pending_soft: list[dict] = []
     pending_young: dict[str, dict] = {}
@@ -2281,7 +2308,7 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
         unevaluated = 0
         pending_gt_429 = 0
 
-    for raw in text.splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line:
             continue

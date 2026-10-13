@@ -75,6 +75,15 @@ def _young_trail_hook(stats=None, tokens=None):
         log.warning("young_trail: %s", safe_err(e))
 
 
+def _research_hook(stats=None, tokens=None):
+    """Research snapshots. Never raise; never live orders; never log secrets."""
+    try:
+        import research
+        research.on_cycle(stats=stats, tokens=tokens)
+    except Exception as e:
+        log.warning("research: %s", safe_err(e))
+
+
 # Judge question-set router. 8453 (Base) shares the bsc seat on purpose
 # (questions.CHAIN_BSC). Holder APIs must use t["net"] (8453), never this map —
 # mapping Base to "bsc" here must not send Honeypot/GoPlus/RPC to chain id 56.
@@ -967,6 +976,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
 
     _history_hook("cycle", stats=stats, shadow=shadow)
     _young_trail_hook(stats=stats, tokens=shortlist_result)
+    _research_hook(stats=stats, tokens=shortlist_result)
 
     if not survivors:
         return None, stats
@@ -1070,6 +1080,11 @@ def main(fomo, judge, desk, shadow=True, once=False):
             backtest_signals.maybe_start_weekly(now=_now())
         except Exception as e:
             log.warning("weekly backtest: %s", safe_err(e))
+        try:
+            import research
+            research.maybe_start_sampler()
+        except Exception as e:
+            log.warning("research sampler: %s", safe_err(e))
         if once:
             return
         

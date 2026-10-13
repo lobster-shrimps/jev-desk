@@ -111,6 +111,27 @@ def isolate_judge_inputs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_research(tmp_path, monkeypatch):
+    """Point research.db at a per-test SQLite file. No Dex sampler thread."""
+    monkeypatch.setenv("RESEARCH_DB", str(tmp_path / "research.db"))
+    monkeypatch.setenv("RESEARCH_SAMPLER_DISABLE", "1")
+    import research
+    research.reset()
+    research.set_time_fn(None)
+    research.set_sleep_fn(lambda _d: None)
+
+    def _no_network(*_a, **_k):
+        raise AssertionError("research tests must not use the network")
+
+    research.set_get_fn(_no_network)
+    yield
+    research.reset()
+    research.set_get_fn(None)
+    research.set_sleep_fn(None)
+    research.set_time_fn(None)
+
+
+@pytest.fixture(autouse=True)
 def isolate_x_cache(tmp_path, monkeypatch):
     """Point the X lookup cache at a per-test SQLite file. Reset the cycle cap."""
     monkeypatch.setenv("X_CACHE_DB", str(tmp_path / "x_cache.db"))

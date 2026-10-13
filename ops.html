@@ -638,6 +638,8 @@ tr:hover td { background: #151515; }
   <div id="briefing-shadow"></div>
   <div class="section-title">Young trail (paper, simulated)</div>
   <div id="briefing-young-trail"></div>
+  <div class="section-title">Early signals (research)</div>
+  <div id="briefing-early-signals"></div>
   <div class="section-title">Desk uptime</div>
   <div id="briefing-uptime"></div>
   <details>
@@ -662,6 +664,14 @@ tr:hover td { background: #151515; }
     <summary class="funnel-guide-title" style="margin-top:12px;">▶ Full backtest markdown</summary>
     <pre class="briefing-md" id="backtest-md"></pre>
   </details>
+</div>
+
+<div id="research-panel" class="section">
+  <div class="section-title">Research store</div>
+  <div class="shadow-disclaimer">
+    Queryable snapshots + 60s Dex marks. Read-only SELECT via GET /ops/research/query?sql= (limit 500). Does not change kills, judge, pick, or ticket size. No live orders. Desk stays bound to 127.0.0.1.
+  </div>
+  <div id="research-features"></div>
 </div>
 
 <div id="shadow-kills-panel" class="section">
@@ -1477,6 +1487,30 @@ function makeTokenLinks(tid, ticker, chain) {
   return links.join(' ');
 }
 
+function renderResearchFeatures(data) {
+  const el = document.getElementById('research-features');
+  if (!el) return;
+  if (!data || data.error) {
+    el.innerHTML = '<div class="empty">No research labels yet — wait for a cycle or python research.py backfill</div>';
+    return;
+  }
+  const run = (data.runners || {});
+  const rug = (data.rugs || {});
+  const fmt = (v, money) => {
+    if (v == null) return '—';
+    if (money) return '$' + Number(v).toLocaleString(undefined, {maximumFractionDigits: 0});
+    return Number(v).toFixed(2);
+  };
+  el.innerHTML = `<div class="pnl-grid">
+    <div class="pnl-stat"><div class="pnl-label">Runners n</div><div class="pnl-value">${run.n||0}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Rugs n</div><div class="pnl-value">${rug.n||0}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Runner median liq</div><div class="pnl-value">${fmt(run.liq_usd, true)}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Rug median liq</div><div class="pnl-value">${fmt(rug.liq_usd, true)}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Runner holders</div><div class="pnl-value">${fmt(run.holders)}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Rug holders</div><div class="pnl-value">${fmt(rug.holders)}</div></div>
+  </div><div class="shadow-disclaimer">${esc(data.note || 'Median features at first free-pass.')} GET /ops/research/query?sql=</div>`;
+}
+
 function renderYoungTrailVariants(data) {
   const section = document.getElementById('young-trail-variants-section');
   if (!section) return;
@@ -1896,6 +1930,15 @@ async function refresh() {
     }
 
     try {
+      const rsResp = await fetch('/ops/research/report?kind=features');
+      if (rsResp.ok) {
+        renderResearchFeatures(await rsResp.json());
+      }
+    } catch (e) {
+      console.warn('Could not fetch research report:', e);
+    }
+
+    try {
       const briefResp = await fetch('/ops/briefing');
       if (briefResp.ok) {
         renderBriefing(await briefResp.json());
@@ -2156,6 +2199,20 @@ function renderBriefing(data) {
       <div class="pnl-stat"><div class="pnl-label">Realized</div>
         <div class="pnl-value ${yReal>=0?'positive':'negative'}">$${Number(yReal).toFixed(2)}</div></div>
     </div><div class="shadow-disclaimer">Paper only. $50 · SL -30% · trail 30% · 6h. No live orders. Until ${esc(yt.until_iso||'—')}.</div>`;
+  const esEl = document.getElementById('briefing-early-signals');
+  if (esEl) {
+    const es = data.early_signals || {};
+    const feat = es.features || {};
+    const run = feat.runners || {};
+    const rug = feat.rugs || {};
+    esEl.innerHTML = `<div class="pnl-grid">
+      <div class="pnl-stat"><div class="pnl-label">Runners (peak≥2x before rug)</div><div class="pnl-value">${es.runners_n||0}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Rugs</div><div class="pnl-value">${es.rugs_n||0}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Runner median liq</div><div class="pnl-value">${run.liq_usd==null?'—':('$' + Number(run.liq_usd).toLocaleString(undefined,{maximumFractionDigits:0}))}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Rug median liq</div><div class="pnl-value">${rug.liq_usd==null?'—':('$' + Number(rug.liq_usd).toLocaleString(undefined,{maximumFractionDigits:0}))}</div></div>
+    </div><div class="shadow-disclaimer">Research only. Does not change kills, judge, pick, or ticket size.</div>`;
+  }
+
     const ytv = data.young_trail_variants || {};
     const top = ytv.top3 || [];
     if (top.length) {

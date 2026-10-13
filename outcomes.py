@@ -10,6 +10,7 @@ Exceptions go through safe_err. Never logs secrets.
 """
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
@@ -46,6 +47,8 @@ TP_PCT = 1.00
 TRAIL_PCT = 0.30
 HTTP_TIMEOUT = 20
 LOCK_TIMEOUT_SEC = 0.2
+PRIORITY_LIVE = 0
+PRIORITY_BACKFILL = 1
 
 _conn: sqlite3.Connection | None = None
 _conn_path: str | None = None
@@ -55,6 +58,7 @@ _time_fn = time.time
 _gt_lock = threading.Lock()
 _last_gt_call = 0.0
 _gt_backoff_until = 0.0
+_pacing_loaded = False
 _trickle_mode = False
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
@@ -94,7 +98,7 @@ def db_path() -> pathlib.Path:
 def reset() -> None:
     """Close the cached connection and clear pacing. Tests call this."""
     global _conn, _conn_path, _last_gt_call, _gt_backoff_until
-    global _trickle_mode, _worker_thread
+    global _trickle_mode, _worker_thread, _pacing_loaded
     if _conn is not None:
         try:
             _conn.close()
@@ -105,11 +109,12 @@ def reset() -> None:
     with _gt_lock:
         _last_gt_call = 0.0
         _gt_backoff_until = 0.0
+    _pacing_loaded = False
     _trickle_mode = False
     with _worker_lock:
         _worker_thread = None
     try:
-        gt_api.set_demo_capped_fn(demo_month_capped)
+        gt_api.set_demo_capped_fn(demo_budget_capped)
         gt_api.reset()
     except Exception:
         pass
@@ -160,23 +165,80 @@ def _init_schema(db: sqlite3.Connection) -> None:
       last_attempt REAL,
       last_error TEXT,
       enqueued_at REAL NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (tid, entry_ts)
     );
     CREATE INDEX IF NOT EXISTS idx_fetch_jobs_status ON fetch_jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_fetch_jobs_drain
+      ON fetch_jobs(status, priority, attempts, last_attempt);
     CREATE TABLE IF NOT EXISTS cg_demo_calls (
       yyyymm TEXT PRIMARY KEY,
       calls INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS cg_demo_calls_daily (
+      yyyymmdd TEXT PRIMARY KEY,
+      calls INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS gt_pacing (
+      k TEXT PRIMARY KEY,
+      v REAL NOT NULL
+    );
     """)
     db.commit()
+    _ensure_fetch_job_priority(db)
     try:
         _retire_overlimit_jobs(db)
     except Exception as e:
         log.warning("outcomes retire overlimit failed: %s", safe_err(e))
     try:
-        gt_api.set_demo_capped_fn(demo_month_capped)
+        gt_api.set_demo_capped_fn(demo_budget_capped)
     except Exception:
         pass
+    _load_pacing(db)
+
+
+def _ensure_fetch_job_priority(db: sqlite3.Connection) -> None:
+    """Existing DBs created before priority: default 0 (live)."""
+    try:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(fetch_jobs)")}
+        if "priority" not in cols:
+            db.execute(
+                "ALTER TABLE fetch_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+            )
+            db.commit()
+    except Exception as e:
+        log.warning("outcomes priority migrate: %s", safe_err(e))
+
+
+def _load_pacing(db: sqlite3.Connection | None = None) -> None:
+    """Restore 2s Demo spacing across process restarts."""
+    global _last_gt_call, _pacing_loaded
+    if _pacing_loaded:
+        return
+    try:
+        conn = db or _connect()
+        row = conn.execute(
+            "SELECT v FROM gt_pacing WHERE k = ?", ("last_gt_call",),
+        ).fetchone()
+        if row is not None:
+            with _gt_lock:
+                if _last_gt_call == 0.0:
+                    _last_gt_call = float(row["v"])
+    except Exception as e:
+        log.warning("outcomes pacing load: %s", safe_err(e))
+    _pacing_loaded = True
+
+
+def _persist_last_gt_call(ts: float) -> None:
+    try:
+        db = _connect()
+        db.execute(
+            "INSERT OR REPLACE INTO gt_pacing (k, v) VALUES (?, ?)",
+            ("last_gt_call", float(ts)),
+        )
+        db.commit()
+    except Exception as e:
+        log.warning("outcomes pacing save: %s", safe_err(e))
 
 
 def _sleep(seconds: float) -> None:
@@ -188,11 +250,27 @@ def _sleep(seconds: float) -> None:
 
 
 def _http_get(url: str, params=None, timeout=HTTP_TIMEOUT):
+    """One HTTP request. Demo URLs increment the real-request counter."""
     fn = _get_fn or requests.get
-    return fn(
+    resp = fn(
         url, params=params, timeout=timeout,
         headers=gt_api.request_headers(url, purpose="outcomes"),
     )
+    if gt_api.is_demo_url(url):
+        try:
+            n = record_demo_call()
+            if n >= gt_api.DEMO_MONTHLY_CAP:
+                log.info(
+                    "coingecko demo monthly cap reached (%d), falling back to free GT", n,
+                )
+            elif demo_day_capped():
+                log.info(
+                    "coingecko demo daily cap reached (%d/%d), falling back to free GT",
+                    demo_calls_today(), demo_daily_cap(),
+                )
+        except Exception as e:
+            log.warning("demo call counter after HTTP: %s", safe_err(e))
+    return resp
 
 
 def parse_tid(tid) -> tuple[str | None, int | None]:
@@ -446,8 +524,12 @@ def put_cached(tid: str, entry_ts: float, payload: dict) -> None:
 
 
 def _pace_gt(deadline: float | None) -> bool:
-    """Wait for own spacing and 429 backoff. False if the deadline would be missed."""
+    """Wait for own spacing and 429 backoff. False if the deadline would be missed.
+
+    last_gt_call is persisted so 2s Demo spacing survives process restarts.
+    """
     global _last_gt_call
+    _load_pacing()
     spacing = gt_api.outcomes_spacing_sec(trickle=_trickle_mode)
     with _gt_lock:
         now = current_time()
@@ -459,6 +541,8 @@ def _pace_gt(deadline: float | None) -> bool:
         _sleep(wait)
     with _gt_lock:
         _last_gt_call = current_time()
+        stamped = _last_gt_call
+    _persist_last_gt_call(stamped)
     return True
 
 
@@ -523,6 +607,20 @@ def _yyyymm(now: float | None = None) -> str:
     return f"{lt.tm_year:04d}-{lt.tm_mon:02d}"
 
 
+def _yyyymmdd(now: float | None = None) -> str:
+    ts = current_time() if now is None else float(now)
+    lt = time.localtime(ts)
+    return f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+
+
+def days_left_in_month(now: float | None = None) -> int:
+    """Days remaining including today. Oct 12 -> 20 in a 31-day month."""
+    ts = current_time() if now is None else float(now)
+    lt = time.localtime(ts)
+    last = calendar.monthrange(lt.tm_year, lt.tm_mon)[1]
+    return max(1, last - int(lt.tm_mday) + 1)
+
+
 def demo_calls_this_month(now: float | None = None) -> int:
     try:
         db = _connect()
@@ -536,15 +634,50 @@ def demo_calls_this_month(now: float | None = None) -> int:
         return gt_api.DEMO_MONTHLY_CAP
 
 
+def demo_calls_today(now: float | None = None) -> int:
+    try:
+        db = _connect()
+        row = db.execute(
+            "SELECT calls FROM cg_demo_calls_daily WHERE yyyymmdd = ?",
+            (_yyyymmdd(now),),
+        ).fetchone()
+        return int(row["calls"]) if row else 0
+    except Exception as e:
+        log.warning("demo daily counter read failed: %s", safe_err(e))
+        return gt_api.DEMO_MONTHLY_CAP
+
+
+def demo_daily_cap(now: float | None = None) -> int:
+    """Spread remaining monthly Demo budget across days left (including today).
+
+    remaining is monthly unused *before today*, so today's own calls do not
+    shrink the day's allowance. 0 when the month is already exhausted.
+    """
+    now = current_time() if now is None else float(now)
+    used_month = demo_calls_this_month(now)
+    used_today = demo_calls_today(now)
+    used_before_today = max(0, used_month - used_today)
+    remaining = max(0, gt_api.DEMO_MONTHLY_CAP - used_before_today)
+    if remaining <= 0:
+        return 0
+    return max(1, remaining // days_left_in_month(now))
+
+
 def record_demo_call(now: float | None = None) -> int:
-    """Count one Demo onchain request. Returns the new monthly total."""
+    """Count one actual Demo HTTP request. Returns the new monthly total."""
     month = _yyyymm(now)
+    day = _yyyymmdd(now)
     try:
         db = _connect()
         db.execute(
             """INSERT INTO cg_demo_calls (yyyymm, calls) VALUES (?, 1)
                ON CONFLICT(yyyymm) DO UPDATE SET calls = calls + 1""",
             (month,),
+        )
+        db.execute(
+            """INSERT INTO cg_demo_calls_daily (yyyymmdd, calls) VALUES (?, 1)
+               ON CONFLICT(yyyymmdd) DO UPDATE SET calls = calls + 1""",
+            (day,),
         )
         db.commit()
         row = db.execute(
@@ -558,6 +691,18 @@ def record_demo_call(now: float | None = None) -> int:
 
 def demo_month_capped(now: float | None = None) -> bool:
     return demo_calls_this_month(now) >= gt_api.DEMO_MONTHLY_CAP
+
+
+def demo_day_capped(now: float | None = None) -> bool:
+    cap = demo_daily_cap(now)
+    if cap <= 0:
+        return True
+    return demo_calls_today(now) >= cap
+
+
+def demo_budget_capped(now: float | None = None) -> bool:
+    """True when Demo must not be used: monthly cap or today's share is gone."""
+    return demo_month_capped(now) or demo_day_capped(now)
 
 
 def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None = None):
@@ -578,10 +723,6 @@ def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None =
         return None
     try:
         resp = _http_get(url, params=params, timeout=HTTP_TIMEOUT)
-        if gt_api.is_demo_url(url):
-            n = record_demo_call()
-            if n >= gt_api.DEMO_MONTHLY_CAP:
-                log.info("coingecko demo monthly cap reached (%d), falling back to free GT", n)
         status = getattr(resp, "status_code", None)
         if status in (401, 403):
             free = gt_api.fallback_free_url(url)
@@ -671,8 +812,12 @@ def fetch_outcome(tid: str, entry_ts: float, *, now: float | None = None,
 # Resumable fetch queue (outcomes.db fetch_jobs)
 # ---------------------------------------------------------------------------
 
-def enqueue_job(tid: str, entry_ts: float, *, now: float | None = None) -> bool:
-    """Insert a pending job if missing. False if already complete/cached."""
+def enqueue_job(tid: str, entry_ts: float, *, now: float | None = None,
+                priority: int = PRIORITY_LIVE) -> bool:
+    """Insert a pending job if missing. False if already complete/cached/queued.
+
+    priority: 0=live (drained anytime), 1=backfill (01:00-06:00 window only).
+    """
     try:
         cached = get_cached(tid, entry_ts)
         if cached and cached.get("complete"):
@@ -680,17 +825,30 @@ def enqueue_job(tid: str, entry_ts: float, *, now: float | None = None) -> bool:
             return False
         db = _connect()
         ts = current_time() if now is None else float(now)
-        db.execute(
+        pri = int(priority)
+        cur = db.execute(
             """INSERT OR IGNORE INTO fetch_jobs
-               (tid, entry_ts, status, attempts, enqueued_at)
-               VALUES (?, ?, 'pending', 0, ?)""",
-            (str(tid), float(entry_ts), ts),
+               (tid, entry_ts, status, attempts, enqueued_at, priority)
+               VALUES (?, ?, 'pending', 0, ?, ?)""",
+            (str(tid), float(entry_ts), ts, pri),
         )
         db.commit()
-        return True
+        return int(cur.rowcount or 0) > 0
     except Exception as e:
         log.warning("outcomes enqueue failed: %s", safe_err(e))
         return False
+
+
+def queued_or_fetched_tids() -> set[str]:
+    """Tids that already have an outcomes row or a fetch_jobs row. Fail closed."""
+    try:
+        db = _connect()
+        tids = {r[0] for r in db.execute("SELECT DISTINCT tid FROM outcomes")}
+        tids |= {r[0] for r in db.execute("SELECT DISTINCT tid FROM fetch_jobs")}
+        return tids
+    except Exception as e:
+        log.warning("outcomes queued tids: %s", safe_err(e))
+        return set()
 
 
 def _upsert_job(tid: str, entry_ts: float, *, status: str, now: float | None = None,
@@ -707,14 +865,16 @@ def _upsert_job(tid: str, entry_ts: float, *, status: str, now: float | None = N
             attempts += 1
         db.execute(
             """INSERT INTO fetch_jobs
-               (tid, entry_ts, status, attempts, last_attempt, last_error, enqueued_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+               (tid, entry_ts, status, attempts, last_attempt, last_error,
+                enqueued_at, priority)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(tid, entry_ts) DO UPDATE SET
                  status = excluded.status,
                  attempts = excluded.attempts,
                  last_attempt = excluded.last_attempt,
                  last_error = excluded.last_error""",
-            (str(tid), float(entry_ts), status, attempts, ts, error, ts),
+            (str(tid), float(entry_ts), status, attempts, ts, error, ts,
+             PRIORITY_LIVE),
         )
         db.commit()
     except Exception as e:
@@ -744,15 +904,24 @@ def _retire_overlimit_jobs(db: sqlite3.Connection | None = None) -> int:
         return 0
 
 
-def list_jobs(status: str | None = "pending", limit: int = 500) -> list[dict]:
+_JOB_COLS = (
+    "tid, entry_ts, status, attempts, last_attempt, last_error, "
+    "COALESCE(priority, 0) AS priority"
+)
+
+
+def list_jobs(status: str | None = "pending", limit: int = 500,
+              *, include_backfill: bool = True) -> list[dict]:
+    """Pending drain order: priority, attempts, last_attempt (live=0 before backfill=1)."""
     try:
         db = _connect()
         if status == "pending":
+            extra = "" if include_backfill else " AND COALESCE(priority, 0) = 0"
             rows = db.execute(
-                """SELECT tid, entry_ts, status, attempts, last_attempt, last_error
-                   FROM fetch_jobs WHERE status = 'pending'
-                   ORDER BY attempts ASC,
-                            last_attempt IS NULL DESC,
+                f"""SELECT {_JOB_COLS}
+                   FROM fetch_jobs WHERE status = 'pending'{extra}
+                   ORDER BY COALESCE(priority, 0) ASC,
+                            attempts ASC,
                             last_attempt ASC,
                             tid
                    LIMIT ?""",
@@ -760,14 +929,14 @@ def list_jobs(status: str | None = "pending", limit: int = 500) -> list[dict]:
             ).fetchall()
         elif status:
             rows = db.execute(
-                """SELECT tid, entry_ts, status, attempts, last_attempt, last_error
+                f"""SELECT {_JOB_COLS}
                    FROM fetch_jobs WHERE status = ?
                    ORDER BY entry_ts, tid LIMIT ?""",
                 (status, int(limit)),
             ).fetchall()
         else:
             rows = db.execute(
-                """SELECT tid, entry_ts, status, attempts, last_attempt, last_error
+                f"""SELECT {_JOB_COLS}
                    FROM fetch_jobs ORDER BY entry_ts, tid LIMIT ?""",
                 (int(limit),),
             ).fetchall()
@@ -831,7 +1000,8 @@ def drain_jobs(*, now: float | None = None, deadline: float | None = None,
     paused = False
     try:
         _retire_overlimit_jobs()
-        jobs = list_jobs("pending")
+        in_window = gt_api.in_outcomes_window(now)
+        jobs = list_jobs("pending", include_backfill=in_window)
         for job in jobs:
             if deadline is not None and current_time() >= deadline:
                 break
