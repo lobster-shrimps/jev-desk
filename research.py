@@ -11,10 +11,18 @@ CLI:
   python research.py report rugs|runners|features
   python research.py backfill [run.log]
   python research.py labels
+
+Rows carry origin='live' or origin='backfill:<source>'. Backfill reads all
+available history (rotated run.logs, cycle JSON, shadow_kills, shadow ledger,
+outcomes candles, judge lines, young_trail+variants, x_cache, coinalyze).
+Tokens still missing post-sighting prices are queued for the off-peak
+outcomes fetcher.
 """
 from __future__ import annotations
 
 import argparse
+import bz2
+import gzip
 import json
 import logging
 import os
@@ -24,6 +32,7 @@ import sqlite3
 import sys
 import threading
 import time
+from datetime import datetime
 
 import requests
 
@@ -176,7 +185,8 @@ def _init_schema(db: sqlite3.Connection) -> None:
       judge_score REAL,
       judge_confidence REAL,
       judge_verdict TEXT,
-      regime TEXT
+      regime TEXT,
+      origin TEXT NOT NULL DEFAULT 'live'
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_snap_dedup
       ON token_snapshots(ts_sec, tid, stage);
@@ -196,6 +206,7 @@ def _init_schema(db: sqlite3.Connection) -> None:
       vol_1h REAL,
       vol_h24 REAL,
       source TEXT NOT NULL DEFAULT 'dex_batch',
+      origin TEXT NOT NULL DEFAULT 'live',
       PRIMARY KEY (ts_sec, tid)
     );
     CREATE INDEX IF NOT EXISTS idx_marks_tid ON fast_marks(tid);
@@ -220,7 +231,8 @@ def _init_schema(db: sqlite3.Connection) -> None:
       rug_ts REAL,
       time_to_rug_min REAL,
       runner INTEGER NOT NULL DEFAULT 0,
-      updated_ts REAL
+      updated_ts REAL,
+      origin TEXT NOT NULL DEFAULT 'live'
     );
     CREATE INDEX IF NOT EXISTS idx_labels_runner ON token_labels(runner);
     CREATE INDEX IF NOT EXISTS idx_labels_rugged ON token_labels(rugged);
@@ -231,6 +243,27 @@ def _init_schema(db: sqlite3.Connection) -> None:
     );
     """)
     db.commit()
+    _ensure_origin_cols(db)
+
+
+def _ensure_origin_cols(db: sqlite3.Connection) -> None:
+    for table in ("token_snapshots", "fast_marks", "token_labels"):
+        try:
+            cols = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        except Exception:
+            continue
+        if "origin" not in cols:
+            db.execute(
+                f"ALTER TABLE {table} ADD COLUMN origin TEXT NOT NULL DEFAULT 'live'"
+            )
+    db.commit()
+
+
+def _as_origin(origin: str | None, *, default: str = "live") -> str:
+    raw = (origin or default or "live").strip() or default
+    if raw == "backfill":
+        return "backfill:run.log"
+    return raw
 
 
 def _sleep(seconds: float) -> None:
@@ -320,7 +353,8 @@ def _x_fields(token: dict) -> tuple:
     return handle, _int(followers), kind
 
 
-def _row_from_token(token: dict, ts: float, *, stage=None, regime=None) -> dict:
+def _row_from_token(token: dict, ts: float, *, stage=None, regime=None,
+                    origin: str | None = None) -> dict:
     t = token or {}
     tid = t.get("tid")
     stage = stage if stage is not None else (t.get("stage") or "")
@@ -364,6 +398,7 @@ def _row_from_token(token: dict, ts: float, *, stage=None, regime=None) -> dict:
         "judge_confidence": _num(t.get("judge_confidence")),
         "judge_verdict": t.get("judge_verdict"),
         "regime": regime or t.get("regime"),
+        "origin": _as_origin(t.get("origin") or origin, default="live"),
     }
 
 
@@ -376,8 +411,9 @@ def _insert_snapshot(db: sqlite3.Connection, row: dict) -> bool:
              vol_5m, vol_1h, buys_5m, sells_5m, buys_1h, sells_1h,
              holders, holder_growth, top_wallet_pct, top10_pct, dev_pct, dev_sold_pct,
              x_handle, x_followers, x_kind, source, trades_source, stage,
-             kill_reason, noul, judge_score, judge_confidence, judge_verdict, regime
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             kill_reason, noul, judge_score, judge_confidence, judge_verdict, regime,
+             origin
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ts"], row["ts_sec"], row["tid"], row.get("chain"), row.get("ticker"),
             row.get("age_min"), row.get("price_usd"), row.get("liq_usd"), row.get("mcap_usd"),
@@ -388,7 +424,7 @@ def _insert_snapshot(db: sqlite3.Connection, row: dict) -> bool:
             row.get("x_kind"), row.get("source"), row.get("trades_source"),
             row.get("stage") or "", row.get("kill_reason"), row.get("noul"),
             row.get("judge_score"), row.get("judge_confidence"), row.get("judge_verdict"),
-            row.get("regime"),
+            row.get("regime"), row.get("origin") or "live",
         ),
     )
     return bool(cur.rowcount)
@@ -406,10 +442,12 @@ def _regime_now() -> str | None:
 
 
 def on_cycle(stats: dict | None = None, tokens=None, now: float | None = None,
-             source: str = "live") -> int:
+             source: str = "live", origin: str | None = None,
+             skip_labels: bool = False) -> int:
     """Write one snapshot per recorded token this cycle. Never raises; never blocks."""
     if not stats or "held" in stats:
         return 0
+    origin = _as_origin(origin or source, default="live")
     ts = current_time() if now is None else float(now)
     shortlist = {}
     for t in tokens or []:
@@ -439,16 +477,19 @@ def on_cycle(stats: dict | None = None, tokens=None, now: float | None = None,
             if key in seen:
                 continue
             seen.add(key)
-            if _insert_snapshot(db, _row_from_token(src, ts, stage=stage, regime=regime)):
+            if _insert_snapshot(db, _row_from_token(
+                src, ts, stage=stage, regime=regime, origin=origin,
+            )):
                 n += 1
         db.commit()
-        try:
-            tids = [tid for (_ts, tid, _st) in seen]
-            if tids:
-                compute_labels(tids=tids, now=ts)
-        except Exception as e:
-            log.warning("research labels: %s", safe_err(e))
-        if source != "backfill":
+        if not skip_labels:
+            try:
+                tids = [tid for (_ts, tid, _st) in seen]
+                if tids:
+                    compute_labels(tids=tids, now=ts)
+            except Exception as e:
+                log.warning("research labels: %s", safe_err(e))
+        if not str(origin).startswith("backfill"):
             try:
                 maybe_vacuum(now=ts)
             except Exception as e:
@@ -465,13 +506,14 @@ def _insert_mark(db: sqlite3.Connection, row: dict) -> bool:
     cur = db.execute(
         """INSERT OR REPLACE INTO fast_marks (
              ts, ts_sec, tid, chain, ticker, price_usd, liq_usd, fdv,
-             vol_5m, vol_1h, vol_h24, source
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             vol_5m, vol_1h, vol_h24, source, origin
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["ts"], row["ts_sec"], row["tid"], row.get("chain"), row.get("ticker"),
             row.get("price_usd"), row.get("liq_usd"), row.get("fdv"),
             row.get("vol_5m"), row.get("vol_1h"), row.get("vol_h24"),
             row.get("source") or "dex_batch",
+            row.get("origin") or "live",
         ),
     )
     return bool(cur.rowcount)
@@ -631,6 +673,7 @@ def tick_sampler(now: float | None = None) -> dict:
                 "vol_1h": mark.get("vol_1h"),
                 "vol_h24": mark.get("vol_h24"),
                 "source": "dex_batch",
+                "origin": "live",
             }):
                 n += 1
         db.commit()
@@ -705,17 +748,20 @@ def _price_series(tid: str) -> list[tuple[float, float | None, float | None]]:
                         (tid,),
                     ):
                         pts.append((float(r["ts"]), _num(r["price"]), None))
-                row = other.execute(
-                    "SELECT entry_ts, entry_price, peak, last_price, last_mark_ts, "
-                    "exit_ts, exit_price FROM young_trail WHERE tid = ?",
-                    (tid,),
-                ).fetchone()
-                if row:
-                    pts.append((float(row["entry_ts"]), _num(row["entry_price"]), None))
-                    if row["last_mark_ts"] is not None and row["last_price"] is not None:
-                        pts.append((float(row["last_mark_ts"]), _num(row["last_price"]), None))
-                    if row["exit_ts"] is not None and row["exit_price"] is not None:
-                        pts.append((float(row["exit_ts"]), _num(row["exit_price"]), None))
+                if other.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='young_trail'"
+                ).fetchone():
+                    row = other.execute(
+                        "SELECT entry_ts, entry_price, peak, last_price, last_mark_ts, "
+                        "exit_ts, exit_price FROM young_trail WHERE tid = ?",
+                        (tid,),
+                    ).fetchone()
+                    if row:
+                        pts.append((float(row["entry_ts"]), _num(row["entry_price"]), None))
+                        if row["last_mark_ts"] is not None and row["last_price"] is not None:
+                            pts.append((float(row["last_mark_ts"]), _num(row["last_price"]), None))
+                        if row["exit_ts"] is not None and row["exit_price"] is not None:
+                            pts.append((float(row["exit_ts"]), _num(row["exit_price"]), None))
             finally:
                 other.close()
     except Exception as e:
@@ -854,8 +900,8 @@ def compute_labels(tids: list[str] | None = None, now: float | None = None) -> i
                      tid, ticker, chain, first_seen_ts, first_free_ts,
                      minutes_from_first_sighting, entry_price, peak_x, peak_ts,
                      time_to_peak_min, ret_15m, ret_1h, ret_3h, ret_6h,
-                     rugged, rug_ts, time_to_rug_min, runner, updated_ts
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     rugged, rug_ts, time_to_rug_min, runner, updated_ts, origin
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     tid, ticker, chain, first_seen, first_free_ts,
                     (first_free_ts - first_seen) / 60.0,
@@ -867,6 +913,7 @@ def compute_labels(tids: list[str] | None = None, now: float | None = None) -> i
                     rug_ts,
                     ((rug_ts - first_free_ts) / 60.0) if rug_ts is not None else None,
                     runner, now,
+                    _label_origin(free or first),
                 ),
             )
             n += 1
@@ -874,6 +921,13 @@ def compute_labels(tids: list[str] | None = None, now: float | None = None) -> i
             log.warning("research label %s: %s", tid, safe_err(e))
     db.commit()
     return n
+
+
+def _label_origin(row) -> str:
+    try:
+        return _as_origin(row["origin"] if row is not None else None, default="live")
+    except Exception:
+        return "live"
 
 
 def _meta_get(key: str) -> str | None:
@@ -927,23 +981,67 @@ def _table_exists(db: sqlite3.Connection, name: str) -> bool:
     return bool(row)
 
 
-def backfill_from_cycle_history() -> int:
-    n = 0
+def _parse_ts(v) -> float | None:
+    if v is None or v == "" or v == "-":
+        return None
+    if isinstance(v, (int, float)):
+        n = float(v)
+        return n / 1000.0 if n > 1e12 else n
+    if isinstance(v, str):
+        try:
+            n = float(v)
+            return n / 1000.0 if n > 1e12 else n
+        except ValueError:
+            pass
+        s = v.strip()
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return datetime.fromisoformat(s).timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def _read_text_file(path: pathlib.Path) -> str:
+    name = path.name.lower()
+    if name.endswith(".gz"):
+        with gzip.open(path, "rt", errors="replace") as f:
+            return f.read()
+    if name.endswith(".bz2"):
+        with bz2.open(path, "rt", errors="replace") as f:
+            return f.read()
+    return path.read_text(errors="replace")
+
+
+def _snap(dst, token, ts, *, stage, origin, regime=None) -> bool:
+    return _insert_snapshot(
+        dst, _row_from_token(token, ts, stage=stage, regime=regime, origin=origin),
+    )
+
+
+def _mark(dst, **row) -> bool:
+    if row.get("ts") is None or not row.get("tid"):
+        return False
+    row.setdefault("ts_sec", int(row["ts"]))
+    return _insert_mark(dst, row)
+
+
+def backfill_from_cycle_history() -> dict:
+    counts = {"cycle_history": 0, "young_free_pass": 0, "shadow_kills": 0, "coinalyze": 0}
     try:
         import cycle_history
         src = _open_foreign(cycle_history.db_path())
         if src is None:
-            return 0
+            return counts
         dst = _connect()
         try:
             if _table_exists(src, "tokens"):
                 for r in src.execute("SELECT * FROM tokens"):
                     row = dict(r)
                     token = {
-                        "tid": row.get("tid"),
-                        "chain": row.get("chain"),
-                        "net": row.get("chain_id"),
-                        "ticker": row.get("ticker"),
+                        "tid": row.get("tid"), "chain": row.get("chain"),
+                        "net": row.get("chain_id"), "ticker": row.get("ticker"),
                         "age_minutes": row.get("age_minutes"),
                         "liquidity_usd": row.get("liquidity_usd"),
                         "mcap_usd": row.get("mcap_usd"),
@@ -951,16 +1049,16 @@ def backfill_from_cycle_history() -> int:
                         "top_10_percent": row.get("top_10_percent"),
                         "developer_holding_percentage": row.get("developer_holding_percentage"),
                         "holder_count": row.get("holder_count"),
-                        "reason": row.get("reason"),
-                        "soft_noul": row.get("noul"),
+                        "reason": row.get("reason"), "soft_noul": row.get("noul"),
                         "judge_score": row.get("judge_score"),
                         "judge_confidence": row.get("judge_confidence"),
                         "judge_verdict": row.get("judge_verdict"),
                         "stage": row.get("kind") or "",
                     }
                     ts = float(row["ts"]) if row.get("ts") is not None else current_time()
-                    if _insert_snapshot(dst, _row_from_token(token, ts, stage=token["stage"])):
-                        n += 1
+                    if _snap(dst, token, ts, stage=token["stage"],
+                             origin="backfill:cycle_history"):
+                        counts["cycle_history"] += 1
             if _table_exists(src, "young_free_pass"):
                 for r in src.execute("SELECT * FROM young_free_pass"):
                     row = dict(r)
@@ -970,12 +1068,11 @@ def backfill_from_cycle_history() -> int:
                         "age_minutes": row.get("age_minutes"),
                         "liquidity_usd": row.get("liquidity_usd"),
                         "mcap_usd": row.get("mcap_usd"),
-                        "reason": row.get("reason") or "pass",
-                        "stage": "trade",
+                        "reason": row.get("reason") or "pass", "stage": "trade",
                     }
                     ts = float(row["ts"]) if row.get("ts") is not None else current_time()
-                    if _insert_snapshot(dst, _row_from_token(token, ts, stage="trade")):
-                        n += 1
+                    if _snap(dst, token, ts, stage="trade", origin="backfill:young_free_pass"):
+                        counts["young_free_pass"] += 1
             if _table_exists(src, "shadow_kills"):
                 for r in src.execute("SELECT * FROM shadow_kills"):
                     row = dict(r)
@@ -993,39 +1090,295 @@ def backfill_from_cycle_history() -> int:
                         "regime": row.get("regime"),
                     }
                     ts = float(row["ts"]) if row.get("ts") is not None else current_time()
-                    if _insert_snapshot(dst, _row_from_token(token, ts, stage=token["stage"],
-                                                            regime=row.get("regime"))):
-                        n += 1
+                    if _snap(dst, token, ts, stage=token["stage"],
+                             origin="backfill:shadow_kills", regime=row.get("regime")):
+                        counts["shadow_kills"] += 1
+            dst.commit()
+            counts["coinalyze"] = _stamp_coinalyze(src, dst)
             dst.commit()
         finally:
             src.close()
     except Exception as e:
         log.warning("research backfill history: %s", safe_err(e))
+    return counts
+
+
+def _stamp_coinalyze(src: sqlite3.Connection, dst: sqlite3.Connection) -> int:
+    if not _table_exists(src, "market_regimes"):
+        return 0
+    n = 0
+    try:
+        for r in src.execute("SELECT ts, regime FROM market_regimes WHERE regime IS NOT NULL"):
+            cur = dst.execute(
+                """UPDATE token_snapshots SET regime = ?
+                   WHERE regime IS NULL AND ABS(ts - ?) < 900""",
+                (r["regime"], float(r["ts"])),
+            )
+            n += int(cur.rowcount or 0)
+    except Exception as e:
+        log.warning("research backfill coinalyze: %s", safe_err(e))
     return n
 
 
-def backfill_from_run_log(path=None) -> int:
+def discover_run_logs(outbox: pathlib.Path | None = None, extra=None) -> list[pathlib.Path]:
+    """run.log plus rotated siblings (run.log.1, .gz, dated names). Oldest first."""
+    root = pathlib.Path(outbox) if outbox else outbox_dir()
+    found: dict[str, pathlib.Path] = {}
+
+    def add(p: pathlib.Path):
+        if p.is_file():
+            found[str(p.resolve())] = p
+
+    if extra:
+        add(pathlib.Path(extra))
+    patterns = (
+        "run.log", "run.log.*", "run-*.log*", "run_*.log*",
+        "desk.log", "desk.log.*",
+        "logs/run.log", "logs/run.log.*",
+    )
+    for pat in patterns:
+        for p in root.glob(pat):
+            add(p)
+    return sorted(found.values(), key=lambda p: (p.stat().st_mtime if p.exists() else 0, p.name))
+
+
+def backfill_from_run_log(path=None) -> dict:
+    """Ingest every discovered run.log / rotated log. Returns {origin: n}."""
+    counts: dict[str, int] = {}
+    try:
+        import cycle_history
+        paths = discover_run_logs(extra=path)
+        seen_text = set()
+        for log_path in paths:
+            try:
+                text = _read_text_file(log_path)
+            except Exception as e:
+                log.warning("research read log %s: %s", log_path.name, safe_err(e))
+                continue
+            sig = (len(text), hash(text[:4096]))
+            if sig in seen_text:
+                continue
+            seen_text.add(sig)
+            origin = f"backfill:{log_path.name}"
+            n = 0
+            parsed, _meta = cycle_history.parse_run_log(text)
+            for item in parsed:
+                n += on_cycle(
+                    item.get("stats") or {}, now=item.get("ts"),
+                    origin=origin, skip_labels=True,
+                )
+            n += backfill_judge_from_text(text, origin=origin)
+            counts[origin] = counts.get(origin, 0) + n
+    except Exception as e:
+        log.warning("research backfill log: %s", safe_err(e))
+    return counts
+
+
+def backfill_judge_from_text(text: str, origin: str) -> int:
+    """Catch judge tid= lines even when a cycle: summary was missing."""
     n = 0
     try:
         import cycle_history
-        log_path = pathlib.Path(path) if path else outbox_dir() / "run.log"
-        if not log_path.exists():
-            return 0
-        parsed, _meta = cycle_history.parse_run_log(log_path.read_text(errors="replace"))
-        for item in parsed:
-            n += on_cycle(item.get("stats") or {}, now=item.get("ts"), source="backfill")
+        last_ts = None
+        dst = _connect()
+        for raw in text.splitlines():
+            ts = cycle_history.parse_log_ts(raw)
+            if ts is not None:
+                last_ts = ts
+            m = cycle_history.JUDGE_RE.search(raw)
+            if not m:
+                continue
+            when = last_ts if last_ts is not None else current_time()
+            tid = m.group(1)
+            verdict = m.group(3)
+            token = {
+                "tid": tid, "ticker": m.group(2),
+                "stage": "judge_error" if verdict == "error" else "judged",
+                "judge_verdict": verdict,
+                "judge_score": _num(m.group(4)),
+                "judge_confidence": _num(m.group(5)),
+                "net": None,
+            }
+            if _snap(dst, token, when, stage=token["stage"], origin=origin):
+                n += 1
+        dst.commit()
     except Exception as e:
-        log.warning("research backfill log: %s", safe_err(e))
+        log.warning("research backfill judge: %s", safe_err(e))
     return n
 
 
-def backfill_from_young_trail() -> int:
+def _iter_json_objs(path: pathlib.Path):
+    raw = _read_text_file(path).strip()
+    if not raw:
+        return
+    if path.suffix == ".jsonl" or path.name.endswith(".jsonl"):
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+        return
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict):
+                yield item
+    elif isinstance(obj, dict):
+        yield obj
+
+
+def _tokens_from_json_obj(obj: dict) -> tuple[float | None, list[dict]]:
+    ts = _parse_ts(obj.get("ts") or obj.get("updated_at") or obj.get("generated_at"))
+    tokens = obj.get("tokens")
+    if not isinstance(tokens, list):
+        stats = obj.get("stats") if isinstance(obj.get("stats"), dict) else {}
+        tokens = stats.get("tokens") if isinstance(stats.get("tokens"), list) else []
+        if ts is None:
+            ts = _parse_ts(stats.get("ts"))
+        cycle = obj.get("cycle") if isinstance(obj.get("cycle"), dict) else {}
+        if ts is None:
+            ts = _parse_ts(cycle.get("ts") or obj.get("updated_at"))
+    out = [t for t in (tokens or []) if isinstance(t, dict)]
+    pick = obj.get("pick") or obj.get("order")
+    if isinstance(pick, dict) and pick.get("token"):
+        tok = pick["token"]
+        if isinstance(tok, dict):
+            addr = tok.get("address") or tok.get("addr")
+            net = tok.get("network_id") if tok.get("network_id") is not None else tok.get("net")
+            tid = tok.get("tid") or (f"{addr}:{net}" if addr is not None and net is not None else None)
+            out.append({
+                **tok, "tid": tid, "stage": tok.get("stage") or "judged",
+                "price_usd": tok.get("price_usd") or tok.get("price"),
+            })
+    return ts, out
+
+
+def discover_cycle_json(outbox: pathlib.Path | None = None) -> list[pathlib.Path]:
+    root = pathlib.Path(outbox) if outbox else outbox_dir()
+    found: dict[str, pathlib.Path] = {}
+
+    def add(p: pathlib.Path):
+        if p.is_file() and p.suffix.lower() in (".json", ".jsonl"):
+            found[str(p.resolve())] = p
+
+    add(root / "state.json")
+    for pat in ("history/*.json", "history/**/*.json", "cycles/*.json",
+                "cycle*.json", "history*.json"):
+        for p in root.glob(pat):
+            add(p)
+    return sorted(found.values(), key=lambda p: p.name)
+
+
+def backfill_from_cycle_json() -> dict:
+    counts: dict[str, int] = {}
+    dst = _connect()
+    try:
+        for path in discover_cycle_json():
+            origin = f"backfill:{path.name}"
+            n = 0
+            try:
+                for obj in _iter_json_objs(path):
+                    ts, tokens = _tokens_from_json_obj(obj)
+                    when = ts if ts is not None else current_time()
+                    for t in tokens:
+                        tid = t.get("tid")
+                        if not tid:
+                            addr = t.get("addr") or t.get("address")
+                            net = t.get("net") if t.get("net") is not None else t.get("network_id")
+                            if addr is not None and net is not None:
+                                tid = f"{addr}:{net}"
+                                t = {**t, "tid": tid}
+                        if not tid:
+                            continue
+                        stage = t.get("stage") or "free"
+                        if _snap(dst, t, when, stage=stage, origin=origin):
+                            n += 1
+            except Exception as e:
+                log.warning("research backfill json %s: %s", path.name, safe_err(e))
+            if n:
+                counts[origin] = n
+        dst.commit()
+    except Exception as e:
+        log.warning("research backfill json: %s", safe_err(e))
+    return counts
+
+
+def backfill_from_shadow_jsonl() -> int:
     n = 0
+    dst = _connect()
+    try:
+        for name in ("shadow.jsonl", "shadow_ledger.jsonl"):
+            path = outbox_dir() / name
+            env = os.environ.get("SHADOW_LOG") if name == "shadow.jsonl" else None
+            if env:
+                path = pathlib.Path(env)
+            if not path.exists():
+                continue
+            origin = f"backfill:{path.name}"
+            for obj in _iter_json_objs(path):
+                try:
+                    ts = _parse_ts(obj.get("ts")) or current_time()
+                    if obj.get("order"):
+                        order = obj["order"]
+                        tok = (order or {}).get("token") or {}
+                        addr = tok.get("address") or tok.get("addr")
+                        net = tok.get("network_id") if tok.get("network_id") is not None else tok.get("net")
+                        tid = tok.get("tid") or (
+                            f"{addr}:{net}" if addr is not None and net is not None else None
+                        )
+                        token = {
+                            **tok, "tid": tid, "stage": "judged",
+                            "judge_confidence": order.get("confidence"),
+                            "price_usd": tok.get("price_usd") or tok.get("price"),
+                        }
+                        if _snap(dst, token, ts, stage="judged", origin=origin):
+                            n += 1
+                    action = obj.get("action")
+                    addr = obj.get("address")
+                    net = obj.get("network_id")
+                    tid = obj.get("tid") or (
+                        f"{addr}:{net}" if addr is not None and net is not None else None
+                    )
+                    if not tid:
+                        continue
+                    px = _num(obj.get("entry_price_usd") or obj.get("current_price_usd")
+                              or obj.get("exit_price_usd") or obj.get("last_price_usd"))
+                    token = {
+                        "tid": tid, "ticker": obj.get("ticker"), "chain": obj.get("chain"),
+                        "net": net, "price_usd": px,
+                        "stage": "judged" if action == "entry" else "trade",
+                    }
+                    if action in ("entry", None) and _snap(
+                        dst, token, ts, stage=token["stage"], origin=origin,
+                    ):
+                        n += 1
+                    if px and action in ("mark", "close", "entry"):
+                        _mark(dst, ts=ts, tid=tid, chain=obj.get("chain"),
+                              ticker=obj.get("ticker"), price_usd=px,
+                              source="shadow_ledger", origin=origin)
+                except Exception as e:
+                    log.warning("research shadow jsonl: %s", safe_err(e))
+        dst.commit()
+    except Exception as e:
+        log.warning("research backfill shadow jsonl: %s", safe_err(e))
+    return n
+
+
+def backfill_from_young_trail() -> dict:
+    counts = {"young_trail": 0, "young_trail_variants": 0}
     try:
         import young_trail
         src = _open_foreign(young_trail.db_path())
         if src is None:
-            return 0
+            return counts
         dst = _connect()
         try:
             if _table_exists(src, "young_trail"):
@@ -1037,64 +1390,286 @@ def backfill_from_young_trail() -> int:
                         "tid": tid, "ticker": row.get("ticker"), "chain": row.get("chain"),
                         "price_usd": row.get("entry_price"), "stage": "trade", "reason": "pass",
                     }
-                    if _insert_snapshot(dst, _row_from_token(token, ts, stage="trade")):
-                        n += 1
+                    if _snap(dst, token, ts, stage="trade", origin="backfill:young_trail"):
+                        counts["young_trail"] += 1
                     if row.get("last_mark_ts") is not None and row.get("last_price"):
-                        _insert_mark(dst, {
-                            "ts": float(row["last_mark_ts"]),
-                            "ts_sec": int(row["last_mark_ts"]),
-                            "tid": tid, "chain": row.get("chain"), "ticker": row.get("ticker"),
-                            "price_usd": _num(row["last_price"]),
-                            "liq_usd": None, "fdv": None, "vol_5m": None, "vol_1h": None,
-                            "vol_h24": None, "source": "young_trail",
-                        })
+                        _mark(dst, ts=float(row["last_mark_ts"]), tid=tid,
+                              chain=row.get("chain"), ticker=row.get("ticker"),
+                              price_usd=_num(row["last_price"]),
+                              source="young_trail", origin="backfill:young_trail")
+                    if row.get("exit_ts") is not None and row.get("exit_price"):
+                        _mark(dst, ts=float(row["exit_ts"]), tid=tid,
+                              chain=row.get("chain"), ticker=row.get("ticker"),
+                              price_usd=_num(row["exit_price"]),
+                              source="young_trail_exit", origin="backfill:young_trail")
             if _table_exists(src, "young_trail_marks"):
                 for r in src.execute("SELECT * FROM young_trail_marks"):
-                    _insert_mark(dst, {
-                        "ts": float(r["ts"]), "ts_sec": int(r["ts"]),
-                        "tid": r["tid"], "price_usd": _num(r["price"]),
-                        "liq_usd": None, "fdv": None, "vol_5m": None, "vol_1h": None,
-                        "vol_h24": None, "source": "young_trail_marks",
-                    })
+                    _mark(dst, ts=float(r["ts"]), tid=r["tid"],
+                          price_usd=_num(r["price"]),
+                          source="young_trail_marks", origin="backfill:young_trail")
+            if _table_exists(src, "young_trail_variants"):
+                for r in src.execute("SELECT * FROM young_trail_variants"):
+                    row = dict(r)
+                    tid = row.get("tid")
+                    if row.get("exit_ts") and row.get("exit_price"):
+                        _mark(dst, ts=float(row["exit_ts"]), tid=tid,
+                              price_usd=_num(row["exit_price"]),
+                              source=f"ytv:{row.get('variant')}",
+                              origin="backfill:young_trail_variants")
+                        counts["young_trail_variants"] += 1
+                    elif row.get("last_price"):
+                        counts["young_trail_variants"] += 1
+            if _table_exists(src, "young_trail_entry_stats"):
+                for r in src.execute("SELECT * FROM young_trail_entry_stats"):
+                    if r["peak_ts"] is not None and r["peak"] is not None:
+                        _mark(dst, ts=float(r["peak_ts"]), tid=r["tid"],
+                              price_usd=_num(r["peak"]),
+                              source="ytv_peak", origin="backfill:young_trail_variants")
             dst.commit()
         finally:
             src.close()
     except Exception as e:
         log.warning("research backfill young_trail: %s", safe_err(e))
+    return counts
+
+
+def backfill_from_outcomes() -> int:
+    n = 0
+    try:
+        import outcomes
+        src = _open_foreign(outcomes.db_path())
+        if src is None or not _table_exists(src, "outcomes"):
+            if src:
+                src.close()
+            return 0
+        dst = _connect()
+        try:
+            for r in src.execute("SELECT tid, entry_ts, candles_json, peak_x FROM outcomes"):
+                tid = r["tid"]
+                entry_ts = float(r["entry_ts"]) if r["entry_ts"] is not None else None
+                token = {"tid": tid, "stage": "trade", "reason": "pass"}
+                if entry_ts is not None and _snap(
+                    dst, token, entry_ts, stage="trade", origin="backfill:outcomes",
+                ):
+                    n += 1
+                raw = r["candles_json"]
+                if not raw:
+                    continue
+                try:
+                    candles = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    continue
+                if not isinstance(candles, list):
+                    continue
+                for c in candles:
+                    if not isinstance(c, dict):
+                        continue
+                    ts = _parse_ts(c.get("ts") or c.get("time"))
+                    px = _num(c.get("close") or c.get("high") or c.get("open"))
+                    if ts is None or not px:
+                        continue
+                    _mark(dst, ts=ts, tid=tid, price_usd=px,
+                          source="outcomes_candle", origin="backfill:outcomes")
+                    n += 1
+            dst.commit()
+        finally:
+            src.close()
+    except Exception as e:
+        log.warning("research backfill outcomes: %s", safe_err(e))
     return n
 
 
+def backfill_from_x_cache() -> int:
+    n = 0
+    try:
+        import x_lookup
+        src = _open_foreign(x_lookup.db_path())
+        if src is None or not _table_exists(src, "x_cache"):
+            if src:
+                src.close()
+            return 0
+        dst = _connect()
+        try:
+            for r in src.execute("SELECT handle, payload_json, ok, fetched_at FROM x_cache WHERE ok = 1"):
+                handle = (r["handle"] or "").lstrip("@").lower()
+                if not handle:
+                    continue
+                try:
+                    payload = json.loads(r["payload_json"]) if r["payload_json"] else {}
+                except Exception:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    continue
+                followers = _int(payload.get("followers"))
+                kind = payload.get("x_kind")
+                cur = dst.execute(
+                    """UPDATE token_snapshots
+                       SET x_followers = COALESCE(x_followers, ?),
+                           x_kind = COALESCE(x_kind, ?),
+                           x_handle = COALESCE(x_handle, ?)
+                       WHERE lower(x_handle) = ?""",
+                    (followers, kind, handle, handle),
+                )
+                n += int(cur.rowcount or 0)
+            dst.commit()
+        finally:
+            src.close()
+    except Exception as e:
+        log.warning("research backfill x_cache: %s", safe_err(e))
+    return n
+
+
+def queue_missing_prices(now: float | None = None) -> int:
+    """Enqueue outcomes jobs for tids with no post-sighting price. Off-peak fill."""
+    now = current_time() if now is None else float(now)
+    n = 0
+    try:
+        import outcomes
+        db = _connect()
+        rows = db.execute(
+            "SELECT tid, MIN(ts) AS first_ts FROM token_snapshots GROUP BY tid"
+        ).fetchall()
+        for r in rows:
+            tid, first = r["tid"], r["first_ts"]
+            if not tid or first is None:
+                continue
+            later = db.execute(
+                """SELECT 1 FROM token_snapshots
+                   WHERE tid = ? AND ts > ? AND price_usd IS NOT NULL AND price_usd > 0
+                   UNION ALL
+                   SELECT 1 FROM fast_marks
+                   WHERE tid = ? AND ts > ? AND price_usd IS NOT NULL AND price_usd > 0
+                   LIMIT 1""",
+                (tid, float(first), tid, float(first)),
+            ).fetchone()
+            if later:
+                continue
+            try:
+                if outcomes.enqueue_job(str(tid), float(first), now=now):
+                    n += 1
+            except Exception as e:
+                log.warning("research enqueue %s: %s", tid, safe_err(e))
+        log.info("research queued outcomes jobs=%d", n)
+    except Exception as e:
+        log.warning("research queue prices: %s", safe_err(e))
+    return n
+
+
+def coverage_report() -> dict:
+    """How far back data goes and row counts per origin."""
+    empty = {
+        "span": {"min_ts": None, "max_ts": None, "min_iso": None, "max_iso": None, "days": None},
+        "snapshots_by_origin": {},
+        "marks_by_origin": {},
+        "token_snapshots": 0, "fast_marks": 0, "token_labels": 0,
+    }
+    try:
+        db = _connect()
+        def n(table):
+            return int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        span = db.execute(
+            """SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM (
+                 SELECT ts FROM token_snapshots UNION ALL SELECT ts FROM fast_marks
+               )"""
+        ).fetchone()
+        min_ts = span["min_ts"] if span else None
+        max_ts = span["max_ts"] if span else None
+        days = None
+        if min_ts is not None and max_ts is not None:
+            days = max(0.0, (float(max_ts) - float(min_ts)) / 86400.0)
+        snaps = {r["origin"] or "live": r["n"] for r in db.execute(
+            "SELECT origin, COUNT(*) AS n FROM token_snapshots GROUP BY origin"
+        )}
+        marks = {r["origin"] or "live": r["n"] for r in db.execute(
+            "SELECT origin, COUNT(*) AS n FROM fast_marks GROUP BY origin"
+        )}
+        return {
+            "span": {
+                "min_ts": min_ts, "max_ts": max_ts,
+                "min_iso": _iso(float(min_ts)) if min_ts is not None else None,
+                "max_iso": _iso(float(max_ts)) if max_ts is not None else None,
+                "days": days,
+            },
+            "snapshots_by_origin": snaps,
+            "marks_by_origin": marks,
+            "token_snapshots": n("token_snapshots"),
+            "fast_marks": n("fast_marks"),
+            "token_labels": n("token_labels"),
+        }
+    except Exception as e:
+        log.warning("research coverage: %s", safe_err(e))
+        return empty
+
+
 def backfill(log_path=None) -> dict:
-    """Idempotent ingest from cycle_history, run.log, young_trail, outcomes."""
-    hist = backfill_from_cycle_history()
-    logn = backfill_from_run_log(log_path)
-    yt = backfill_from_young_trail()
+    """Ingest all available history as far back as it goes. Idempotent."""
+    per_source: dict[str, int] = {}
+
+    def add(bag):
+        if isinstance(bag, dict):
+            for k, v in bag.items():
+                if isinstance(v, int):
+                    key = k if str(k).startswith("backfill:") or k in (
+                        "cycle_history", "young_free_pass", "shadow_kills",
+                        "coinalyze", "young_trail", "young_trail_variants",
+                    ) else f"backfill:{k}"
+                    if k in ("cycle_history", "young_free_pass", "shadow_kills",
+                             "coinalyze", "young_trail", "young_trail_variants"):
+                        key = f"backfill:{k}"
+                    per_source[key] = per_source.get(key, 0) + int(v)
+        elif isinstance(bag, int):
+            return bag
+        return 0
+
+    add(backfill_from_cycle_history())
+    add(backfill_from_run_log(log_path))
+    add(backfill_from_cycle_json())
+    shadow_n = backfill_from_shadow_jsonl()
+    per_source["backfill:shadow_jsonl"] = per_source.get("backfill:shadow_jsonl", 0) + shadow_n
+    add(backfill_from_young_trail())
+    out_n = backfill_from_outcomes()
+    per_source["backfill:outcomes"] = per_source.get("backfill:outcomes", 0) + out_n
+    x_n = backfill_from_x_cache()
+    per_source["backfill:x_cache"] = per_source.get("backfill:x_cache", 0) + x_n
     try:
         labels = compute_labels()
     except Exception as e:
         log.warning("research backfill labels: %s", safe_err(e))
         labels = 0
-    counts = counts_now()
+    queued = 0
+    try:
+        queued = queue_missing_prices()
+    except Exception as e:
+        log.warning("research queue: %s", safe_err(e))
+    cov = coverage_report()
     result = {
-        "history_snapshots": hist,
-        "log_snapshots": logn,
-        "young_trail": yt,
+        "per_source": per_source,
+        "span": cov.get("span"),
+        "snapshots_by_origin": cov.get("snapshots_by_origin"),
+        "marks_by_origin": cov.get("marks_by_origin"),
+        "token_snapshots": cov.get("token_snapshots", 0),
+        "fast_marks": cov.get("fast_marks", 0),
+        "token_labels": labels if labels else cov.get("token_labels", 0),
+        "queued_outcomes": queued,
         "labels": labels,
-        **counts,
     }
-    log.info("research backfill %s", result)
+    log.info(
+        "research backfill span=%s..%s days=%s snapshots=%s marks=%s labels=%s queued=%s sources=%s",
+        (cov.get("span") or {}).get("min_iso"), (cov.get("span") or {}).get("max_iso"),
+        (cov.get("span") or {}).get("days"),
+        result["token_snapshots"], result["fast_marks"], result["token_labels"],
+        queued, per_source,
+    )
     return result
 
 
 def counts_now() -> dict:
     try:
-        db = _connect()
-        def n(table):
-            return int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        cov = coverage_report()
         return {
-            "token_snapshots": n("token_snapshots"),
-            "fast_marks": n("fast_marks"),
-            "token_labels": n("token_labels"),
+            "token_snapshots": cov.get("token_snapshots", 0),
+            "fast_marks": cov.get("fast_marks", 0),
+            "token_labels": cov.get("token_labels", 0),
         }
     except Exception as e:
         log.warning("research counts: %s", safe_err(e))
@@ -1263,7 +1838,7 @@ def main(argv=None) -> int:
     p_sql.add_argument("query")
     p_rep = sub.add_parser("report", help="Canned rugs|runners|features")
     p_rep.add_argument("kind", choices=("rugs", "runners", "features"))
-    p_bf = sub.add_parser("backfill", help="Ingest history / run.log / young_trail")
+    p_bf = sub.add_parser("backfill", help="Ingest all available history (logs, JSON, ledgers, outcomes)")
     p_bf.add_argument("log_path", nargs="?", default=None)
     sub.add_parser("labels", help="Recompute token_labels")
     sub.add_parser("vacuum", help="VACUUM (weekly is automatic)")

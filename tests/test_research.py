@@ -17,6 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("DESK_SECRET", "test-secret-for-research")
+os.environ.setdefault("JUDGE_MOCK", "1")
 os.environ.setdefault("DESK_OUTBOX", str(ROOT / "tests" / "_outbox"))
 os.environ["TZ"] = "UTC"
 if hasattr(time, "tzset"):
@@ -69,6 +70,15 @@ def test_wal_and_schema(rs):
     assert str(mode).lower() == "wal"
     names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"token_snapshots", "fast_marks", "token_labels"} <= names
+
+
+def test_live_snapshot_origin_is_live(rs):
+    t0 = ts(2026, 10, 13, 12)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "L:1399811149", "ticker": "LIVE", "stage": "soft", "price_usd": 1,
+    }]), now=t0)
+    row = rs.run_sql("SELECT origin FROM token_snapshots")[0]
+    assert row["origin"] == "live"
 
 
 def test_on_cycle_merges_shortlist_price_usd(rs):
@@ -274,6 +284,10 @@ def test_backfill_from_cycle_history_and_young_trail(rs, tmp_path, monkeypatch):
     tickers = {r["ticker"] for r in rs.run_sql("SELECT ticker FROM token_snapshots")}
     assert "WHL" in tickers
     assert result["token_labels"] >= 1
+    origins = {r["origin"] for r in rs.run_sql("SELECT origin FROM token_snapshots")}
+    assert any(o.startswith("backfill:") for o in origins)
+    assert "per_source" in result
+    assert result["span"]["min_ts"] is not None
     cycle_history.reset()
 
 
@@ -320,3 +334,134 @@ def test_no_keys_in_research_logs(rs, caplog, monkeypatch):
     blob = caplog.text
     assert "ts-should-never-appear" not in blob
     assert "desk-secret-should-never-appear" not in blob
+
+
+def test_backfill_rotated_logs_and_judge_lines(rs, tmp_path, monkeypatch):
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    log1 = tmp_path / "run.log.1"
+    log1.write_text(
+        "2026-10-01 08:00:00 desk INFO judge tid=Old:1399811149 ticker=OLD "
+        "verdict=yes score=0.72 confidence=0.61 reason=momentum mode=live\n"
+        "2026-10-01 08:00:01 desk INFO cycle: 3 seen, 0 benched, free {}, trade {}, "
+        "chain {}, soft {}, judged 1, requeued 0\n"
+    )
+    n = rs.backfill_from_run_log()
+    assert sum(n.values()) >= 1
+    rows = rs.run_sql("SELECT ticker, origin, judge_verdict, stage FROM token_snapshots")
+    assert any(r["ticker"] == "OLD" for r in rows)
+    assert any(str(r["origin"]).startswith("backfill:run.log") for r in rows)
+
+
+def test_backfill_shadow_ledger_and_state_json(rs, tmp_path, monkeypatch):
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    (tmp_path / "shadow_ledger.jsonl").write_text(json.dumps({
+        "action": "entry", "ts": "2026-10-10T12:00:00Z",
+        "ticker": "SHD", "address": "ShdAddr", "network_id": 1399811149,
+        "chain": "solana", "entry_price_usd": 0.02,
+    }) + "\n")
+    (tmp_path / "state.json").write_text(json.dumps({
+        "updated_at": "2026-10-11T12:00:00Z",
+        "tokens": [{
+            "tid": "St:1399811149", "ticker": "STAT", "stage": "chain",
+            "reason": "top_wallet", "age_minutes": 19, "liquidity_usd": 8000,
+        }],
+    }))
+    js = rs.backfill_from_cycle_json()
+    sh = rs.backfill_from_shadow_jsonl()
+    assert sh >= 1
+    assert sum(js.values()) >= 1
+    tickers = {r["ticker"] for r in rs.run_sql("SELECT ticker FROM token_snapshots")}
+    assert "SHD" in tickers
+    assert "STAT" in tickers
+
+
+def test_backfill_outcomes_candles_and_queue_missing(rs, tmp_path, monkeypatch):
+    import outcomes
+    t0 = ts(2026, 10, 1, 1)
+    candles = [{"ts": t0 + 300 * i, "close": 1.0 + i * 0.1} for i in range(4)]
+    db = outcomes._connect()
+    db.execute(
+        """INSERT INTO outcomes (tid, entry_ts, candles_json, complete, peak_x)
+           VALUES (?,?,?,?,?)""",
+        ("Cndl:1399811149", t0, json.dumps(candles), 1, 1.3),
+    )
+    db.commit()
+    n = rs.backfill_from_outcomes()
+    assert n >= 1
+    marks = rs.run_sql("SELECT origin, source FROM fast_marks")
+    assert any(r["origin"] == "backfill:outcomes" for r in marks)
+
+    t1 = ts(2026, 10, 12, 3)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "NeedPx:1399811149", "ticker": "NOPX", "stage": "chain",
+        "reason": "top_wallet", "age_minutes": 20,
+    }]), now=t1, origin="backfill:shadow_kills", skip_labels=True)
+    queued = []
+
+    def capture(tid, entry_ts, now=None):
+        queued.append((tid, entry_ts))
+        return True
+
+    monkeypatch.setattr(outcomes, "enqueue_job", capture)
+    nq = rs.queue_missing_prices(now=t1 + 3600)
+    assert nq >= 1
+    assert any(q[0] == "NeedPx:1399811149" for q in queued)
+
+
+def test_backfill_x_cache_and_coinalyze(rs, tmp_path, monkeypatch):
+    import x_lookup
+    import cycle_history
+    t0 = ts(2026, 10, 8, 9)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "Xtok:1399811149", "ticker": "XT", "stage": "soft",
+        "x_handle": "tokacct", "price_usd": 1, "age_minutes": 20,
+    }]), now=t0)
+    xdb = x_lookup._connect()
+    xdb.execute(
+        "INSERT OR REPLACE INTO x_cache (handle, payload_json, ok, fetched_at) VALUES (?,?,?,?)",
+        ("tokacct", json.dumps({"followers": 4242, "x_kind": "official"}), 1, t0),
+    )
+    xdb.commit()
+    n = rs.backfill_from_x_cache()
+    assert n >= 1
+    row = rs.run_sql("SELECT x_followers, x_kind FROM token_snapshots WHERE ticker='XT'")[0]
+    assert row["x_followers"] == 4242
+
+    monkeypatch.setenv("CYCLE_HISTORY_DB", str(tmp_path / "ch_reg.db"))
+    cycle_history.reset()
+    cid = cycle_history.on_cycle(_stats(tokens=[{
+        "tid": "Rg:1399811149", "ticker": "RG", "net": 1399811149,
+        "stage": "chain", "reason": "top_wallet", "age_minutes": 15,
+    }]), now=t0, source="backfill")
+    ch = cycle_history._connect()
+    ch.execute(
+        "INSERT INTO market_regimes (cycle_id, ts, ts_iso, regime, metrics_json, symbols_json) "
+        "VALUES (?,?,?,?,?,?)",
+        (cid or 1, t0, "2026-10-08T09:00:00Z", "risk_off", "{}", "{}"),
+    )
+    ch.commit()
+    rs.backfill_from_cycle_history()
+    # regime stamped onto matching snapshots
+    # the RG token is in cycle_history, ingested then stamped
+    regs = rs.run_sql("SELECT ticker, regime FROM token_snapshots WHERE ticker='RG'")
+    assert regs
+    assert regs[0]["regime"] == "risk_off"
+    cycle_history.reset()
+
+
+def test_coverage_report_span_and_per_source(rs):
+    t0 = ts(2026, 9, 1, 0)
+    t1 = ts(2026, 10, 13, 12)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "A:1399811149", "ticker": "A", "stage": "soft", "price_usd": 1,
+    }]), now=t0)
+    rs.on_cycle(_stats(tokens=[{
+        "tid": "B:1399811149", "ticker": "B", "stage": "chain", "price_usd": 2,
+    }]), now=t1, origin="backfill:run.log", skip_labels=True)
+    cov = rs.coverage_report()
+    assert cov["span"]["min_ts"] == pytest.approx(t0)
+    assert cov["span"]["max_ts"] == pytest.approx(t1)
+    assert cov["span"]["days"] == pytest.approx((t1 - t0) / 86400.0)
+    assert cov["snapshots_by_origin"]["live"] >= 1
+    assert cov["snapshots_by_origin"]["backfill:run.log"] >= 1
+    assert cov["token_snapshots"] >= 2
