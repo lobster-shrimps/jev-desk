@@ -148,6 +148,24 @@ def test_time_exit_6h(yt):
     assert row["pnl_usd"] == pytest.approx(5.0)
 
 
+def test_time_exit_no_price_uses_last_mark_not_peak(yt):
+    t = _tok()
+    yt.consider_entries([t], now=T0)
+    yt.mark_open({t["tid"]: 2.0}, now=T0 + 60)
+    # 1.5 is above trail (peak*0.7=1.4) so this stays open and becomes last_price.
+    stay = yt.mark_open({t["tid"]: 1.5}, now=T0 + 120)
+    assert stay["closed"] == 0
+    open_row = yt.open_rows()[0]
+    assert open_row["peak"] == pytest.approx(2.0)
+    assert open_row["last_price"] == pytest.approx(1.5)
+    yt.mark_open({}, now=T0 + 6 * 3600)
+    row = yt.closed_rows()[0]
+    assert row["exit_reason"] == "time"
+    assert row["exit_price"] == pytest.approx(1.5)
+    assert row["peak"] == pytest.approx(2.0)
+    assert row["pnl_usd"] == pytest.approx(yt.pnl_usd(1.5, 1.0))
+
+
 def test_sl_beats_time_on_same_tick(yt):
     t = _tok()
     yt.consider_entries([t], now=T0)
@@ -306,7 +324,34 @@ def test_decide_exit_helpers(yt):
     assert yt.decide_exit(1.0, 2.0, 1.4, T0, T0 + 10) == ("trail", 1.4)
     assert yt.decide_exit(1.0, 2.0, 1.41, T0, T0 + 10) is None
     assert yt.decide_exit(1.0, 1.1, 1.05, T0, T0 + 6 * 3600) == ("time", 1.05)
-    assert yt.decide_exit(1.0, 1.1, None, T0, T0 + 6 * 3600)[0] == "time"
+    assert yt.decide_exit(1.0, 2.0, None, T0, T0 + 6 * 3600, last_price=0.9) == ("time", 0.9)
+    assert yt.decide_exit(1.0, 2.0, None, T0, T0 + 6 * 3600) == ("time", 1.0)
+
+
+def test_dex_lookups_timeout_and_cycle_budget(yt):
+    assert yt.HTTP_TIMEOUT == 5
+    assert yt.DEX_CYCLE_BUDGET_SEC == 20.0
+    clock = {"t": T0}
+    yt.set_time_fn(lambda: clock["t"])
+    calls = []
+
+    class Resp:
+        status_code = 200
+        def json(self):
+            return [{"liquidity": {"usd": 1}, "priceUsd": "1.0"}]
+
+    def fake_get(url, timeout=None, headers=None):
+        assert timeout == 5
+        calls.append(url)
+        clock["t"] += 8.0
+        return Resp()
+
+    yt.set_get_fn(fake_get)
+    tids = [f"Tok{i}:1399811149" for i in range(6)]
+    out = yt.fetch_dex_prices(tids, cap=10)
+    # t=0, 8, 16 proceed; t=24 exceeds 20s budget so the rest skip.
+    assert len(calls) == 3
+    assert len(out) == 3
 
 
 def test_dex_priceusd_preferred_when_cycle_price_missing(yt):

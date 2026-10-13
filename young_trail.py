@@ -37,7 +37,8 @@ SL_PCT = -0.30
 TRAIL_PCT = 0.30
 WINDOW_SEC = 6 * 3600
 EXPERIMENT_SEC = 7 * 86400
-HTTP_TIMEOUT = 20
+HTTP_TIMEOUT = 5
+DEX_CYCLE_BUDGET_SEC = 20.0
 LOCK_TIMEOUT_SEC = 0.2
 DEX_CAP_DEFAULT = 20
 DEX_SPACING_SEC = 0.25
@@ -229,11 +230,13 @@ def pnl_usd(exit_price: float, entry_price: float, ticket: float = TICKET_USD) -
 
 
 def decide_exit(entry_price: float, peak: float, price: float | None,
-                entry_ts: float, now: float) -> tuple[str, float] | None:
+                entry_ts: float, now: float, last_price: float | None = None
+                ) -> tuple[str, float] | None:
     """Return (reason, exit_price) or None. Peak should include this tick.
 
     SL -30% from entry, trail 30% from peak (price <= peak * 0.7), time at 6h.
     Price stops beat the time stop in the same tick (stopsim order).
+    A 6h exit with no current price uses last marked price, never peak.
     """
     sl_price = float(entry_price) * (1.0 + SL_PCT)
     trail_price = float(peak) * (1.0 - TRAIL_PCT)
@@ -249,7 +252,11 @@ def decide_exit(entry_price: float, peak: float, price: float | None,
             return "time", px
         return None
     if now >= float(entry_ts) + WINDOW_SEC:
-        fallback = float(peak or entry_price)
+        try:
+            marked = float(last_price) if last_price is not None else 0.0
+        except (TypeError, ValueError):
+            marked = 0.0
+        fallback = marked if marked > 0 else float(entry_price)
         return "time", fallback
     return None
 
@@ -358,9 +365,12 @@ def _dex_cap() -> int:
         return DEX_CAP_DEFAULT
 
 
-def fetch_dex_prices(tids: list[str], *, cap: int | None = None) -> dict[str, float]:
+def fetch_dex_prices(tids: list[str], *, cap: int | None = None,
+                     budget_sec: float | None = None) -> dict[str, float]:
     out: dict[str, float] = {}
     limit = _dex_cap() if cap is None else max(0, int(cap))
+    budget = DEX_CYCLE_BUDGET_SEC if budget_sec is None else float(budget_sec)
+    started = current_time()
     seen = set()
     n = 0
     for tid in tids:
@@ -368,6 +378,9 @@ def fetch_dex_prices(tids: list[str], *, cap: int | None = None) -> dict[str, fl
             continue
         seen.add(tid)
         if n >= limit:
+            break
+        if current_time() - started >= budget:
+            log.info("young_trail dex cycle budget exceeded, skipping remaining")
             break
         n += 1
         px = fetch_dex_price(tid)
@@ -520,8 +533,16 @@ def mark_open(prices: dict[str, float] | None = None, now: float | None = None) 
             peak = float(pos["peak"] or pos["entry_price"])
             if px is not None and px > 0:
                 peak = max(peak, float(px))
+            last_px = pos.get("last_price")
+            try:
+                last_px = float(last_px) if last_px is not None else None
+            except (TypeError, ValueError):
+                last_px = None
+            if last_px is None or last_px <= 0:
+                last_px = float(pos["entry_price"])
             decision = decide_exit(
                 float(pos["entry_price"]), peak, px, float(pos["entry_ts"]), ts,
+                last_price=last_px,
             )
             if decision:
                 reason, exit_px = decision
