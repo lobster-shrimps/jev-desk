@@ -91,17 +91,30 @@ class Desk:
                  order["token"]["ticker"], order["token"]["chain"],
                  order["size_factor"], order.get("confidence"))
         
-        # Record hypothetical entry in shadow PnL ledger
-        if fomo_data:
-            shadow_ledger.entry(order, fomo_data)
+        # Record hypothetical entry in shadow PnL ledger (FOMO, then Dex; never skip Dex)
+        try:
+            return shadow_ledger.entry(order, fomo_data)
+        except Exception as e:
+            log.warning("shadow ledger entry: %s", safe_err(e))
+            return None
 
     def report(self, order, stats):
+        stats = stats or {}
         self.write_state(order, stats)
+        shadow_order = order or stats.get("shadow_order")
         if order:
             t = order["token"]
             line = (f"ORDER {order.get('order_id')} {t['ticker']} on {t['chain']} "
                     f"size x{order['size_factor']} conf {order.get('confidence')} "
                     f"model {order['model']}")
+        elif stats.get("shadow_recorded") and shadow_order:
+            t = shadow_order["token"]
+            line = (f"SHADOW {shadow_order.get('order_id')} {t['ticker']} on {t['chain']} "
+                    f"size x{shadow_order.get('size_factor')} conf {shadow_order.get('confidence')} "
+                    f"model {shadow_order.get('model')}")
+        elif stats.get("shadow_order"):
+            t = stats["shadow_order"].get("token") or {}
+            line = f"SHADOW pick lost: {t.get('ticker')} no price"
         elif "held" in stats:
             line = f"HOLDING {stats['held']} for {stats['minutes']} min, no scan"
         else:
@@ -148,6 +161,9 @@ class Desk:
         elif order:
             outcome = "SHADOW" if not os.environ.get("CONFIRM_LIVE") else "ORDER"
             error = None
+        elif stats.get("shadow_recorded") or stats.get("shadow_order"):
+            outcome = "SHADOW"
+            error = None if stats.get("shadow_recorded") else "SHADOW pick lost: no price"
         elif stats.get("error"):
             outcome = "ERROR"
             error = stats.get("error")
@@ -186,7 +202,7 @@ class Desk:
             "tokens": tokens,
             "held": [book.held()] if book.held() else [],
             "bench": book.bench_count(),
-            "pick": order
+            "pick": order or stats.get("shadow_order")
         }
         
         state_path.parent.mkdir(parents=True, exist_ok=True)

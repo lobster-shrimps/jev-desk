@@ -33,7 +33,7 @@ log = logging.getLogger("x_lookup")
 
 FX_PROFILE_URL = "https://api.fxtwitter.com/{handle}"
 FX_STATUSES_URL = "https://api.fxtwitter.com/2/profile/{handle}/statuses"
-TIMEOUT_SEC = 10
+TIMEOUT_SEC = 8.0
 POSITIVE_TTL_SEC = 30 * 60
 NEGATIVE_TTL_SEC = 10 * 60
 DEFAULT_LOOKUPS_PER_CYCLE = 15
@@ -457,6 +457,8 @@ def _fetch_account(handle: str) -> dict | None:
     profile_url = FX_PROFILE_URL.format(handle=quote(handle, safe=""))
     resp = None
     for attempt in range(1 + NOT_FOUND_RETRIES):
+        if _over_budget():
+            raise _BudgetExceeded()
         resp = _get_with_retry(profile_url)
         status = getattr(resp, "status_code", 0) or 0
         if status == 200:
@@ -523,16 +525,29 @@ def _over_budget() -> bool:
 
     The window opens on the first uncached HTTP lookup. Cache hits do not
     start it. budget<=0 skips every HTTP lookup (fail open).
+    Checked before every HTTP request so a slow fetch cannot overrun.
     """
     global _window_start
     budget = lookup_budget_sec()
+    if budget <= 0:
+        return True
     now = current_time()
     if _window_start is None:
-        if budget <= 0:
-            return True
-        _window_start = now
         return False
     return (now - _window_start) >= budget
+
+
+def _request_timeout() -> float:
+    """Per-request timeout (~8s), capped to remaining cycle budget. Starts the window."""
+    global _window_start
+    if _over_budget():
+        raise _BudgetExceeded()
+    if _window_start is None:
+        _window_start = current_time()
+    remain = lookup_budget_sec() - (current_time() - _window_start)
+    if remain <= 0:
+        raise _BudgetExceeded()
+    return min(float(TIMEOUT_SEC), max(0.1, remain))
 
 
 def _parse_statuses_payload(payload) -> list:
@@ -562,7 +577,12 @@ def _fetch_statuses(handle: str) -> list:
     last_status = None
     for attempt in range(1 + NOT_FOUND_RETRIES):
         try:
+            if _over_budget():
+                raise _BudgetExceeded()
             resp = _get_with_retry(url)
+        except _BudgetExceeded:
+            log.info("x statuses stop budget handle=%s", handle)
+            return []
         except Exception as e:
             log.warning("x statuses failed for @%s: %s", handle, safe_err(e))
             return []
@@ -613,12 +633,18 @@ def _shape_post(item) -> dict | None:
 
 
 def _get_with_retry(url: str):
-    """One attempt plus one retry on 5xx or timeout. Other errors raise immediately."""
+    """One attempt plus one retry on 5xx or timeout. Other errors raise immediately.
+
+    Elapsed wall-clock is checked before each GET. Timeout is min(8s, remaining budget).
+    """
     last_exc = None
     resp = None
     for attempt in range(2):
         try:
-            resp = requests.get(url, timeout=TIMEOUT_SEC)
+            timeout = _request_timeout()
+            resp = requests.get(url, timeout=timeout)
+        except _BudgetExceeded:
+            raise
         except (requests.Timeout, requests.ConnectTimeout, requests.ReadTimeout) as e:
             last_exc = e
             if attempt == 0:
