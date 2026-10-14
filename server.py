@@ -15,6 +15,7 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
   GET  /ops/backtest   latest weekly signal-backtest JSON
   GET  /ops/young_trail paper young-trail ledger (simulated, no live orders)
   GET  /ops/young_trail_variants paper exit-variant ranking (same marks)
+  GET  /ops/young_trail_fast paper 60s-mark ledger vs per-cycle young_trail
   GET  /ops/research/query?sql=  read-only SELECT on research.db (limit 500)
   GET  /ops/research/report?kind= rugs|runners|features
   GET  /api/state      outbox/state.json for ops panel
@@ -170,6 +171,35 @@ async def ops_young_trail():
                 "open_count": 0, "closed_count": 0, "win_rate": 0.0,
                 "realized_pnl_usd": 0.0, "winning_trades": 0, "losing_trades": 0,
             },
+        })
+
+
+@app.get("/ops/young_trail_fast")
+async def ops_young_trail_fast():
+    """Paper 60s-mark young_trail_fast vs per-cycle. Simulated; no live orders."""
+    try:
+        import young_trail_fast
+        return JSONResponse(young_trail_fast.ops_payload())
+    except Exception as e:
+        log.warning("ops young_trail_fast: %s", safe_err(e))
+        return JSONResponse({
+            "paper": True,
+            "simulated": True,
+            "live_orders": False,
+            "error": "young_trail_fast unavailable",
+            "summary": {
+                "baseline": {
+                    "open_count": 0, "closed_count": 0, "win_rate": 0.0,
+                    "realized_pnl_usd": 0.0,
+                },
+                "tp_50": {
+                    "open_count": 0, "closed_count": 0, "win_rate": 0.0,
+                    "realized_pnl_usd": 0.0,
+                },
+            },
+            "comparison": [],
+            "open_positions": [],
+            "closed_trades": [],
         })
 
 

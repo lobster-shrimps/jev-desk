@@ -760,7 +760,11 @@ def fetch_dex_batch(tids: list[str]) -> dict[str, dict]:
 
 
 def tick_sampler(now: float | None = None) -> dict:
-    """One 60s sample: up to 30 Dex batch marks. Never touches young_trail exits."""
+    """One 60s sample: up to 30 Dex batch marks. Never touches young_trail exits.
+
+    After logging marks, drives the paper young_trail_fast ledger on the same
+    prices (no extra Dex). Fail open.
+    """
     ts = current_time() if now is None else float(now)
     empty = {"n": 0, "marks": 0}
     try:
@@ -790,6 +794,16 @@ def tick_sampler(now: float | None = None) -> dict:
                     n += 1
             db.commit()
         log.info("research sampler n=%d marks=%d", len(tids), n)
+        try:
+            import young_trail_fast
+            px_map = {
+                tid: mark.get("price_usd")
+                for tid, mark in prices.items()
+                if isinstance(mark, dict) and mark.get("price_usd")
+            }
+            young_trail_fast.on_sampler_tick(px_map, ts)
+        except Exception as e:
+            log.warning("research young_trail_fast: %s", safe_err(e))
         try:
             maybe_compute_labels(tids=tids, now=ts)
         except Exception as e:

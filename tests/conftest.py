@@ -68,11 +68,16 @@ def isolate_young_trail(tmp_path, monkeypatch):
         raise AssertionError("young_trail tests must not use the network")
 
     young_trail.set_get_fn(_no_network)
+    import young_trail_fast
+    young_trail_fast.reset()
+    young_trail_fast.set_time_fn(None)
     yield
     young_trail.reset()
     young_trail.set_get_fn(None)
     young_trail.set_sleep_fn(None)
     young_trail.set_time_fn(None)
+    young_trail_fast.reset()
+    young_trail_fast.set_time_fn(None)
 
 
 @pytest.fixture(autouse=True)
