@@ -15,6 +15,7 @@ import os
 import pathlib
 import re
 import sqlite3
+import threading
 import time
 from typing import Callable, Iterable
 
@@ -62,8 +63,8 @@ NOTABLE_MIX_PP = 10.0
 NOTABLE_CHAIN_PP = 10.0
 
 _pending_soft: list[dict] = []
-_conn: sqlite3.Connection | None = None
-_conn_path: str | None = None
+_tls = threading.local()
+_schema_lock = threading.Lock()
 
 
 def outbox_dir() -> pathlib.Path:
@@ -81,17 +82,21 @@ def briefings_dir() -> pathlib.Path:
     return outbox_dir() / "briefings"
 
 
-def reset() -> None:
-    """Close the cached connection and drop in-memory soft-token buffer."""
-    global _conn, _conn_path
-    _pending_soft.clear()
-    if _conn is not None:
+def _close_local() -> None:
+    conn = getattr(_tls, "conn", None)
+    if conn is not None:
         try:
-            _conn.close()
+            conn.close()
         except Exception:
             pass
-    _conn = None
-    _conn_path = None
+    _tls.conn = None
+    _tls.path = None
+
+
+def reset() -> None:
+    """Close this thread's cached connection and drop in-memory soft-token buffer."""
+    _pending_soft.clear()
+    _close_local()
     try:
         import coinalyze
         coinalyze.reset(hooks=False)
@@ -100,21 +105,20 @@ def reset() -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    global _conn, _conn_path
+    """Per-thread connection. Default check_same_thread (this thread only)."""
     path = str(db_path())
-    if _conn is not None and _conn_path == path:
-        return _conn
-    if _conn is not None:
-        try:
-            _conn.close()
-        except Exception:
-            pass
+    conn = getattr(_tls, "conn", None)
+    if conn is not None and getattr(_tls, "path", None) == path:
+        return conn
+    _close_local()
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _conn = sqlite3.connect(path, check_same_thread=False)
-    _conn.row_factory = sqlite3.Row
-    _init_schema(_conn)
-    _conn_path = path
-    return _conn
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    with _schema_lock:
+        _init_schema(conn)
+    _tls.conn = conn
+    _tls.path = path
+    return conn
 
 
 def _init_schema(db: sqlite3.Connection) -> None:
