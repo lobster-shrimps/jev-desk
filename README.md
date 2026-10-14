@@ -24,6 +24,30 @@ price. And research.db is a local file that records every sighting and outcome s
 a rule can be backtested, meaning replayed against past data, before anyone treats
 it as real.
 
+```mermaid
+flowchart LR
+    F[fomo.family<br/>new launches] --> HF{Hard floors<br/>age · liquidity · volume<br/>market cap · wallet concentration}
+    HF -- most cut --> X[Dropped]
+    HF -- survivors --> J[AI judge<br/>score 0–1 + confidence]
+    J -- "score ≥ 0.6 and conf ≥ 0.55" --> P[Paper $50 pick]
+    J -- below --> N[No trade]
+    P --> E[Paper exits<br/>stop · trail · time]
+    F -. young tokens .-> Y[Young-token test<br/>exit variants]
+    Y --> FC[60s fast checks]
+    Y --> HW[Helius wallet watch<br/>rug signals]
+    E --> R[(research.db)]
+    Y --> R
+    FC --> R
+    HW --> R
+    R --> B[Backtests]
+```
+
+*How one cycle flows. Every step is paper only: no real orders are placed.*
+
+![Animated illustration of one JEV cycle](docs/img/jev-cycle.gif)
+
+*Illustration only, not real data: most launches are cut at the floors, a few are scored, one becomes a paper trade, and it exits when an early rug signal fires.*
+
 The hoped-for benefit is simple. Catch the few launches that run early, get out
 before the many that rug, and prove any rule on paper before risking real money.
 
@@ -32,6 +56,10 @@ is, on data it was not tuned against. Most young-token paper trades lose money (
 Helius sell signal is the most promising lead so far, but the sample is small.
 Live trading stays off until a rule shows realized profit on paper: gains after
 those pretend trades are closed.
+
+![Young-token paper test: 8 wins out of 118 closed trades](docs/img/young-trail-results.png)
+
+*Young-token paper test so far: 8 wins in 118 closed $50 paper trades.*
 
 The live picture is at `/ops` on 127.0.0.1:8080.
 
