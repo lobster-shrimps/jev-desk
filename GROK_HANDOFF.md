@@ -1,22 +1,19 @@
 # Grok Bot handoff
 
-Written 2026-09-29 against `main` at `1ee89a5`. Repo: https://github.com/lobster-shrimp/jev-desk (private).
-
-This document is the operating brief for whoever runs the desk from here. It covers what
-exists, what is proven, what is not, how to deploy it, and what to settle before any real
-money moves. `prompts/HANDOFF.txt` is a different file: it is the text pasted above each
-judging seat's prompt. This one is for the person or agent running the deployment.
+Updated 2026-10-14. Operating brief for whoever runs the desk. `prompts/HANDOFF.txt`
+is different: that text is pasted above each judging seat. This file is for the person
+or agent on the machine. Depth lives in `README.md`.
 
 ## 1. What this is
 
-A memecoin launch desk. Code fetches, Jev (a TypeSafe model) judges, code decides.
+A memecoin launch desk. Code fetches, Jev (TypeSafe) judges, code decides.
 
 ```
-0. UNIVERSE  GeckoTerminal new_pools, 3 chains          -> fresh launches
+0. UNIVERSE  GeckoTerminal new_pools                    -> fresh launches
 1. LIST      FOMO filterTokens, 20 per call             -> hundreds, one batch
 2. FREE CUT  age, liquidity, volume, mcap. No network   -> tens
 3. TRADE CUT DexScreener buys and sells, one per token  -> a handful
-4. DOSSIER   GeckoTerminal info + chain RPC + X         -> three per cycle
+4. DOSSIER   GeckoTerminal info + chain RPC + X         -> a few per cycle
 5. JUDGE     market + chain + social per token          -> scored shortlist
 6. PICK      one choice over the shortlist              -> one token, or none
 ```
@@ -24,196 +21,165 @@ A memecoin launch desk. Code fetches, Jev (a TypeSafe model) judges, code decide
 A finished order then goes SIZE -> FILLS -> RISK, with CHIEF logging. Every threshold is
 in `thresholds.py` and is the original guide author's, not tuned to you.
 
+Beside the funnel: paper `young_trail` (and variants / 60s fast / Helius rug signals),
+`research.db`, an outcomes drain, Coinalyze mood, and a redesigned `/ops` page. None of
+those change filter, pick, questions, collect, or live orders.
+
 ## 2. Status
 
-**Built and tested (16 tests, CI green on Python 3.10-3.14):**
-filter kill order, question wire shape, pick gating, book invariants, two faked cycles,
-collector helpers. Dependencies are pinned. Assertions were mutation-verified to fail when
-the code they cover breaks.
+The desk runs on the Mac under launchd. Default is shadow. Paper ledgers and research
+are live and queryable.
 
-**Not proven. Nothing in this repo has touched a live market.**
+**Current finding: a week of paper data shows no profitable entry rule yet.** Do not
+promote a threshold or entry cut from that week. Keep collecting; treat `thresholds.py`
+as a starting point, not an edge.
 
-- Every network path. `universe`, `shortlist`, `trade_counts` and `dossier` are faked in
-  tests. `fomo_api.py` (CDP, Privy token, refresh) has no coverage, and the FOMO
-  `filterTokens` response envelope is undocumented and unverified.
-- The real judge. `judge.py` and `server.py` never run under test, so `DESK_SECRET` auth
-  and the `/book/*` endpoints are unproven. `mock_judge.py` stands in everywhere.
-- The `social` question set. The test desk returns no X account, so that branch is never
-  entered.
-- Live mode. Every cycle test is shadow or held, so `book.take(order)` is never reached.
-- Base chain routing (net 8453 uses the `bsc` set on purpose; fixtures are Solana only).
-- `desk.py` and `run.py`'s flags.
-
-**Not deployed.** No judge is running, no tunnel exists, no `.env` has been created.
+`python -m pytest -q` is offline and keyless. CI covers 3.10–3.14. Live `book.take` and
+the FOMO fill path are still the unproven money path — `--live` needs `CONFIRM_LIVE=yes`
+after you have a rule that actually pays.
 
 ## 3. What runs where
 
-Two processes on one machine (yours), plus bots in xAI's cloud.
-
-| piece | where | what it does |
+| piece | where | label / how |
 |---|---|---|
-| judge (`server.py`) | your machine | Holds the only TypeSafe key. Serves `/judge` and `/book/*`. |
-| shift (`run.py`) | your machine | Runs the whole funnel in Python. Needs Chrome logged in to FOMO, or `FOMO_BEARER`. |
-| `desk.db` | your machine | The book. The judge process and the shift process **must point at the same file**. The path is `$DESK_DB`, default `desk.db` relative to the working directory, so start both from the repo root or set `DESK_DB` to one absolute path. Started from different directories, `/book/release` frees a book the shift never reads. |
-| SOCIAL, CHIEF, SIZE, FILLS, RISK bots | xAI cloud | Reach the judge only over the tunnel. They never see the repo or the TypeSafe key. |
+| ops / judge | this Mac | launchd `com.robbrown.jevdesk.ops` — `uvicorn server:app` |
+| shift | this Mac | launchd `com.robbrown.jevdesk.desk` — `run.py` every 15 min |
+| FomoDesk Chrome | this Mac | dedicated profile, CDP on 9222, `fomo.family` tab logged in |
+| `desk.db` + `outbox/` | this Mac | book, state, research, outcomes, paper ledgers. Same working directory (or absolute `DESK_DB` / `DESK_OUTBOX`) for both jobs |
+| SOCIAL, CHIEF, SIZE, FILLS, RISK | xAI cloud | reach `/judge` and `/book/*` over the tunnel. Never see the TypeSafe key |
 
-The shift does the scanning and judging itself. The bots are the read-X seat and the
-execution seats; they receive orders from the shift, they do not generate them.
-
-## 4. Deployment, in order
-
-**1. Judge.** On your machine, from the repo root:
+## 4. Launchd — status and restart
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export TYPESAFE_API_KEY="ts-..."                 # console.typesafe.ai -> Keys
-export DESK_SECRET="$(openssl rand -hex 24)"     # what the bots get. NOT the key.
-uvicorn server:app --host 127.0.0.1 --port 8080
+launchctl list | grep jevdesk
+launchctl kickstart -k "gui/$(id -u)/com.robbrown.jevdesk.desk"
+launchctl kickstart -k "gui/$(id -u)/com.robbrown.jevdesk.ops"
 ```
 
-Bind `127.0.0.1`, not the README's `0.0.0.0`. `cloudflared` connects locally, so nothing
-needs the LAN to reach the judge.
+Plists are on the operator machine (`~/Library/LaunchAgents/`), not in the repo.
+`/ops/summary` reads `launchctl list` only and never kickstarts.
 
-**2. Tunnel.** `cloudflared tunnel --url http://localhost:8080` prints a URL. Two values
-matter and they are not the same:
+## 5. FomoDesk Chrome token flow
 
-- `BASE` = `https://<tunnel>` (no path)
-- `JUDGE_URL` = `$BASE/judge`
+FOMO has no public API. A dedicated **FomoDesk** Chrome profile is started with
+`--remote-debugging-port=9222`. Stay logged into `fomo.family` in **that** window.
 
-A quick tunnel gets a **new URL every restart**, which silently breaks every bot skill
-that hard-coded the old one. Use a named tunnel for anything that stays up.
+Each cycle `Fomo.token()` reads the Privy bearer from the tab's `localStorage`
+(`privy:token` / `privy:access_token`) over `CDP_URL`. It dies about hourly; refresh is
+automatic. Never log the bearer.
 
-**3. Prove the key, then prove the link from a bot's terminal, not your laptop.** Use the
-two `curl` commands in README section 1. Stop if any of these is off: `answers.shape.choice`
-not one of the listed options, probabilities not summing to about 1, or `model` being an
-alias instead of a version string such as `jev-1.13.0`. Also `curl $BASE/health` should
-report `"mock": false`.
+`/ops` **Fix FOMO Login** (`POST /api/fomo_activate`) brings that tab forward or opens
+`fomo.family` in the CDP Chrome. Alternative: set `FOMO_BEARER` (still hourly).
 
-**4. Shift.** In a second terminal, same repo root so `desk.db` is shared:
+## 6. /ops
+
+Page: `GET /ops` (`ops.html`, no external URLs, no secrets). JSON:
+
+| endpoint | what |
+|---|---|
+| `GET /ops/summary` | 30s cache: launchd, health, judge-hi, outcomes, budget, Coinalyze, young_trail curve |
+| `GET /ops/briefing` | last-24h + 7-day trends |
+| `GET /ops/briefing?compact=1` | markdown + morning only |
+| `GET /ops/young_trail` | paper ledger |
+| `GET /ops/young_trail_variants` | exit-variant ranking |
+| `GET /ops/young_trail_fast` | 60s marks vs per-cycle |
+| `GET /ops/young_trail_helius` | Helius vs fast vs cycle |
+| `GET /ops/research/query?sql=` | read-only SELECT on `research.db` (limit 500) |
+| `GET /ops/research/report?kind=` | rugs / runners / features |
+| `GET /ops/backtest` | weekly signal-backtest JSON |
+
+## 7. Paper young_trail
+
+$50 ticket, first tid, free-pass and `age_minutes < 60`. Dex marks only. Ends
+2026-10-20 7:38 AM ET.
+
+- **Baseline:** −30% stop, 30% trail from peak, 6h.
+- **Variants (per-cycle marks):** `tp_50`, `tp_100`, `half_50_trail`, `trail_20`,
+  `trail_40`, `sl_20`, `time_1h` / `time_2h` / `time_3h`, `be_after_30`.
+- **Fast:** same entries, baseline + `tp_50` on the 60s Dex sampler.
+- **Helius (Solana):** FOMO creator + top 10 + pool at entry; budgeted RPC for a 20%+
+  dev sell, 30%+ top-3 sell, or 25%+ pool SOL drop. Paper exit; precision / recall /
+  lead time vs `token_labels` and outcomes.
+
+## 8. research.db and outcomes
+
+`outbox/research.db` (WAL): `token_snapshots`, `fast_marks`, `token_labels`,
+`research_meta`. Analysis only.
 
 ```bash
-export JUDGE_URL="$BASE/judge" DESK_SECRET="..." BANK_USD=1000
-# FOMO: Chrome with --remote-debugging-port=9222 and a fomo.family tab open,
-#       or set FOMO_BEARER (expires in about an hour)
-python run.py --once        # one shadow cycle; read the log and outbox/shadow.jsonl
-python run.py               # shadow, every 15 min
+python research.py sql "SELECT ..."
+python research.py report rugs|runners|features
+python research.py backfill
+python research.py labels
 ```
 
-Optional wiring: `SOCIAL_URL` (endpoint the SOCIAL bot serves), `SEATS_WEBHOOK_URL`
-(CHIEF's inbox; unset means orders are written to `outbox/orders/`),
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+Backfill reads cycle history, run logs, cycle JSON, shadow rows, young_trail, outcomes
+candles, X cache, Coinalyze. Missing prices queue into the outcomes drain.
 
-**5. Seats.** Paste `prompts/HANDOFF.txt` above SCAN, VET, SOCIAL and CHIEF, then each
-seat's own file. SIZE, FILLS and RISK get no judge call and no key. Record one judge call
-by hand in front of Grok Bot and save it as a skill; skills are shared across the desk.
+Outcomes (`outcomes.db`): 6h OHLCV. Bulk in `OUTCOMES_WINDOW` (default 01:00–06:00
+local); daytime trickle (`OUTCOMES_TRICKLE_SEC`, default 20s). CoinGecko Demo
+(`COINGECKO_API_KEY`, `COINGECKO_PLAN=demo`) is 9000 calls/month then free
+GeckoTerminal. Desk scan stays on free GT.
 
-## 5. What each seat may and may not do
+## 9. Coinalyze and X
 
-- **Judging seats** (SCAN, VET, SOCIAL, CHIEF): build a state, call the judge once, act on
-  the numbers. Never call `api.typesafe.ai`. Never ask for a question set that is not
-  theirs. Never retry a 422. A missing answer is missing, not neutral.
-- **SOCIAL**: one X account in, one X block out. Never summarise posts, never substitute a
-  similar handle. No handle means `{"x_account": null}`.
-- **SIZE**: arithmetic only. Multiply by `size_factor` **once**. The "dark cuts to 0.40,
-  missing X cuts to 0.60" line in `prompts/SIZE.txt` describes how `size_factor` was built.
-  `pick.py` has already applied both, so SIZE reapplying them double-cuts the ticket.
-- **FILLS**: fee floor check first, then one market order through FOMO, nowhere else.
-- **RISK**: polls every 5 minutes, closes on `volume.h6 / (volume.h24 / 4) < 0.20`, and
-  closes anyway if it cannot measure. After a filled close it must release the book (next
-  section).
-- **CHIEF**: works the order in sequence, logs the order id, model id and every answer,
-  sends one line to Telegram. No order is also an order: send the line with the reason.
+- **Coinalyze** (`COINALYZE_API_KEY`): log-only mood — `long_flush` / `risk_on` /
+  `risk_off` / `neutral`. Missing key skips. Never feeds filter or pick.
+- **X:** `SOCIAL_URL` if the bot can serve HTTP; else `x_lookup.py` (fxtwitter, no key),
+  capped by `X_LOOKUPS_PER_CYCLE` and `X_LOOKUP_BUDGET_SEC`. Failure is `NO_SOCIAL_CUT`.
 
-## 6. The order contract
+## 10. Env var names only
 
-The order the shift hands over has this shape. Two cases differ from `prompts/CHIEF.txt`:
+Never log or commit values, especially `SOLANA_RPC_URL`, `COINALYZE_API_KEY`,
+`COINGECKO_API_KEY`.
 
-```json
-{
-  "order_id": "2026-09-29T12:00:00Z",
-  "model": "jev-1.13.0",
-  "token": {"ticker": "...", "address": "...", "network_id": 1399811149, "chain": "solana"},
-  "size_factor": 0.6,
-  "confidence": 0.78,
-  "runner_up": [["T0", 0.131]],
-  "why": {"shape": {"type": "choice", "choice": "crowd", "probabilities": {}}, "...": "raw wire objects"}
-}
-```
+Also used by name: `TYPESAFE_API_KEY`, `DESK_SECRET`, `JUDGE_URL`, `FOMO_BEARER`,
+`CDP_URL`, `BANK_USD`, `DESK_DB`, `DESK_OUTBOX`, `SOCIAL_URL`, `SEATS_WEBHOOK_URL`,
+`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `CONFIRM_LIVE`, `JUDGE_MOCK`,
+`COINGECKO_PLAN`, `OUTCOMES_WINDOW`, `OUTCOMES_TRICKLE_SEC`, `X_LOOKUPS_PER_CYCLE`,
+`X_LOOKUP_BUDGET_SEC`.
 
-- **Single-survivor orders** have `"model": "single-survivor"` and `"confidence": null`.
-  Anything that formats or compares `confidence` must handle `null`.
-- **`why` holds raw judge answers** (`{"type": "noul", "noul": 0.14}`), not the flattened
-  `crowd_p` / `authority_risk` fields the CHIEF prompt example shows. Nobody reads `why` as
-  an input, so this only affects logging, but a parser written from the example will break.
+`.env` is gitignored. `.env.example` holds placeholders only.
 
-## 7. Book control
+## 11. Shadow first, then live
 
-The desk does not scan while a position is held. Only RISK frees it.
+`python run.py` (default) does everything except take the book. Would-be trades go to
+`outbox/shadow.jsonl`. The paper week so far has **not** produced a profitable entry
+rule — do not go live on that evidence.
+
+`JUDGE_MOCK=1` / `--mock-judge` are funnel tests, never for tuning.
+
+Live only with `CONFIRM_LIVE=yes python run.py --live`.
+
+## 12. Book control
 
 ```bash
-curl $BASE/book/held    -H "Authorization: Bearer $DESK_SECRET"     # {"held": {...} | null}
+curl $BASE/book/held    -H "Authorization: Bearer $DESK_SECRET"
 curl -X POST $BASE/book/release -H "Authorization: Bearer $DESK_SECRET"
 ```
 
-If a close happened and nothing reported it, the desk is stalled, not broken. Run the
-release by hand after confirming in FOMO that the position is actually closed.
+If a close happened and nothing reported it, the desk is stalled. Release by hand after
+confirming in FOMO that the position is actually closed.
 
-## 8. Shadow first, then live
-
-Shadow mode (`python run.py`, the default) does everything except take the book and hand
-the order over. It writes one row per would-be trade to `outbox/shadow.jsonl`. Fill in
-`your_call` by hand and read only the rows where you disagree; that is where your
-thresholds come from. Leave it a week.
-
-In shadow the seats receive nothing, so SIZE, FILLS and RISK are unexercised until live.
-Plan a separate dry run of that path at minimum size before trusting it.
-
-The shadow week only means something against the real judge. `JUDGE_MOCK=1` and
-`--mock-judge` return deterministic synthetic answers that carry no information about any
-token; they are for testing the funnel, never for tuning.
-
-Go live only with `CONFIRM_LIVE=yes python run.py --live`, after the week.
-
-## 9. Settle before live
-
-1. **Every bot holds `DESK_SECRET`, and it authorises `/book/release`.** "Only RISK
-   releases" is a convention, not an enforced rule. Any seat, or anything that leaks the
-   secret, can free the book mid-position. Consider a separate release secret.
-2. **Can a Grok Bot serve an HTTP endpoint?** `SOCIAL_URL` and `SEATS_WEBHOOK_URL` both
-   assume so. This was not checked. If they cannot, SOCIAL is permanently absent (every
-   ticket shrinks by `NO_SOCIAL_CUT`) and orders only reach the seats through
-   `outbox/orders/`.
-3. **Nothing exercises the FOMO order path.** FILLS sends real market orders and no test
-   or dry run has.
-4. **RISK's volume source is unspecified.** The prompt needs `volume.h24` and `volume.h6`
-   but does not say where they come from.
-5. **`order_id` is a per-second timestamp.** Two orders in the same second share an id.
-
-Resolved: `prompts/RISK.txt` used to tell RISK to call the Python function
-`book.release()`, which the cloud bots cannot reach. It now has RISK `POST` to
-`/book/release` with `DESK_SECRET`, release only when flat, retry on failure, and report
-the book as still held rather than claim it is free if the call never returns 200.
-
-## 10. If something breaks
+## 13. If something breaks
 
 | symptom | meaning |
 |---|---|
+| launchd PID missing on `/ops` | `launchctl kickstart` that label |
 | 401 from `/judge` | wrong `DESK_SECRET` |
-| 422 from `/judge` | malformed question. Never retry. The cycle stops (`JudgeDown`). |
-| 429 GeckoTerminal | back off a full minute; persisting, set `universe(pages=1)` |
-| 429 DexScreener | lower `DEX_BUDGET` in `main.py` |
-| FOMO 401/403 | bearer expired; refreshed from Chrome automatically |
-| every token "malformed row" | FOMO envelope differs; print one raw row and adjust `fomo_api._row` |
-| "HOLDING ... no scan" forever | a close was never released (section 7) |
-| bots suddenly get connection errors | tunnel restarted and the URL changed |
-| judge unreachable | the cycle stands down. No guessing. |
+| 422 from `/judge` | malformed question. Never retry (`JudgeDown`) |
+| 429 GeckoTerminal | back off; persist → `universe(pages=1)` or wait for trickle |
+| Demo month exhausted | outcomes on free GT until rollover |
+| FOMO 401/403 | bearer expired; refresh from FomoDesk Chrome, or **Fix FOMO Login** |
+| "HOLDING ... no scan" forever | close never released |
+| bots connection errors | tunnel URL changed |
+| judge unreachable | cycle stands down. No guessing |
 
 `python run.py --bench` prints what is benched and why.
 
-## 11. Secrets
+## 14. Secrets
 
-- `TYPESAFE_API_KEY` lives on the judge machine only. No bot gets it, ever.
-- `DESK_SECRET` is what bots get. Rotate it if it leaks: restart the judge and the shift
-  with a new value, then update every bot skill.
-- `.env` is gitignored; `.env.example` holds placeholders only.
+- `TYPESAFE_API_KEY` lives on the judge machine only. No bot gets it.
+- `DESK_SECRET` is what bots get. Rotate: restart ops + desk, update every bot skill.
+- `SOLANA_RPC_URL`, `COINALYZE_API_KEY`, `COINGECKO_API_KEY`, `FOMO_BEARER`: names in
+  docs and logs, never values. Route errors through `safe_err`.
