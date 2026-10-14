@@ -335,15 +335,21 @@ def test_dex_lookups_timeout_and_cycle_budget(yt):
     calls = []
 
     class Resp:
-        status_code = 200
+        def __init__(self, addr):
+            self.status_code = 200
+            self._addr = addr
         def json(self):
-            return [{"liquidity": {"usd": 1}, "priceUsd": "1.0"}]
+            return [{
+                "liquidity": {"usd": 50_000},
+                "priceUsd": "1.0",
+                "baseToken": {"address": self._addr},
+            }]
 
     def fake_get(url, timeout=None, headers=None):
         assert timeout == 5
         calls.append(url)
         clock["t"] += 8.0
-        return Resp()
+        return Resp(url.rsplit("/", 1)[-1])
 
     yt.set_get_fn(fake_get)
     tids = [f"Tok{i}:1399811149" for i in range(6)]
@@ -354,6 +360,9 @@ def test_dex_lookups_timeout_and_cycle_budget(yt):
 
 
 def test_dex_priceusd_preferred_when_cycle_price_missing(yt):
+    t = _tok(price=None)
+    t.pop("price_usd")
+    mint = t["tid"].split(":")[0]
     class Resp:
         status_code = 200
         def json(self):
@@ -361,10 +370,9 @@ def test_dex_priceusd_preferred_when_cycle_price_missing(yt):
                 "pairAddress": "pool1",
                 "liquidity": {"usd": 90_000},
                 "priceUsd": "0.0042",
+                "baseToken": {"address": mint},
             }]
     yt.set_get_fn(lambda *a, **k: Resp())
-    t = _tok(price=None)
-    t.pop("price_usd")
     out = yt.on_cycle(stats={"young_free": [t]}, tokens=[t], now=T0)
     assert out["entries"] == 1
     assert yt.open_rows()[0]["entry_price"] == pytest.approx(0.0042)

@@ -60,6 +60,8 @@ SAMPLE_SEC = 60.0
 YOUNG_AGE_MAX_MIN = 120.0
 SEEN_WINDOW_SEC = 3 * 3600
 LOCK_TIMEOUT_SEC = 0.2
+OPS_BUSY_TIMEOUT_SEC = 0.05
+REPORT_CACHE_TTL_SEC = 300.0
 VACUUM_INTERVAL_SEC = 7 * 86400
 SQL_ROW_LIMIT = 500
 LABELS_INTERVAL_SEC = 600.0
@@ -91,6 +93,7 @@ _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
 _db_lock = threading.RLock()
 _last_labels_at = 0.0
+_report_cache: dict[str, tuple[float, dict]] = {}
 
 
 def set_get_fn(fn):
@@ -137,9 +140,10 @@ def _close_local() -> None:
 
 def reset() -> None:
     """Close this thread's cached connection. Tests call this between cases."""
-    global _worker_thread, _last_labels_at
+    global _worker_thread, _last_labels_at, _report_cache
     _close_local()
     _last_labels_at = 0.0
+    _report_cache = {}
     with _worker_lock:
         _worker_thread = None
 
@@ -720,8 +724,50 @@ def _best_pair_by_addr(pairs: list) -> dict[str, dict]:
     return best
 
 
-def fetch_dex_batch(tids: list[str]) -> dict[str, dict]:
-    """DexScreener /latest/dex/tokens/<comma list up to 30>. 5s timeout. No GT."""
+def _mark_context(tids: list[str]) -> tuple[dict[str, float], dict[str, float]]:
+    """Entry and previous-mark prices for spike checks. Fail open."""
+    entries: dict[str, float] = {}
+    prevs: dict[str, float] = {}
+    try:
+        import young_trail
+        for r in young_trail.open_rows():
+            tid = r.get("tid")
+            if not tid:
+                continue
+            ep = _num(r.get("entry_price"))
+            if ep is not None and ep > 0:
+                entries[tid] = ep
+            lp = _num(r.get("last_price"))
+            if lp is not None and lp > 0:
+                prevs[tid] = lp
+    except Exception as e:
+        log.warning("research mark context young_trail: %s", safe_err(e))
+    try:
+        db = _connect()
+        for tid in tids:
+            if tid in prevs:
+                continue
+            row = db.execute(
+                "SELECT price_usd FROM fast_marks WHERE tid = ? ORDER BY ts DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            if row is None:
+                continue
+            px = _num(row["price_usd"])
+            if px is not None and px > 0:
+                prevs[tid] = px
+    except Exception as e:
+        log.warning("research mark context fast_marks: %s", safe_err(e))
+    return entries, prevs
+
+
+def fetch_dex_batch(tids: list[str], entries: dict | None = None,
+                    prevs: dict | None = None) -> dict[str, dict]:
+    """DexScreener /latest/dex/tokens/<comma list up to 30>. 5s timeout. No GT.
+
+    Marks pass price_guard (mint match, liq >= $1,000, unconfirmed spikes skipped).
+    """
+    import price_guard
     addrs = []
     tid_by_addr: dict[str, list[str]] = {}
     for tid in tids[:BATCH_CAP]:
@@ -746,25 +792,21 @@ def fetch_dex_batch(tids: list[str]) -> dict[str, dict]:
     except Exception as e:
         log.warning("research dex batch: %s", safe_err(e))
         return {}
-    best = _best_pair_by_addr(_pairs_from_payload(payload))
+    pairs = _pairs_from_payload(payload)
     out = {}
-    for addr, tid_list in tid_by_addr.items():
-        pair = best.get(addr)
-        if not pair:
-            continue
-        px = _num(pair.get("priceUsd") or pair.get("price_usd") or pair.get("price"))
-        mark = {
-            "price_usd": px,
-            "liq_usd": _num((pair.get("liquidity") or {}).get("usd")) if isinstance(pair.get("liquidity"), dict) else None,
-            "fdv": _num(pair.get("fdv") or pair.get("marketCap")),
-            "vol_5m": _pair_vol(pair, "m5"),
-            "vol_1h": _pair_vol(pair, "h1"),
-            "vol_h24": _pair_vol(pair, "h24"),
-            "chain": pair.get("chainId"),
-            "ticker": ((pair.get("baseToken") or {}) if isinstance(pair.get("baseToken"), dict) else {}).get("symbol"),
-        }
+    entries = entries or {}
+    prevs = prevs or {}
+    for _addr, tid_list in tid_by_addr.items():
         for tid in tid_list:
-            out[tid] = mark
+            mint, _net = parse_tid(tid)
+            mark = price_guard.mark_from_pairs(
+                pairs, mint,
+                entry=entries.get(tid),
+                prev=prevs.get(tid),
+                tid=tid,
+            )
+            if mark and mark.get("price_usd"):
+                out[tid] = mark
     return out
 
 
@@ -781,7 +823,8 @@ def tick_sampler(now: float | None = None) -> dict:
         tids = sampler_candidates(now=ts)
         if not tids:
             return empty
-        prices = fetch_dex_batch(tids)
+        entries, prevs = _mark_context(tids)
+        prices = fetch_dex_batch(tids, entries=entries, prevs=prevs)
         n = 0
         with _locked() as db:
             for tid in tids:
@@ -928,9 +971,9 @@ def _price_at_or_before(series, horizon_ts: float, after_ts: float | None = None
     return last
 
 
-def _first_free(tid: str) -> sqlite3.Row | None:
-    db = _connect()
-    row = db.execute(
+def _first_free(tid: str, db: sqlite3.Connection | None = None) -> sqlite3.Row | None:
+    conn = db if db is not None else _connect()
+    row = conn.execute(
         """SELECT * FROM token_snapshots
            WHERE tid = ? AND stage IN ('trade','chain','soft','judged','judge','judge_error')
            ORDER BY ts ASC LIMIT 1""",
@@ -938,7 +981,7 @@ def _first_free(tid: str) -> sqlite3.Row | None:
     ).fetchone()
     if row:
         return row
-    return db.execute(
+    return conn.execute(
         "SELECT * FROM token_snapshots WHERE tid = ? ORDER BY ts ASC LIMIT 1",
         (tid,),
     ).fetchone()
@@ -1987,12 +2030,13 @@ def _assert_select(sql: str) -> str:
     return s
 
 
-def readonly_connect() -> sqlite3.Connection:
+def readonly_connect(timeout: float | None = None) -> sqlite3.Connection:
     path = db_path()
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     _connect()  # ensure schema exists
     uri = f"file:{path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=LOCK_TIMEOUT_SEC)
+    busy = OPS_BUSY_TIMEOUT_SEC if timeout is None else float(timeout)
+    conn = sqlite3.connect(uri, uri=True, timeout=busy)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn
@@ -2021,8 +2065,8 @@ def _median(vals: list[float]) -> float | None:
     return (xs[mid - 1] + xs[mid]) / 2.0
 
 
-def _first_free_features(tid: str) -> dict | None:
-    row = _first_free(tid)
+def _first_free_features(tid: str, db: sqlite3.Connection | None = None) -> dict | None:
+    row = _first_free(tid, db=db)
     return dict(row) if row is not None else None
 
 
@@ -2032,43 +2076,88 @@ FEATURE_KEYS = (
 )
 
 
-def report(kind: str) -> dict:
-    """Canned rugs | runners | features. Features compared at first free-pass."""
-    kind = (kind or "").strip().lower()
-    compute_labels()
-    db = _connect()
-    if kind == "rugs":
-        rows = [dict(r) for r in db.execute(
-            "SELECT * FROM token_labels WHERE rugged = 1 ORDER BY time_to_rug_min ASC"
-        )]
-        return {"kind": "rugs", "n": len(rows), "rows": rows[:200]}
-    if kind == "runners":
-        rows = [dict(r) for r in db.execute(
-            "SELECT * FROM token_labels WHERE runner = 1 ORDER BY peak_x DESC"
-        )]
-        return {"kind": "runners", "n": len(rows), "rows": rows[:200]}
+def _empty_report(kind: str, error: str | None = None) -> dict:
     if kind == "features":
+        payload = {
+            "kind": "features",
+            "note": "Median features at first free-pass. Runners = peak>=2x before rug.",
+            "runners": {"n": 0},
+            "rugs": {"n": 0},
+        }
+    else:
+        payload = {"kind": kind, "n": 0, "rows": []}
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _report_uncached(kind: str) -> dict:
+    """Read stored token_labels only. Does not call compute_labels()."""
+    db = readonly_connect()
+    try:
+        if kind == "rugs":
+            rows = [dict(r) for r in db.execute(
+                "SELECT * FROM token_labels WHERE rugged = 1 ORDER BY time_to_rug_min ASC"
+            )]
+            return {"kind": "rugs", "n": len(rows), "rows": rows[:200]}
+        if kind == "runners":
+            rows = [dict(r) for r in db.execute(
+                "SELECT * FROM token_labels WHERE runner = 1 ORDER BY peak_x DESC"
+            )]
+            return {"kind": "runners", "n": len(rows), "rows": rows[:200]}
         runners, rugs = [], []
         for r in db.execute("SELECT tid, runner, rugged FROM token_labels"):
-            feat = _first_free_features(r["tid"])
+            feat = _first_free_features(r["tid"], db=db)
             if not feat:
                 continue
             if r["runner"]:
                 runners.append(feat)
             if r["rugged"]:
                 rugs.append(feat)
+
         def agg(group):
             out = {"n": len(group)}
             for k in FEATURE_KEYS:
                 out[k] = _median([_num(g.get(k)) for g in group])
             return out
+
         return {
             "kind": "features",
             "note": "Median features at first free-pass. Runners = peak>=2x before rug.",
             "runners": agg(runners),
             "rugs": agg(rugs),
         }
-    raise ValueError("report kind must be rugs, runners, or features")
+    finally:
+        db.close()
+
+
+def report(kind: str) -> dict:
+    """Canned rugs | runners | features from stored labels. Cached 5 minutes.
+
+    Never calls compute_labels(). Ops readers are mode=ro with a short busy
+    timeout; a lock or error falls back to the cached payload (or empty JSON).
+    """
+    kind = (kind or "").strip().lower()
+    if kind not in ("rugs", "runners", "features"):
+        raise ValueError("report kind must be rugs, runners, or features")
+    now = current_time()
+    hit = _report_cache.get(kind)
+    if hit is not None and now - hit[0] < REPORT_CACHE_TTL_SEC:
+        return hit[1]
+    try:
+        payload = _report_uncached(kind)
+        _report_cache[kind] = (now, payload)
+        return payload
+    except Exception as e:
+        log.warning("research report: %s", safe_err(e))
+        if hit is not None:
+            stale = dict(hit[1])
+            stale["stale"] = True
+            stale["error"] = "report unavailable"
+            return stale
+        empty = _empty_report(kind, error="report unavailable")
+        empty["stale"] = True
+        return empty
 
 
 def early_signals() -> dict:

@@ -105,7 +105,8 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
   <div class="scroll"><table id="var-t"><thead><tr><th>#</th><th>Variant</th><th class="n">Closed</th><th class="n">Open</th><th class="n">Win rate</th><th class="n">Realized</th><th style="width:28%">vs baseline</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="research" class="s6" aria-labelledby="res-h">
-  <h2 id="res-h">Rugs vs runners <small>median at first free-pass</small></h2>
+  <h2 id="res-h">Rugs vs runners <small>median at first free-pass · once, not every 60s</small>
+    <button id="feat-reload" type="button">Load report</button></h2>
   <div class="scroll"><table id="feat-t"><thead><tr><th>Feature</th><th class="n">Runners</th><th class="n">Rugs</th><th class="n">Ratio</th></tr></thead><tbody></tbody></table></div>
   <div class="note">Runners = peak ≥ 2× before rug. Small n: read as hints, not thresholds.</div>
 </section>
@@ -180,8 +181,12 @@ function curve(points){
   $('yt-curve-note').textContent=`Cumulative realized P&L over ${points.length} closes · $50 paper ticket`;
 }
 
+let loadInflight=false;
 async function load(){
-  const [S,YT,V,F,SL,B,YF,YH]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/ops/research/report?kind=features'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius')]);
+  if(loadInflight)return;
+  loadInflight=true;
+  try{
+  const [S,YT,V,SL,B,YF,YH]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius')]);
   const now=Date.now()/1000;
   if(S){const h=S.health||{};
     $('h-mode').textContent=(h.mode||'shadow')+' · judge '+(h.judge_mode||'?');
@@ -232,10 +237,21 @@ async function load(){
     const span=Math.max(1,...rk.map(r=>Math.abs(r.realized_pnl_usd-base)));
     $('var-cav').textContent=V.caveat||'';
     rows('var-t',rk.map((r,i)=>{const d=r.realized_pnl_usd-base;const w=50*Math.abs(d)/span;return `<tr><td class="n">${i+1}</td><td>${esc(r.label)}</td><td class="n">${r.n}</td><td class="n">${r.open}</td><td class="n">${pct(r.win_rate)}</td><td class="n ${cls(r.realized_pnl_usd)}">${fmtUsd(r.realized_pnl_usd)}</td><td><div style="position:relative;height:10px"><span style="position:absolute;left:50%;top:0;bottom:0;border-left:1px solid var(--line)"></span><i style="position:absolute;top:2px;height:6px;${d>=0?'left:50%':'right:50%'};width:${w}%;background:${d>=0?'var(--pos)':'var(--neg)'}"></i></div><span class="stat">${r.variant==='baseline'?'baseline':(d>=0?'+':'−')+fmtUsd(Math.abs(d)).slice(d<0?1:0)}</span></td></tr>`}).join(''));}
-  if(F&&F.runners){const keys=[['x_followers','X followers'],['mcap_usd','Market cap $'],['holders','Holders'],['top_wallet_pct','Top wallet %'],['dev_pct','Dev holding %'],['liq_usd','Liquidity $'],['top10_pct','Top 10 %'],['age_min','Age min'],['buys_1h','Buys 1h'],['noul','Judge score']];
-    const f=v=>v==null?'—':Math.abs(v)>=1000?Math.round(v).toLocaleString():(+v).toPrecision(3);
-    rows('feat-t',`<tr><td class="stat">n</td><td class="n">${F.runners.n}</td><td class="n">${F.rugs.n}</td><td></td></tr>`+keys.map(([k,l])=>{const a=F.runners[k],b=F.rugs[k];const r=(a&&b)?b/a:null;return `<tr><td>${l}</td><td class="n">${f(a)}</td><td class="n">${f(b)}</td><td class="n ${r&&(r>1.5||r<0.67)?'warn':''}">${r?r.toFixed(2)+'×':'—'}</td></tr>`}).join(''));}
   if(B){$('br-date').textContent=B.date_local||'';$('br-md').innerHTML=md((B.morning&&B.morning.markdown)||B.markdown||'');}
+  }finally{loadInflight=false;}
+}
+function paintFeat(F){
+  if(!F||!F.runners)return;
+  const keys=[['x_followers','X followers'],['mcap_usd','Market cap $'],['holders','Holders'],['top_wallet_pct','Top wallet %'],['dev_pct','Dev holding %'],['liq_usd','Liquidity $'],['top10_pct','Top 10 %'],['age_min','Age min'],['buys_1h','Buys 1h'],['noul','Judge score']];
+  const f=v=>v==null?'—':Math.abs(v)>=1000?Math.round(v).toLocaleString():(+v).toPrecision(3);
+  rows('feat-t',`<tr><td class="stat">n</td><td class="n">${F.runners.n}</td><td class="n">${F.rugs.n}</td><td></td></tr>`+keys.map(([k,l])=>{const a=F.runners[k],b=F.rugs[k];const r=(a&&b)?b/a:null;return `<tr><td>${l}</td><td class="n">${f(a)}</td><td class="n">${f(b)}</td><td class="n ${r&&(r>1.5||r<0.67)?'warn':''}">${r?r.toFixed(2)+'×':'—'}</td></tr>`}).join(''));
+}
+let featInflight=false;
+async function loadResearch(){
+  if(featInflight)return;
+  featInflight=true;
+  try{paintFeat(await J('/ops/research/report?kind=features'))}
+  finally{featInflight=false;}
 }
 function md(t){return t.split('\n').filter(l=>!/^\|\s*-/.test(l)).slice(0,120).map(l=>/^#{1,3} /.test(l)?`<h3>${esc(l.replace(/^#+ /,''))}</h3>`:/^- /.test(l)?`<li>${esc(l.slice(2))}</li>`:/^\|/.test(l)?`<p class="mono">${esc(l)}</p>`:l.trim()?`<p>${esc(l)}</p>`:'').join('')}
 async function runQ(){const sql=$('q-sql').value;$('q-err').textContent='';const r=await fetch('/ops/research/query?sql='+encodeURIComponent(sql)).then(r=>r.json()).catch(()=>({error:'request failed'}));
@@ -259,6 +275,7 @@ $('fomo-fix-button').addEventListener('click', async function(){
   }
   setTimeout(()=>{button.disabled=false;button.textContent='Fix FOMO Login';},3000);
 });
-load();runQ();setInterval(load,60000);
+$('feat-reload').onclick=loadResearch;
+load();loadResearch();runQ();setInterval(load,60000);
 </script>
 </body></html>

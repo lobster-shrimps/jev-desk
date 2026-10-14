@@ -1066,8 +1066,14 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
                 "pool_sol_lamports": row["pool_sol_lamports"],
             }
             fired = detect_signals(watch, largest, pool_sol)
-            px = _price_of(prices.get(tid))
-            mark_px = px if px is not None else _num(row["last_price"], row["entry_price"])
+            import price_guard
+            entry_px = _num(row["entry_price"]) or 0.0
+            last_px = _num(row["last_price"], row["entry_price"])
+            px = price_guard.accept_price(
+                _price_of(prices.get(tid)),
+                entry=entry_px, prev=last_px, tid=tid,
+            )
+            mark_px = px if px is not None else last_px
             mark_px = float(mark_px or row["entry_price"])
             checked += 1
             if fired:

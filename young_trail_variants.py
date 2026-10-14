@@ -245,7 +245,8 @@ def _record_mark(db, tid: str, ts: float, price: float, entry_ts: float,
 
 def _parent(db, tid: str):
     return db.execute(
-        "SELECT entry_ts, entry_price FROM young_trail WHERE tid = ?", (tid,),
+        "SELECT entry_ts, entry_price, last_price, peak FROM young_trail WHERE tid = ?",
+        (tid,),
     ).fetchone()
 
 
@@ -287,7 +288,12 @@ def on_marks(prices: dict | None, now: float) -> None:
                 continue
             entry_price = float(parent["entry_price"])
             entry_ts = float(parent["entry_ts"])
-            px = _f(prices.get(tid), None)
+            import price_guard
+            raw_px = _f(prices.get(tid), None)
+            prev = _f(parent["last_price"], None) or entry_price
+            px = price_guard.accept_price(
+                raw_px, entry=entry_price, prev=prev, tid=tid,
+            )
             if px is not None and px > 0:
                 _record_mark(db, tid, now, px, entry_ts, entry_price)
             for row in group:
