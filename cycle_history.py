@@ -2181,8 +2181,13 @@ def latest_briefing() -> dict | None:
     return payload
 
 
-def briefing_payload(now: float | None = None, *, localtime: Callable | None = None) -> dict:
-    """Live snapshot for GET /ops/briefing, plus the persisted morning file if any."""
+def briefing_payload(now: float | None = None, *, localtime: Callable | None = None,
+                    compact: bool = False) -> dict:
+    """Live snapshot for GET /ops/briefing, plus the persisted morning file if any.
+
+    compact=True drops last_24h / trends (those embed every token) so the
+    ops page can stay under 50 KB.
+    """
     snap = build_briefing(now, localtime=localtime)
     persisted = latest_briefing()
     snap["morning"] = None
@@ -2193,6 +2198,13 @@ def briefing_payload(now: float | None = None, *, localtime: Callable | None = N
             "markdown": persisted.get("markdown"),
         }
         snap["persisted"] = persisted.get("date_local") == snap.get("date_local")
+    if compact:
+        return {
+            "date_local": snap.get("date_local"),
+            "generated_at_iso": snap.get("generated_at_iso"),
+            "markdown": snap.get("markdown") or "",
+            "morning": snap.get("morning"),
+        }
     return snap
 
 

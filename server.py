@@ -9,7 +9,9 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
   GET  /book/held      {"held": {...}|null}
   POST /book/release   RISK calls this the moment a close is filled. Nothing else does.
   GET  /ops            ops panel HTML
+  GET  /ops/summary    read-only desk aggregate (cached 30s)
   GET  /ops/briefing   last-24h briefing + 7-day trends
+  GET  /ops/briefing?compact=1  markdown + morning only (<50 KB)
   GET  /ops/backtest   latest weekly signal-backtest JSON
   GET  /ops/young_trail paper young-trail ledger (simulated, no live orders)
   GET  /ops/young_trail_variants paper exit-variant ranking (same marks)
@@ -74,14 +76,73 @@ async def ops_panel():
     return html_path.read_text()
 
 
+@app.get("/ops/summary")
+async def ops_summary():
+    """Read-only desk aggregate. Cached 30s. Fail open. Local-only (127.0.0.1)."""
+    try:
+        import ops_summary as _ops_summary
+        return JSONResponse(_ops_summary.summary_payload())
+    except Exception as e:
+        log.warning("ops summary: %s", safe_err(e))
+        return JSONResponse({
+            "error": "summary unavailable",
+            "generated_at_iso": None,
+            "health": {
+                "desk": {"loaded": False, "pid": None},
+                "ops": {"loaded": False, "pid": None},
+                "mode": "shadow",
+                "judge_mode": "live",
+                "last_cycle_start_iso": None,
+                "last_cycle_secs": None,
+                "next_cycle_in_s": None,
+                "cycles_24h": 0,
+                "no_trade_24h": 0,
+                "shadow_24h": 0,
+                "tracebacks_24h": {"run_log": 0, "uvicorn_log": 0},
+                "last_traceback": None,
+                "fomo_bearer_ok": False,
+            },
+            "judge_hi": [],
+            "outcomes": {
+                "complete": 0, "pending_live": 0, "pending_backfill": 0,
+                "dead": 0, "complete_24h": 0, "window": "01:00-06:00",
+                "trickle": True, "paused": False,
+            },
+            "budget": {
+                "cg_plan": None, "cg_key_present": False,
+                "cg_month_calls": 0, "cg_month_cap": 9000,
+                "cg_daily_cap": 0, "cg_today": 0, "demo_active": False,
+                "gt_calls_per_min": 5, "gt_429_24h": 0, "outcomes_spacing_s": 20.0,
+            },
+            "regime": {
+                "tag": None, "ts_iso": None, "reason": None,
+                "long_liq_usd": None, "short_liq_usd": None,
+                "majors_funding": None, "memes_funding": None,
+                "oi_change": None, "history": [],
+            },
+            "young_trail_curve": [],
+        })
+
+
 @app.get("/ops/briefing")
-async def ops_briefing():
-    """Last-24h morning briefing plus 7-day trends. Local-only (bind 127.0.0.1)."""
+async def ops_briefing(compact: int = 0):
+    """Last-24h morning briefing plus 7-day trends. Local-only (bind 127.0.0.1).
+
+    ?compact=1 returns date_local / generated_at_iso / markdown / morning only.
+    """
     try:
         import cycle_history
-        return JSONResponse(cycle_history.briefing_payload())
+        return JSONResponse(cycle_history.briefing_payload(compact=bool(compact)))
     except Exception as e:
         log.warning("ops briefing: %s", safe_err(e))
+        if compact:
+            return JSONResponse({
+                "error": "briefing unavailable",
+                "date_local": None,
+                "generated_at_iso": None,
+                "markdown": "",
+                "morning": None,
+            })
         return JSONResponse({
             "error": "briefing unavailable",
             "last_24h": {},

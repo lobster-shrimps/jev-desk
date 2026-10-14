@@ -561,33 +561,15 @@ def test_ops_html_has_briefing_and_trends():
     resp = client.get("/ops")
     assert resp.status_code == 200
     html = resp.text
-    assert 'id="briefing-panel"' in html
-    assert 'id="trends-panel"' in html
-    assert 'id="briefing-momentum"' in html
-    assert "/ops/briefing" in html
-    assert "renderBriefing" in html
-    assert "renderTrends" in html
-    assert "Solana only" in html
-    assert "insufficient history" in html
-    assert "Young free-pass" in html or "young free-pass" in html.lower()
-    assert "Reached judge" in html
-    assert "Passed judge/picks" in html
-    assert "No tokens passed judge/picks" in html
-    assert "Judge verdicts" in html
-    assert 'id="briefing-judge-verdicts"' in html
-    assert 'id="judge-verdicts-section"' in html
-    assert "renderJudgeVerdicts" in html
-    assert 'id="briefing-regime"' in html
-    assert 'id="trends-regime"' in html
-    assert "Market regime (log-only)" in html
-    assert "regime / day" in html
-    assert 'id="backtest-panel"' in html
-    assert 'id="shadow-kills-panel"' in html
-    assert "Signal backtest" in html
-    assert "Shadow kills by reason" in html
-    assert "/ops/backtest" in html
-    assert "renderBacktest" in html
-    assert "6h forward outcome" in html
+    assert 'id="briefing"' in html
+    assert 'id="br-md"' in html
+    assert "/ops/briefing?compact=1" in html
+    assert "/ops/summary" in html
+    assert 'id="mood"' in html
+    assert "Morning briefing" in html
+    assert "Market mood" in html
+    assert "prefers-color-scheme" in html
+    assert "prefers-reduced-motion" in html
 
 
 def test_briefing_payload_empty_store(hist):

@@ -273,11 +273,10 @@ def test_ops_html_has_young_trail_panel():
     import server
     client = TestClient(server.app)
     html = client.get("/ops").text
-    assert 'id="young-trail-panel"' in html
-    assert 'id="young-trail-section"' in html
-    assert 'id="briefing-young-trail"' in html
+    assert 'id="yt"' in html
+    assert 'id="yt-curve"' in html
     assert "/ops/young_trail" in html
-    assert "renderYoungTrail" in html
+    assert "young_trail" in html
     assert "No live orders" in html or "no live orders" in html.lower()
 
 

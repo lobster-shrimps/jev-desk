@@ -188,9 +188,9 @@ def test_ops_html_has_variants_panel():
     from fastapi.testclient import TestClient
     import server
     html = TestClient(server.app).get("/ops").text
-    assert 'id="young-trail-variants-panel"' in html
+    assert 'id="variants"' in html
     assert "/ops/young_trail_variants" in html
-    assert "renderYoungTrailVariants" in html
+    assert "Exit variants" in html
     assert "intra-cycle" in html
 
 
