@@ -17,6 +17,7 @@ import logging
 import os
 import pathlib
 import sqlite3
+import threading
 import time
 
 from secret_utils import safe_err
@@ -57,8 +58,8 @@ AMM_PROGRAMS = {
 }
 INCINERATOR = "1nc1nerator11111111111111111111111111111111"
 
-_conn: sqlite3.Connection | None = None
-_conn_path: str | None = None
+_tls = threading.local()
+_schema_lock = threading.Lock()
 _time_fn = time.time
 _rpc_fn = None
 _cycle_calls = 0
@@ -88,16 +89,21 @@ def db_path() -> pathlib.Path:
     return outbox / "outcomes.db"
 
 
-def reset() -> None:
-    """Close the cached connection. Tests call this."""
-    global _conn, _conn_path, _cycle_calls, _creator_mem
-    if _conn is not None:
+def _close_local() -> None:
+    conn = getattr(_tls, "conn", None)
+    if conn is not None:
         try:
-            _conn.close()
+            conn.close()
         except Exception:
             pass
-    _conn = None
-    _conn_path = None
+    _tls.conn = None
+    _tls.path = None
+
+
+def reset() -> None:
+    """Close this thread's cached connection. Tests call this."""
+    global _cycle_calls, _creator_mem
+    _close_local()
     _cycle_calls = 0
     _creator_mem = {}
 
@@ -188,21 +194,20 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    global _conn, _conn_path
+    """Per-thread connection. Default check_same_thread (this thread only)."""
     path = str(db_path())
-    if _conn is not None and _conn_path == path:
-        return _conn
-    if _conn is not None:
-        try:
-            _conn.close()
-        except Exception:
-            pass
+    conn = getattr(_tls, "conn", None)
+    if conn is not None and getattr(_tls, "path", None) == path:
+        return conn
+    _close_local()
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _conn = sqlite3.connect(path, check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
-    _conn.row_factory = sqlite3.Row
-    init_schema(_conn)
-    _conn_path = path
-    return _conn
+    conn = sqlite3.connect(path, timeout=LOCK_TIMEOUT_SEC)
+    conn.row_factory = sqlite3.Row
+    with _schema_lock:
+        init_schema(conn)
+    _tls.conn = conn
+    _tls.path = path
+    return conn
 
 
 def enabled() -> bool:

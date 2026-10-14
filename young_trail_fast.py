@@ -12,6 +12,7 @@ import logging
 import os
 import pathlib
 import sqlite3
+import threading
 import time
 
 from secret_utils import safe_err
@@ -35,8 +36,8 @@ FAST_VARIANTS: list[dict] = [
 ]
 VARIANT_BY_ID = {v["id"]: v for v in FAST_VARIANTS}
 
-_conn: sqlite3.Connection | None = None
-_conn_path: str | None = None
+_tls = threading.local()
+_schema_lock = threading.Lock()
 _time_fn = time.time
 
 
@@ -57,16 +58,20 @@ def db_path() -> pathlib.Path:
     return outbox / "outcomes.db"
 
 
-def reset() -> None:
-    """Close the cached connection. Tests call this."""
-    global _conn, _conn_path
-    if _conn is not None:
+def _close_local() -> None:
+    conn = getattr(_tls, "conn", None)
+    if conn is not None:
         try:
-            _conn.close()
+            conn.close()
         except Exception:
             pass
-    _conn = None
-    _conn_path = None
+    _tls.conn = None
+    _tls.path = None
+
+
+def reset() -> None:
+    """Close this thread's cached connection. Tests call this."""
+    _close_local()
 
 
 def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
@@ -118,21 +123,20 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    global _conn, _conn_path
+    """Per-thread connection. Default check_same_thread (this thread only)."""
     path = str(db_path())
-    if _conn is not None and _conn_path == path:
-        return _conn
-    if _conn is not None:
-        try:
-            _conn.close()
-        except Exception:
-            pass
+    conn = getattr(_tls, "conn", None)
+    if conn is not None and getattr(_tls, "path", None) == path:
+        return conn
+    _close_local()
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _conn = sqlite3.connect(path, check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
-    _conn.row_factory = sqlite3.Row
-    init_schema(_conn)
-    _conn_path = path
-    return _conn
+    conn = sqlite3.connect(path, timeout=LOCK_TIMEOUT_SEC)
+    conn.row_factory = sqlite3.Row
+    with _schema_lock:
+        init_schema(conn)
+    _tls.conn = conn
+    _tls.path = path
+    return conn
 
 
 def enabled() -> bool:

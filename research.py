@@ -82,8 +82,8 @@ TRADE_BUYS_RE = re.compile(
     r"trade tid=(\S+)\b.*?buys_h1=(\S+)"
 )
 
-_conn: sqlite3.Connection | None = None
-_conn_path: str | None = None
+_tls = threading.local()
+_schema_lock = threading.Lock()
 _get_fn = None
 _sleep_fn = None
 _time_fn = time.time
@@ -124,16 +124,21 @@ def db_path() -> pathlib.Path:
     return outbox_dir() / "research.db"
 
 
-def reset() -> None:
-    """Close the cached connection. Tests call this between cases."""
-    global _conn, _conn_path, _worker_thread, _last_labels_at
-    if _conn is not None:
+def _close_local() -> None:
+    conn = getattr(_tls, "conn", None)
+    if conn is not None:
         try:
-            _conn.close()
+            conn.close()
         except Exception:
             pass
-    _conn = None
-    _conn_path = None
+    _tls.conn = None
+    _tls.path = None
+
+
+def reset() -> None:
+    """Close this thread's cached connection. Tests call this between cases."""
+    global _worker_thread, _last_labels_at
+    _close_local()
     _last_labels_at = 0.0
     with _worker_lock:
         _worker_thread = None
@@ -147,26 +152,25 @@ def _locked():
 
 
 def _connect() -> sqlite3.Connection:
-    global _conn, _conn_path
+    """Per-thread connection. Default check_same_thread (this thread only)."""
     path = str(db_path())
-    if _conn is not None and _conn_path == path:
-        return _conn
-    if _conn is not None:
-        try:
-            _conn.close()
-        except Exception:
-            pass
+    conn = getattr(_tls, "conn", None)
+    if conn is not None and getattr(_tls, "path", None) == path:
+        return conn
+    _close_local()
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _conn = sqlite3.connect(path, check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
-    _conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(path, timeout=LOCK_TIMEOUT_SEC)
+    conn.row_factory = sqlite3.Row
     try:
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
     except Exception as e:
         log.warning("research wal: %s", safe_err(e))
-    _init_schema(_conn)
-    _conn_path = path
-    return _conn
+    with _schema_lock:
+        _init_schema(conn)
+    _tls.conn = conn
+    _tls.path = path
+    return conn
 
 
 def _init_schema(db: sqlite3.Connection) -> None:
@@ -879,7 +883,7 @@ def _price_series(tid: str) -> list[tuple[float, float | None, float | None]]:
         import young_trail
         path = young_trail.db_path()
         if pathlib.Path(path).exists():
-            other = sqlite3.connect(str(path), check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
+            other = sqlite3.connect(str(path), timeout=LOCK_TIMEOUT_SEC)
             other.row_factory = sqlite3.Row
             try:
                 if other.execute(
@@ -947,7 +951,7 @@ def _outcomes_overlay(tid: str) -> dict:
         path = outcomes.db_path()
         if not pathlib.Path(path).exists():
             return out
-        other = sqlite3.connect(str(path), check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
+        other = sqlite3.connect(str(path), timeout=LOCK_TIMEOUT_SEC)
         other.row_factory = sqlite3.Row
         try:
             row = other.execute(
@@ -1131,7 +1135,7 @@ def maybe_vacuum(now: float | None = None) -> bool:
 def _open_foreign(path: pathlib.Path) -> sqlite3.Connection | None:
     if not path or not pathlib.Path(path).exists():
         return None
-    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
+    conn = sqlite3.connect(str(path), timeout=LOCK_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -1988,7 +1992,7 @@ def readonly_connect() -> sqlite3.Connection:
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     _connect()  # ensure schema exists
     uri = f"file:{path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
+    conn = sqlite3.connect(uri, uri=True, timeout=LOCK_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn

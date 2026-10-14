@@ -633,6 +633,41 @@ def test_sqlite_lock_serializes_cycle_and_sampler_writes(rs):
     assert rs._db_lock is not None
 
 
+def test_sqlite_connections_are_per_thread(rs):
+    """Cycle, sampler, and ops threads must not share a Connection object."""
+    import cycle_history
+    import young_trail_fast
+    import young_trail_helius
+
+    for name in (
+        "cycle_history.py", "research.py",
+        "young_trail_fast.py", "young_trail_helius.py",
+    ):
+        src = (ROOT / name).read_text()
+        assert "check_same_thread=False" not in src, name
+
+    seen: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def worker(mod, key):
+        try:
+            seen[key] = mod._connect()  # keep alive: id() reuse after GC
+        except BaseException as e:
+            errors.append(e)
+
+    for key, mod in (
+        ("research", rs),
+        ("cycle_history", cycle_history),
+        ("young_trail_fast", young_trail_fast),
+        ("young_trail_helius", young_trail_helius),
+    ):
+        t = threading.Thread(target=worker, args=(mod, key))
+        t.start()
+        t.join()
+        assert errors == []
+        assert seen[key] is not mod._connect(), key
+
+
 def test_backfill_streams_gzip_logs_not_whole_read(rs, tmp_path, monkeypatch):
     monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
     p = tmp_path / "run.log.gz"
