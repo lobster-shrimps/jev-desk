@@ -63,7 +63,7 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
   <span class="stat" style="margin-left:auto">updated <b id="h-upd">…</b></span>
 </header>
 <nav class="jump" aria-label="Sections">
-  <a href="#desk">Desk</a><a href="#yt">young_trail</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
+  <a href="#desk">Desk</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
 </nav>
 <main>
 <section id="desk" class="s6" aria-labelledby="desk-h">
@@ -87,6 +87,12 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
 <section class="s6" aria-label="young_trail recent closes">
   <h2>Recent closes</h2>
   <div class="scroll"><table id="yt-closed"><thead><tr><th>Closed</th><th>Ticker</th><th>Reason</th><th class="n">Held</th><th class="n">P&amp;L</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="yt-fast" aria-labelledby="ytf-h">
+  <h2 id="ytf-h">young_trail_fast <small>60s marks vs per-cycle · same entries</small></h2>
+  <div class="kv" id="ytf-kv"></div>
+  <div class="note" id="ytf-note"></div>
+  <div class="scroll"><table id="ytf-t"><thead><tr><th>Ticker</th><th>Cycle exit</th><th class="n">Cycle P&amp;L</th><th>Fast baseline</th><th class="n">Fast P&amp;L</th><th>Fast tp_50</th><th class="n">Δ vs cycle</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="variants" aria-labelledby="var-h">
   <h2 id="var-h">Exit variants <small id="var-cav"></small></h2>
@@ -169,7 +175,7 @@ function curve(points){
 }
 
 async function load(){
-  const [S,YT,V,F,SL,B]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/ops/research/report?kind=features'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1')]);
+  const [S,YT,V,F,SL,B,YF]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/ops/research/report?kind=features'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast')]);
   const now=Date.now()/1000;
   if(S){const h=S.health||{};
     $('h-mode').textContent=(h.mode||'shadow')+' · judge '+(h.judge_mode||'?');
@@ -208,6 +214,10 @@ async function load(){
     kv('yt-kv',[['Realized',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Closed',s.closed_count],['Wins',s.winning_trades],['Win rate',pct(s.win_rate)],['Open',s.open_count]]);
     rows('yt-open',(YT.open_positions||[]).map(p=>{const r=p.last_price/p.entry_price;return `<tr><td>${esc(p.ticker)}</td><td>${esc(p.chain)}</td><td class="n">${ago(now-p.entry_ts)}</td><td class="n ${cls(r-1)}">${x(r)}</td><td class="n">${x(p.peak/p.entry_price)}</td><td class="n ${cls(r-1)}">${fmtUsd((YT.ticket_usd||50)*(r-1))}</td></tr>`}).join(''));
     rows('yt-closed',(YT.closed_trades||[]).slice(0,12).map(c=>`<tr><td>${tLocal(c.exit_ts)}</td><td>${esc(c.ticker)}</td><td>${esc(c.exit_reason)}</td><td class="n">${ago(c.exit_ts-c.entry_ts)}</td><td class="n ${cls(c.pnl_usd)}">${fmtUsd(c.pnl_usd)}</td></tr>`).join(''));}
+  if(YF){const sb=YF.summary&&YF.summary.baseline||{};const st=YF.summary&&YF.summary.tp_50||{};
+    kv('ytf-kv',[['Fast baseline',fmtUsd(sb.realized_pnl_usd),cls(sb.realized_pnl_usd)],['Fast closed',sb.closed_count],['Fast tp_50',fmtUsd(st.realized_pnl_usd),cls(st.realized_pnl_usd)],['Open',sb.open_count]]);
+    $('ytf-note').textContent=YF.caveat||'Paper only · 60s Dex marks · no live orders';
+    rows('ytf-t',(YF.comparison||[]).slice(0,20).map(r=>`<tr><td>${esc(r.ticker||'')}</td><td>${esc(r.cycle_exit_reason||'open')}</td><td class="n ${cls(r.cycle_pnl_usd)}">${fmtUsd(r.cycle_pnl_usd)}</td><td>${esc(r.fast_baseline_exit_reason||'open')}</td><td class="n ${cls(r.fast_baseline_pnl_usd)}">${fmtUsd(r.fast_baseline_pnl_usd)}</td><td>${esc(r.fast_tp50_exit_reason||'open')}</td><td class="n ${cls(r.delta_vs_cycle_usd)}">${fmtUsd(r.delta_vs_cycle_usd)}</td></tr>`).join(''));}
   if(V){const rk=[...(V.ranking||[])].sort((a,b)=>b.realized_pnl_usd-a.realized_pnl_usd);const base=rk.find(r=>r.variant==='baseline')?.realized_pnl_usd??0;
     const span=Math.max(1,...rk.map(r=>Math.abs(r.realized_pnl_usd-base)));
     $('var-cav').textContent=V.caveat||'';
