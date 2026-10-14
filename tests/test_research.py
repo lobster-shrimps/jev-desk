@@ -307,15 +307,15 @@ def test_briefing_early_signals_section(rs, tmp_path, monkeypatch):
 
 def test_ops_html_has_research_hooks():
     html = (ROOT / "ops.html").read_text()
-    assert 'id="briefing-early-signals"' in html
-    assert 'id="research-panel"' in html
+    assert 'id="research"' in html
+    assert 'id="q-sql"' in html
     assert "/ops/research/query" in html
     assert "/ops/research/report" in html
-    assert "renderResearchFeatures" in html
+    assert "kind=features" in html
 
 
 def test_protected_files_untouched():
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py"):
+    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py", "collect.py"):
         r = subprocess.run(
             ["git", "diff", "--", name],
             cwd=str(ROOT), capture_output=True, text=True, check=True,

@@ -955,12 +955,11 @@ def test_ops_endpoint_returns_html():
     
     response = client.get("/ops")
     assert response.status_code == 200
-    assert "jev-desk ops" in response.text
-    assert "ops-console" in response.text or "Kill Histograms" in response.text
-    # Verify new summary section exists
-    assert "summary-box" in response.text
-    assert "What Happened" in response.text
-    assert "Judge Health" in response.text
+    assert "JEV Ops" in response.text
+    assert "/ops/summary" in response.text
+    assert 'id="desk"' in response.text
+    assert "Judge scores" in response.text
+    assert "young_trail" in response.text
 
 
 def test_ops_panel_has_summary_and_judge_health():
@@ -977,19 +976,14 @@ def test_ops_panel_has_summary_and_judge_health():
     assert response.status_code == 200
     html = response.text
     
-    # Verify summary section
-    assert 'id="summary-box"' in html
-    assert 'id="summary-content"' in html
-    assert "What Happened" in html
-    
-    # Verify judge health field
-    assert 'id="judge-health"' in html
-    
-    # Verify JavaScript functions for rendering
-    assert "renderSummary" in html
-    assert "renderJudgeHealth" in html
-    assert "summary-highlight" in html  # CSS class for emphasis
-    assert "summary-warning" in html    # CSS class for warnings
+    assert 'id="desk"' in html
+    assert 'id="judge-t"' in html
+    assert 'id="yt"' in html
+    assert 'id="briefing"' in html
+    assert "/ops/summary" in html
+    assert "/ops/briefing?compact=1" in html
+    assert "prefers-color-scheme" in html
+    assert "fomo-fix-button" in html
 
 
 def test_run_once_records_tokens(monkeypatch):
