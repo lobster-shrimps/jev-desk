@@ -27,6 +27,13 @@ CATNIP_ENTRY = 9.24e-7
 CATNIP_SPIKE = 0.009226
 
 
+@pytest.fixture(autouse=True)
+def _reset_guard():
+    price_guard.reset()
+    yield
+    price_guard.reset()
+
+
 def _pair(mint, price, liq, **extra):
     row = {
         "priceUsd": str(price),
@@ -34,6 +41,36 @@ def _pair(mint, price, liq, **extra):
         "baseToken": {"address": mint, "symbol": extra.pop("symbol", "X")},
         "chainId": extra.pop("chainId", "solana"),
         "volume": extra.pop("volume", {"m5": 1, "h1": 2, "h24": 3}),
+    }
+    row.update(extra)
+    return row
+
+
+def _pumpfun_pair(mint, price, *, symbol="PINECONE", market_cap=21_500, **extra):
+    """Real-shaped DexScreener pump.fun bonding-curve pair: no liquidity field."""
+    row = {
+        "chainId": "solana",
+        "dexId": "pumpfun",
+        "url": f"https://dexscreener.com/solana/{mint[:8]}pump",
+        "pairAddress": f"{mint[:8]}bondingcurve",
+        "labels": ["pump"],
+        "baseToken": {"address": mint, "name": symbol, "symbol": symbol},
+        "quoteToken": {
+            "address": "So11111111111111111111111111111111111111112",
+            "name": "Wrapped SOL",
+            "symbol": "SOL",
+        },
+        "priceNative": "0.00001234",
+        "priceUsd": str(price),
+        "txns": {
+            "m5": {"buys": 12, "sells": 3},
+            "h1": {"buys": 80, "sells": 20},
+            "h24": {"buys": 200, "sells": 50},
+        },
+        "volume": {"h24": 12000.0, "h6": 4000.0, "h1": 800.0, "m5": 100.0},
+        "priceChange": {"m5": 5.2, "h1": 12.0, "h6": 40.0, "h24": 80.0},
+        "fdv": market_cap,
+        "marketCap": market_cap,
     }
     row.update(extra)
     return row
@@ -56,17 +93,70 @@ def test_reject_low_liq_and_wrong_mint():
     assert ok["price_usd"] == pytest.approx(1.25)
 
 
+def test_pumpfun_pair_with_no_liquidity_field_is_accepted():
+    mint = "PINECONEmint1111111111111111111111111111111"
+    pair = _pumpfun_pair(mint, 0.00215, symbol="PINECONE", market_cap=21_500)
+    assert "liquidity" not in pair
+    assert price_guard.pair_reject_reason(pair, mint) is None
+    mark = price_guard.mark_from_pairs([pair], mint, entry=0.002, prev=0.002, tid=f"{mint}:1399811149")
+    assert mark is not None
+    assert mark["price_usd"] == pytest.approx(0.00215)
+    assert mark["liq_usd"] is None
+
+    jump = _pumpfun_pair(mint, 0.00215, symbol="JUMP", market_cap=48_000)
+    assert price_guard.mark_from_pairs([jump], mint, tid="jump:1399811149")["price_usd"] == pytest.approx(0.00215)
+
+    cheap = _pumpfun_pair(mint, 0.00215, market_cap=500)
+    assert price_guard.pair_reject_reason(cheap, mint) == "low_mcap"
+
+
 def test_catnip_pumpswap_quote_is_rejected(caplog):
     caplog.set_level(logging.INFO)
-    pairs = [_pair(CATNIP_MINT, CATNIP_SPIKE, 0.02, symbol="Catnip")]
+    # pumpswap reports $0.02 liquidity and ~10,000× entry. Still low_liq.
+    pairs = [_pair(
+        CATNIP_MINT, CATNIP_SPIKE, 0.02, symbol="Catnip", dexId="pumpswap",
+        marketCap=9_000_000,
+    )]
+    assert CATNIP_SPIKE / CATNIP_ENTRY == pytest.approx(10_000, rel=0.01)
     mark = price_guard.mark_from_pairs(
         pairs, CATNIP_MINT, entry=CATNIP_ENTRY, prev=CATNIP_ENTRY, tid=CATNIP_TID,
     )
     assert mark is None
+    assert price_guard.pair_reject_reason(pairs[0], CATNIP_MINT) == "low_liq"
     blob = caplog.text
     assert "price_guard skip" in blob
     assert CATNIP_TID in blob
     assert "TYPESAFE" not in blob
+
+
+def test_single_pool_spike_accepted_after_two_consecutive_confirms():
+    mint = "SoloMint111"
+    tid = f"{mint}:1399811149"
+    entry = 1.0
+    spike = 25.0
+    first = [_pair(mint, spike, 8_000, dexId="raydium")]
+    assert price_guard.mark_from_pairs(
+        first, mint, entry=entry, prev=entry, tid=tid, now=T0,
+    ) is None
+    # Same timestamp must not confirm (variants/fast share a tick).
+    assert price_guard.mark_from_pairs(
+        first, mint, entry=entry, prev=entry, tid=tid, now=T0,
+    ) is None
+    second = [_pair(mint, spike * 1.1, 8_000, dexId="raydium")]
+    mark = price_guard.mark_from_pairs(
+        second, mint, entry=entry, prev=entry, tid=tid, now=T0 + 60,
+    )
+    assert mark is not None
+    assert mark["price_usd"] == pytest.approx(spike * 1.1)
+
+    # Same via accept_price (paper ledgers). Fresh tid so pending is empty.
+    tid2 = "solo2:1399811149"
+    assert price_guard.accept_price(
+        25.0, entry=1.0, prev=1.0, tid=tid2, now=T0,
+    ) is None
+    assert price_guard.accept_price(
+        24.0, entry=1.0, prev=1.0, tid=tid2, now=T0 + 60,
+    ) == pytest.approx(24.0)
 
 
 def test_spike_needs_second_source_within_30pct():
@@ -106,7 +196,7 @@ def test_young_trail_skips_spike_never_uses_for_peak_or_exit():
     assert pos["peak"] == pytest.approx(CATNIP_ENTRY)
     assert pos["last_price"] == pytest.approx(CATNIP_ENTRY)
     # Time exit with no valid mark uses last_price, not the spike.
-    gone = young_trail.mark_open({tid: CATNIP_SPIKE}, now=T0 + 6 * 3600)
+    gone = young_trail.mark_open({}, now=T0 + 6 * 3600)
     assert gone["closed"] == 1
     closed = young_trail.closed_rows()[0]
     assert closed["exit_reason"] == "time"

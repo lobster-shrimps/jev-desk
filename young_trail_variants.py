@@ -292,7 +292,7 @@ def on_marks(prices: dict | None, now: float) -> None:
             raw_px = _f(prices.get(tid), None)
             prev = _f(parent["last_price"], None) or entry_price
             px = price_guard.accept_price(
-                raw_px, entry=entry_price, prev=prev, tid=tid,
+                raw_px, entry=entry_price, prev=prev, tid=tid, now=now,
             )
             if px is not None and px > 0:
                 _record_mark(db, tid, now, px, entry_ts, entry_price)

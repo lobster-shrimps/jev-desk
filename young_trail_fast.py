@@ -363,7 +363,7 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
             last_px = _num(row["last_price"], None) or entry_price
             px = price_guard.accept_price(
                 _price_of(prices.get(tid)),
-                entry=entry_price, prev=last_px, tid=tid,
+                entry=entry_price, prev=last_px, tid=tid, now=ts,
             )
             peak = _num(row["peak"], entry_price) or entry_price
             peak_ts = _num(row["peak_ts"], row["entry_ts"]) or float(row["entry_ts"])

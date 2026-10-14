@@ -1071,7 +1071,7 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
             last_px = _num(row["last_price"], row["entry_price"])
             px = price_guard.accept_price(
                 _price_of(prices.get(tid)),
-                entry=entry_px, prev=last_px, tid=tid,
+                entry=entry_px, prev=last_px, tid=tid, now=ts,
             )
             mark_px = px if px is not None else last_px
             mark_px = float(mark_px or row["entry_price"])

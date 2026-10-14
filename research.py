@@ -762,7 +762,8 @@ def _mark_context(tids: list[str]) -> tuple[dict[str, float], dict[str, float]]:
 
 
 def fetch_dex_batch(tids: list[str], entries: dict | None = None,
-                    prevs: dict | None = None) -> dict[str, dict]:
+                    prevs: dict | None = None, now: float | None = None
+                    ) -> dict[str, dict]:
     """DexScreener /latest/dex/tokens/<comma list up to 30>. 5s timeout. No GT.
 
     Marks pass price_guard (mint match, liq >= $1,000, unconfirmed spikes skipped).
@@ -804,6 +805,7 @@ def fetch_dex_batch(tids: list[str], entries: dict | None = None,
                 entry=entries.get(tid),
                 prev=prevs.get(tid),
                 tid=tid,
+                now=now,
             )
             if mark and mark.get("price_usd"):
                 out[tid] = mark
@@ -824,7 +826,7 @@ def tick_sampler(now: float | None = None) -> dict:
         if not tids:
             return empty
         entries, prevs = _mark_context(tids)
-        prices = fetch_dex_batch(tids, entries=entries, prevs=prevs)
+        prices = fetch_dex_batch(tids, entries=entries, prevs=prevs, now=ts)
         n = 0
         with _locked() as db:
             for tid in tids:

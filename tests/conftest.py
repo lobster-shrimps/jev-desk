@@ -59,7 +59,9 @@ def isolate_young_trail(tmp_path, monkeypatch):
     monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
     monkeypatch.delenv("YOUNG_TRAIL_UNTIL", raising=False)
     monkeypatch.delenv("YOUNG_TRAIL_ENABLED", raising=False)
+    import price_guard
     import young_trail
+    price_guard.reset()
     young_trail.reset()
     young_trail.set_time_fn(None)
     young_trail.set_sleep_fn(lambda _d: None)
@@ -76,6 +78,7 @@ def isolate_young_trail(tmp_path, monkeypatch):
     young_trail_helius.set_time_fn(None)
     young_trail_helius.set_rpc_fn(None)
     yield
+    price_guard.reset()
     young_trail.reset()
     young_trail.set_get_fn(None)
     young_trail.set_sleep_fn(None)
