@@ -5,7 +5,7 @@
 JEV is a shadow desk. Shadow means paper-only: it watches the market and writes down
 what it would have done, and it never places a real order. It follows brand-new
 memecoins — joke or internet-culture tokens that often appear and vanish in a day —
-as they launch on fomo.family, across Solana, BSC, Base, and other chains.
+as they launch on fomo.family, across Solana, BSC, Base, and Robinhood Chain.
 
 About every fifteen minutes it runs one cycle, a single pass through the new names.
 It collects the latest tokens, then applies hard safety floors: automatic cuts for
@@ -13,7 +13,7 @@ age, liquidity (cash sitting in the trading pool), volume (how much has actually
 changed hands), market cap (the token's total implied value), and wallet
 concentration (how much of the supply a few addresses hold). Tokens that survive
 those floors go to an AI judge, which scores each one from 0 to 1. A score of 0.6
-or higher becomes a simulated $50 pick: a pretend fifty-dollar trade, logged as if
+or higher, with judge confidence of at least 0.55, becomes a simulated $50 pick: a pretend fifty-dollar trade, logged as if
 it had been placed.
 
 Beside that loop sit a few side experiments, all still on paper. The young-token
@@ -28,7 +28,7 @@ The hoped-for benefit is simple. Catch the few launches that run early, get out
 before the many that rug, and prove any rule on paper before risking real money.
 
 After about a week of paper data, no rule has been profitable out-of-sample — that
-is, on data it was not tuned against. Most young tokens rug within an hour. The
+is, on data it was not tuned against. Most young-token paper trades lose money (8 wins in 118 closed trades so far). The
 Helius sell signal is the most promising lead so far, but the sample is small.
 Live trading stays off until a rule shows realized profit on paper: gains after
 those pretend trades are closed.
