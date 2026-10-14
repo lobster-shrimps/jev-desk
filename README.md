@@ -1,5 +1,40 @@
 # Jev Desk
 
+## What JEV is and why
+
+JEV is a shadow desk. Shadow means paper-only: it watches the market and writes down
+what it would have done, and it never places a real order. It follows brand-new
+memecoins — joke or internet-culture tokens that often appear and vanish in a day —
+as they launch on fomo.family, across Solana, BSC, Base, and other chains.
+
+About every fifteen minutes it runs one cycle, a single pass through the new names.
+It collects the latest tokens, then applies hard safety floors: automatic cuts for
+age, liquidity (cash sitting in the trading pool), volume (how much has actually
+changed hands), market cap (the token's total implied value), and wallet
+concentration (how much of the supply a few addresses hold). Tokens that survive
+those floors go to an AI judge, which scores each one from 0 to 1. A score of 0.6
+or higher becomes a simulated $50 pick: a pretend fifty-dollar trade, logged as if
+it had been placed.
+
+Beside that loop sit a few side experiments, all still on paper. The young-token
+test follows very new coins and tries exit variants — different rules for when to
+sell. A faster version of the same entries checks prices every sixty seconds.
+Helius wallet-watch looks for rug signals: sudden insider dumps that collapse the
+price. And research.db is a local file that records every sighting and outcome so
+a rule can be backtested, meaning replayed against past data, before anyone treats
+it as real.
+
+The hoped-for benefit is simple. Catch the few launches that run early, get out
+before the many that rug, and prove any rule on paper before risking real money.
+
+After about a week of paper data, no rule has been profitable out-of-sample — that
+is, on data it was not tuned against. Most young tokens rug within an hour. The
+Helius sell signal is the most promising lead so far, but the sample is small.
+Live trading stays off until a rule shows realized profit on paper: gains after
+those pretend trades are closed.
+
+The live picture is at `/ops` on 127.0.0.1:8080.
+
 A memecoin launch desk built from @savipww's "Megabrain (Jev) & Six Grok Bots" setup guide
 (x.com/savipww/status/2102720919185617314). Code fetches, Jev judges, code decides.
 
