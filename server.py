@@ -16,6 +16,7 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
   GET  /ops/young_trail paper young-trail ledger (simulated, no live orders)
   GET  /ops/young_trail_variants paper exit-variant ranking (same marks)
   GET  /ops/young_trail_fast paper 60s-mark ledger vs per-cycle young_trail
+  GET  /ops/young_trail_helius paper Helius rug-signal ledger vs fast/cycle
   GET  /ops/research/query?sql=  read-only SELECT on research.db (limit 500)
   GET  /ops/research/report?kind= rugs|runners|features
   GET  /api/state      outbox/state.json for ops panel
@@ -198,6 +199,33 @@ async def ops_young_trail_fast():
                 },
             },
             "comparison": [],
+            "open_positions": [],
+            "closed_trades": [],
+        })
+
+
+@app.get("/ops/young_trail_helius")
+async def ops_young_trail_helius():
+    """Paper Helius rug-signal ledger vs fast and per-cycle. No live orders."""
+    try:
+        import young_trail_helius
+        return JSONResponse(young_trail_helius.ops_payload())
+    except Exception as e:
+        log.warning("ops young_trail_helius: %s", safe_err(e))
+        return JSONResponse({
+            "paper": True,
+            "simulated": True,
+            "live_orders": False,
+            "error": "young_trail_helius unavailable",
+            "summary": {
+                "open_count": 0, "closed_count": 0, "win_rate": 0.0,
+                "realized_pnl_usd": 0.0,
+            },
+            "quality": {
+                "precision": None, "recall": None, "lead_min_median": None,
+            },
+            "comparison": [],
+            "signals": [],
             "open_positions": [],
             "closed_trades": [],
         })

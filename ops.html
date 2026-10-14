@@ -94,6 +94,12 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
   <div class="note" id="ytf-note"></div>
   <div class="scroll"><table id="ytf-t"><thead><tr><th>Ticker</th><th>Cycle exit</th><th class="n">Cycle P&amp;L</th><th>Fast baseline</th><th class="n">Fast P&amp;L</th><th>Fast tp_50</th><th class="n">Δ vs cycle</th></tr></thead><tbody></tbody></table></div>
 </section>
+<section id="yt-helius" aria-labelledby="yth-h">
+  <h2 id="yth-h">young_trail_helius <small>Helius vs fast vs per-cycle · same entries</small></h2>
+  <div class="kv" id="yth-kv"></div>
+  <div class="note" id="yth-note"></div>
+  <div class="scroll"><table id="yth-t"><thead><tr><th>Ticker</th><th>Signal</th><th class="n">Helius P&amp;L</th><th class="n">Fast P&amp;L</th><th class="n">Cycle P&amp;L</th><th>Rug</th><th class="n">Lead min</th></tr></thead><tbody></tbody></table></div>
+</section>
 <section id="variants" aria-labelledby="var-h">
   <h2 id="var-h">Exit variants <small id="var-cav"></small></h2>
   <div class="scroll"><table id="var-t"><thead><tr><th>#</th><th>Variant</th><th class="n">Closed</th><th class="n">Open</th><th class="n">Win rate</th><th class="n">Realized</th><th style="width:28%">vs baseline</th></tr></thead><tbody></tbody></table></div>
@@ -175,7 +181,7 @@ function curve(points){
 }
 
 async function load(){
-  const [S,YT,V,F,SL,B,YF]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/ops/research/report?kind=features'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast')]);
+  const [S,YT,V,F,SL,B,YF,YH]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/ops/research/report?kind=features'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius')]);
   const now=Date.now()/1000;
   if(S){const h=S.health||{};
     $('h-mode').textContent=(h.mode||'shadow')+' · judge '+(h.judge_mode||'?');
@@ -218,6 +224,10 @@ async function load(){
     kv('ytf-kv',[['Fast baseline',fmtUsd(sb.realized_pnl_usd),cls(sb.realized_pnl_usd)],['Fast closed',sb.closed_count],['Fast tp_50',fmtUsd(st.realized_pnl_usd),cls(st.realized_pnl_usd)],['Open',sb.open_count]]);
     $('ytf-note').textContent=YF.caveat||'Paper only · 60s Dex marks · no live orders';
     rows('ytf-t',(YF.comparison||[]).slice(0,20).map(r=>`<tr><td>${esc(r.ticker||'')}</td><td>${esc(r.cycle_exit_reason||'open')}</td><td class="n ${cls(r.cycle_pnl_usd)}">${fmtUsd(r.cycle_pnl_usd)}</td><td>${esc(r.fast_baseline_exit_reason||'open')}</td><td class="n ${cls(r.fast_baseline_pnl_usd)}">${fmtUsd(r.fast_baseline_pnl_usd)}</td><td>${esc(r.fast_tp50_exit_reason||'open')}</td><td class="n ${cls(r.delta_vs_cycle_usd)}">${fmtUsd(r.delta_vs_cycle_usd)}</td></tr>`).join(''));}
+  if(YH){const s=YH.summary||{};const q=YH.quality||{};
+    kv('yth-kv',[['Helius P&L',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Signals',s.signals||0],['Precision',q.precision==null?'—':pct(q.precision)],['Recall',q.recall==null?'—':pct(q.recall)],['Lead min',q.lead_min_median==null?'—':(+q.lead_min_median).toFixed(1)]]);
+    $('yth-note').textContent=YH.caveat||'Paper only · Helius rug signals · no live orders';
+    rows('yth-t',(YH.comparison||[]).slice(0,20).map(r=>`<tr><td>${esc(r.ticker||'')}</td><td>${esc(r.helius_signal||'open')}</td><td class="n ${cls(r.helius_pnl_usd)}">${fmtUsd(r.helius_pnl_usd)}</td><td class="n ${cls(r.fast_baseline_pnl_usd)}">${fmtUsd(r.fast_baseline_pnl_usd)}</td><td class="n ${cls(r.cycle_pnl_usd)}">${fmtUsd(r.cycle_pnl_usd)}</td><td>${r.helius_rugged==1?'rug':r.helius_rugged==0?'no':'—'}</td><td class="n">${r.helius_lead_min==null?'—':(+r.helius_lead_min).toFixed(1)}</td></tr>`).join(''));}
   if(V){const rk=[...(V.ranking||[])].sort((a,b)=>b.realized_pnl_usd-a.realized_pnl_usd);const base=rk.find(r=>r.variant==='baseline')?.realized_pnl_usd??0;
     const span=Math.max(1,...rk.map(r=>Math.abs(r.realized_pnl_usd-base)));
     $('var-cav').textContent=V.caveat||'';

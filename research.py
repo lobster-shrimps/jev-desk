@@ -600,6 +600,11 @@ def on_cycle(stats: dict | None = None, tokens=None, now: float | None = None,
                 )):
                     n += 1
             db.commit()
+        try:
+            import young_trail_helius
+            young_trail_helius.remember_creators(list(shortlist.values()), now=ts)
+        except Exception as e:
+            log.warning("research young_trail_helius creators: %s", safe_err(e))
         # Labels run on the sampler thread (maybe_compute_labels), not the desk cycle.
         if not str(origin).startswith("backfill"):
             try:
@@ -763,7 +768,8 @@ def tick_sampler(now: float | None = None) -> dict:
     """One 60s sample: up to 30 Dex batch marks. Never touches young_trail exits.
 
     After logging marks, drives the paper young_trail_fast ledger on the same
-    prices (no extra Dex). Fail open.
+    prices (no extra Dex) and the paper young_trail_helius rug-signal checks.
+    Fail open.
     """
     ts = current_time() if now is None else float(now)
     empty = {"n": 0, "marks": 0}
@@ -804,6 +810,16 @@ def tick_sampler(now: float | None = None) -> dict:
             young_trail_fast.on_sampler_tick(px_map, ts)
         except Exception as e:
             log.warning("research young_trail_fast: %s", safe_err(e))
+        try:
+            import young_trail_helius
+            px_map = {
+                tid: mark.get("price_usd")
+                for tid, mark in prices.items()
+                if isinstance(mark, dict) and mark.get("price_usd")
+            }
+            young_trail_helius.on_sampler_tick(px_map, ts)
+        except Exception as e:
+            log.warning("research young_trail_helius: %s", safe_err(e))
         try:
             maybe_compute_labels(tids=tids, now=ts)
         except Exception as e:
