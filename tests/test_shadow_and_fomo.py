@@ -132,7 +132,11 @@ def test_shadow_entry_dexscreener_fallback(monkeypatch):
     class Resp:
         status_code = 200
         def json(self):
-            return [{"liquidity": {"usd": 80_000}, "priceUsd": "0.0099"}]
+            return [{
+                "liquidity": {"usd": 80_000},
+                "priceUsd": "0.0099",
+                "baseToken": {"address": "HelLoPAddr111"},
+            }]
     young_trail.set_get_fn(lambda *a, **k: Resp())
     rec = shadow_ledger.entry(_shadow_order(), {"price": None, "price_usd": None})
     assert rec is not None

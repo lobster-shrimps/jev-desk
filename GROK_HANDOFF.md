@@ -42,7 +42,7 @@ after you have a rule that actually pays.
 
 | piece | where | label / how |
 |---|---|---|
-| ops / judge | this Mac | launchd `com.robbrown.jevdesk.ops` — `uvicorn server:app` |
+| ops / judge | this Mac | launchd `com.robbrown.jevdesk.ops` — `uvicorn server:app` ( `/ops`+`/api` are sync/threadpool so they cannot stall `/judge`). Optional split: `uvicorn judge:app` on 8081, desk `JUDGE_URL=http://127.0.0.1:8081/judge` |
 | shift | this Mac | launchd `com.robbrown.jevdesk.desk` — `run.py` every 15 min |
 | FomoDesk Chrome | this Mac | dedicated profile, CDP on 9222, `fomo.family` tab logged in |
 | `desk.db` + `outbox/` | this Mac | book, state, research, outcomes, paper ledgers. Same working directory (or absolute `DESK_DB` / `DESK_OUTBOX`) for both jobs |
@@ -174,6 +174,7 @@ confirming in FOMO that the position is actually closed.
 | "HOLDING ... no scan" forever | close never released |
 | bots connection errors | tunnel URL changed |
 | judge unreachable | cycle stands down. No guessing |
+| `/judge` times out while `/ops` tabs are open | ops SQLite was on the event loop; handlers are now `def`. Optional: judge on 8081 |
 
 `python run.py --bench` prints what is benched and why.
 

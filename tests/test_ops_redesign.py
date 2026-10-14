@@ -328,7 +328,7 @@ def test_protected_logic_untouched():
     import subprocess
     for name in (
         "thresholds.py", "questions.py", "pick.py", "filter.py", "collect.py",
-        "young_trail.py",
+        "judge.py",
     ):
         r = subprocess.run(
             ["git", "diff", "--", name],

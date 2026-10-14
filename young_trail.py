@@ -241,12 +241,21 @@ def decide_exit(entry_price: float, peak: float, price: float | None,
 
     SL -30% from entry, trail 30% from peak (price <= peak * 0.7), time at 6h.
     Price stops beat the time stop in the same tick (stopsim order).
-    A 6h exit with no current price uses last marked price, never peak.
+    A 6h exit with a current mark (including drain 0) uses that mark.
+    With no current price it uses last marked price, never peak.
     """
     sl_price = float(entry_price) * (1.0 + SL_PCT)
     trail_price = float(peak) * (1.0 - TRAIL_PCT)
-    if price is not None and price > 0:
-        px = float(price)
+    px = None
+    if price is not None:
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            px = None
+        else:
+            if px < 0:
+                px = None
+    if px is not None:
         hit_sl = px <= sl_price
         hit_trail = px <= trail_price
         if hit_sl or hit_trail:
@@ -332,8 +341,13 @@ def _pair_price_usd(pair: dict | None) -> float | None:
     return None
 
 
-def fetch_dex_price(tid: str) -> float | None:
-    """DexScreener /tokens/v1/{chain}/{addr} highest-liq pair priceUsd. No GT."""
+def fetch_dex_price(tid: str, *, entry=None, prev=None, now=None) -> float | None:
+    """DexScreener /tokens/v1/{chain}/{addr} guarded priceUsd. No GT.
+
+    Rejects liq < $1,000, baseToken.address != mint, and unconfirmed spikes
+    (>20× entry or >10× previous mark without a second pair within ±30%).
+    """
+    import price_guard
     addr, net = parse_tid(tid)
     if not addr:
         return None
@@ -354,7 +368,9 @@ def fetch_dex_price(tid: str) -> float | None:
             log.info("young_trail dex HTTP %s", status)
             return None
         pairs = resp.json()
-        return _pair_price_usd(_highest_liq_pair(pairs))
+        return price_guard.price_from_pairs(
+            pairs, addr, entry=entry, prev=prev, tid=tid, now=now,
+        )
     except Exception as e:
         log.warning("young_trail dex failed: %s", safe_err(e))
         return None
@@ -371,13 +387,18 @@ def _dex_cap() -> int:
 
 
 def fetch_dex_prices(tids: list[str], *, cap: int | None = None,
-                     budget_sec: float | None = None) -> dict[str, float]:
+                     budget_sec: float | None = None,
+                     entries: dict | None = None,
+                     prevs: dict | None = None,
+                     now=None) -> dict[str, float]:
     out: dict[str, float] = {}
     limit = _dex_cap() if cap is None else max(0, int(cap))
     budget = DEX_CYCLE_BUDGET_SEC if budget_sec is None else float(budget_sec)
     started = current_time()
     seen = set()
     n = 0
+    entries = entries or {}
+    prevs = prevs or {}
     for tid in tids:
         if not tid or tid in seen:
             continue
@@ -388,8 +409,10 @@ def fetch_dex_prices(tids: list[str], *, cap: int | None = None,
             log.info("young_trail dex cycle budget exceeded, skipping remaining")
             break
         n += 1
-        px = fetch_dex_price(tid)
-        if px:
+        px = fetch_dex_price(
+            tid, entry=entries.get(tid), prev=prevs.get(tid), now=now,
+        )
+        if px is not None:
             out[tid] = px
     return out
 
@@ -540,9 +563,7 @@ def mark_open(prices: dict[str, float] | None = None, now: float | None = None) 
         tid = pos["tid"]
         px = prices.get(tid)
         try:
-            peak = float(pos["peak"] or pos["entry_price"])
-            if px is not None and px > 0:
-                peak = max(peak, float(px))
+            import price_guard
             last_px = pos.get("last_price")
             try:
                 last_px = float(last_px) if last_px is not None else None
@@ -550,6 +571,13 @@ def mark_open(prices: dict[str, float] | None = None, now: float | None = None) 
                 last_px = None
             if last_px is None or last_px <= 0:
                 last_px = float(pos["entry_price"])
+            px = price_guard.accept_price(
+                px, entry=float(pos["entry_price"]), prev=last_px, tid=tid,
+                now=ts,
+            )
+            peak = float(pos["peak"] or pos["entry_price"])
+            if px is not None and px > 0:
+                peak = max(peak, float(px))
             decision = decide_exit(
                 float(pos["entry_price"]), peak, px, float(pos["entry_ts"]), ts,
                 last_price=last_px,
@@ -559,7 +587,7 @@ def mark_open(prices: dict[str, float] | None = None, now: float | None = None) 
                 if _close_row(tid, ts, exit_px, reason, peak):
                     closed += 1
                 continue
-            if px is None or px <= 0:
+            if px is None:
                 stale += 1
                 continue
             db = _connect()
@@ -629,7 +657,8 @@ def on_cycle(stats=None, tokens=None, now: float | None = None) -> dict:
             px = _price_from_token(t)
             if px:
                 prices[t["tid"]] = px
-        missing = [r["tid"] for r in open_rows() if r["tid"] not in prices]
+        opens = open_rows()
+        missing = [r["tid"] for r in opens if r["tid"] not in prices]
         candidates: list[dict] = []
         if accepting_entries(ts):
             for y in stats.get("young_free") or []:
@@ -650,7 +679,11 @@ def on_cycle(stats=None, tokens=None, now: float | None = None) -> dict:
                     missing.append(tid)
                 candidates.append(t if t.get("tid") else y)
         if missing:
-            prices.update(fetch_dex_prices(missing))
+            entries = {r["tid"]: r["entry_price"] for r in opens}
+            prevs = {r["tid"]: r["last_price"] for r in opens}
+            prices.update(fetch_dex_prices(
+                missing, entries=entries, prevs=prevs, now=ts,
+            ))
         n_entries = consider_entries(candidates, prices, ts) if candidates else 0
         marks = mark_open(prices, ts)
         return {"entries": n_entries, **marks}

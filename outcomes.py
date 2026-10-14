@@ -133,9 +133,37 @@ def _connect() -> sqlite3.Connection:
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     _conn = sqlite3.connect(path, check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
     _conn.row_factory = sqlite3.Row
+    _enable_wal(_conn)
     _init_schema(_conn)
     _conn_path = path
     return _conn
+
+
+OPS_BUSY_TIMEOUT_SEC = 0.05
+
+
+def _enable_wal(db: sqlite3.Connection) -> None:
+    """WAL + synchronous=NORMAL. Idempotent. Own commit (SQLite auto-commits PRAGMA)."""
+    try:
+        db.commit()
+    except Exception:
+        pass
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+
+
+def readonly_connect(timeout: float | None = None) -> sqlite3.Connection:
+    """Ops readers: mode=ro, short busy timeout. Creates the file if missing."""
+    path = db_path()
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if not pathlib.Path(path).exists():
+        _connect()
+    uri = f"file:{path}?mode=ro"
+    busy = OPS_BUSY_TIMEOUT_SEC if timeout is None else float(timeout)
+    conn = sqlite3.connect(uri, uri=True, timeout=busy)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    return conn
 
 
 def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
@@ -216,6 +244,7 @@ def _init_schema(db: sqlite3.Connection) -> None:
     except Exception:
         pass
     _schema_step(db, "load_pacing", lambda: _load_pacing(db))
+    _schema_step(db, "wal", lambda: _enable_wal(db))
 
 
 def _ensure_fetch_job_priority(db: sqlite3.Connection) -> None:

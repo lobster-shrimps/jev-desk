@@ -476,28 +476,31 @@ def _outcomes(now: float) -> dict:
             payload["paused"] = bool(outcomes.cycle_gt_paused(now))
         except Exception as e:
             log.warning("ops summary outcomes pause: %s", safe_err(e))
-        db = outcomes._connect()
-        for status, pri, n in db.execute(
-            """SELECT status, COALESCE(priority, 0), COUNT(*)
-               FROM fetch_jobs GROUP BY 1, 2"""
-        ):
-            n = int(n or 0)
-            if status == "complete":
-                payload["complete"] += n
-            elif status == "dead":
-                payload["dead"] += n
-            elif status == "pending":
-                if int(pri or 0) >= 1:
-                    payload["pending_backfill"] += n
-                else:
-                    payload["pending_live"] += n
-        row = db.execute(
-            """SELECT COUNT(*) FROM fetch_jobs
-               WHERE status = 'complete' AND last_attempt IS NOT NULL
-                 AND last_attempt >= ?""",
-            (now - 86400,),
-        ).fetchone()
-        payload["complete_24h"] = int(row[0] or 0) if row else 0
+        db = outcomes.readonly_connect()
+        try:
+            for status, pri, n in db.execute(
+                """SELECT status, COALESCE(priority, 0), COUNT(*)
+                   FROM fetch_jobs GROUP BY 1, 2"""
+            ):
+                n = int(n or 0)
+                if status == "complete":
+                    payload["complete"] += n
+                elif status == "dead":
+                    payload["dead"] += n
+                elif status == "pending":
+                    if int(pri or 0) >= 1:
+                        payload["pending_backfill"] += n
+                    else:
+                        payload["pending_live"] += n
+            row = db.execute(
+                """SELECT COUNT(*) FROM fetch_jobs
+                   WHERE status = 'complete' AND last_attempt IS NOT NULL
+                     AND last_attempt >= ?""",
+                (now - 86400,),
+            ).fetchone()
+            payload["complete_24h"] = int(row[0] or 0) if row else 0
+        finally:
+            db.close()
     except Exception as e:
         log.warning("ops summary outcomes: %s", safe_err(e))
     return payload

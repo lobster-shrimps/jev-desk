@@ -256,11 +256,11 @@ def _price_of(mark) -> float | None:
     if isinstance(mark, dict):
         for key in ("price_usd", "price", "priceUsd"):
             px = _num(mark.get(key))
-            if px is not None and px > 0:
+            if px is not None and px >= 0:
                 return px
         return None
     px = _num(mark)
-    return px if px is not None and px > 0 else None
+    return px if px is not None and px >= 0 else None
 
 
 def _row_dict(row: sqlite3.Row) -> dict:
@@ -358,8 +358,13 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
             if not rule:
                 continue
             tid = row["tid"]
-            px = _price_of(prices.get(tid))
+            import price_guard
             entry_price = float(row["entry_price"])
+            last_px = _num(row["last_price"], None) or entry_price
+            px = price_guard.accept_price(
+                _price_of(prices.get(tid)),
+                entry=entry_price, prev=last_px, tid=tid, now=ts,
+            )
             peak = _num(row["peak"], entry_price) or entry_price
             peak_ts = _num(row["peak_ts"], row["entry_ts"]) or float(row["entry_ts"])
             time_to_peak = _num(row["time_to_peak_sec"], 0.0) or 0.0

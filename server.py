@@ -5,9 +5,17 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
     uvicorn server:app --host 0.0.0.0 --port 8080
     cloudflared tunnel --url http://localhost:8080
 
+Every /ops and /api handler that touches SQLite or files is a plain `def` so
+Starlette runs it in a threadpool. That keeps POST /judge (async, same process)
+from stalling when outcomes.db is busy. Optional split if you want a hard wall:
+
+    uvicorn judge:app --host 127.0.0.1 --port 8081
+    # desk JUDGE_URL=http://127.0.0.1:8081/judge  (or the tunnel to 8081)
+    # keep this process on 8080 for /ops /book /api
+
   POST /judge          the judge (see judge.py)
   GET  /book/held      {"held": {...}|null}
-  POST /book/release   RISK calls this the moment a close is filled. Nothing else does.
+    POST /book/release   RISK calls this the moment a close is filled. Nothing else does.
   GET  /ops            ops panel HTML
   GET  /ops/summary    read-only desk aggregate (cached 30s)
   GET  /ops/briefing   last-24h briefing + 7-day trends
@@ -52,13 +60,13 @@ def _auth(authorization: str):
 
 
 @router.get("/held")
-async def held(authorization: str = Header("")):
+def held(authorization: str = Header("")):
     _auth(authorization)
     return {"held": book.held()}
 
 
 @router.post("/release")
-async def release(authorization: str = Header("")):
+def release(authorization: str = Header("")):
     """RISK only. The seat that closed the position is the seat that frees the book."""
     _auth(authorization)
     was = book.held()
@@ -70,7 +78,7 @@ app.include_router(router)
 
 
 @app.get("/ops", response_class=HTMLResponse)
-async def ops_panel():
+def ops_panel():
     """Serve the ops panel HTML."""
     html_path = HERE / "ops.html"
     if not html_path.exists():
@@ -79,7 +87,7 @@ async def ops_panel():
 
 
 @app.get("/ops/summary")
-async def ops_summary():
+def ops_summary():
     """Read-only desk aggregate. Cached 30s. Fail open. Local-only (127.0.0.1)."""
     try:
         import ops_summary as _ops_summary
@@ -127,7 +135,7 @@ async def ops_summary():
 
 
 @app.get("/ops/briefing")
-async def ops_briefing(compact: int = 0):
+def ops_briefing(compact: int = 0):
     """Last-24h morning briefing plus 7-day trends. Local-only (bind 127.0.0.1).
 
     ?compact=1 returns date_local / generated_at_iso / markdown / morning only.
@@ -154,7 +162,7 @@ async def ops_briefing(compact: int = 0):
 
 
 @app.get("/ops/young_trail")
-async def ops_young_trail():
+def ops_young_trail():
     """Paper young-trail ledger. Simulated; no live orders. Fail open."""
     try:
         import young_trail
@@ -176,7 +184,7 @@ async def ops_young_trail():
 
 
 @app.get("/ops/young_trail_fast")
-async def ops_young_trail_fast():
+def ops_young_trail_fast():
     """Paper 60s-mark young_trail_fast vs per-cycle. Simulated; no live orders."""
     try:
         import young_trail_fast
@@ -205,7 +213,7 @@ async def ops_young_trail_fast():
 
 
 @app.get("/ops/young_trail_helius")
-async def ops_young_trail_helius():
+def ops_young_trail_helius():
     """Paper Helius rug-signal ledger vs fast and per-cycle. No live orders."""
     try:
         import young_trail_helius
@@ -232,7 +240,7 @@ async def ops_young_trail_helius():
 
 
 @app.get("/ops/young_trail_variants")
-async def ops_young_trail_variants():
+def ops_young_trail_variants():
     """Paper exit-variant ranking on the same young_trail marks. Fail open."""
     try:
         import young_trail_variants
@@ -253,7 +261,7 @@ async def ops_young_trail_variants():
 
 
 @app.get("/ops/research/query")
-async def ops_research_query(sql: str = ""):
+def ops_research_query(sql: str = ""):
     """Read-only SELECT on research.db. Local-only (bind 127.0.0.1). Limit 500."""
     try:
         import research
@@ -269,7 +277,7 @@ async def ops_research_query(sql: str = ""):
 
 
 @app.get("/ops/research/report")
-async def ops_research_report(kind: str = "features"):
+def ops_research_report(kind: str = "features"):
     """Canned rugs|runners|features. Local-only. Fail open."""
     try:
         import research
@@ -282,7 +290,7 @@ async def ops_research_report(kind: str = "features"):
 
 
 @app.get("/ops/backtest")
-async def ops_backtest():
+def ops_backtest():
     """Latest weekly signal backtest JSON. Local-only (bind 127.0.0.1). Fail open."""
     try:
         import backtest_signals
@@ -311,7 +319,7 @@ async def ops_backtest():
 
 
 @app.get("/api/state")
-async def api_state():
+def api_state():
     """Serve outbox/state.json for the ops panel."""
     state_path = _outbox() / "state.json"
     if not state_path.exists():
@@ -320,7 +328,7 @@ async def api_state():
 
 
 @app.get("/api/shadow_ledger")
-async def api_shadow_ledger():
+def api_shadow_ledger():
     """
     Return shadow PnL ledger: open positions, closed positions, summary.
     All data is hypothetical and labeled as such.
@@ -333,7 +341,7 @@ async def api_shadow_ledger():
 
 
 @app.get("/api/fomo_status")
-async def api_fomo_status():
+def api_fomo_status():
     """
     Return FOMO health status. NEVER returns the bearer token itself.
     Safe for ops panel display.
@@ -356,7 +364,7 @@ async def api_fomo_status():
 
 
 @app.post("/api/fomo_activate")
-async def api_fomo_activate(x_ops_action: str = Header(None, alias="X-Ops-Action")):
+def api_fomo_activate(x_ops_action: str = Header(None, alias="X-Ops-Action")):
     """
     Activate the fomo.family tab in the CDP Chrome instance.
     Requires X-Ops-Action header to prevent cross-site requests.

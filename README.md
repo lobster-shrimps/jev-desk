@@ -185,6 +185,17 @@ On the Mac the two long-running processes are launchd agents (labels from
 | `com.robbrown.jevdesk.desk` | `run.py` | 15-minute shift: universe, FOMO, kills, judge, paper ledgers, research snapshots |
 | `com.robbrown.jevdesk.ops` | `uvicorn server:app` | Judge, `/book/*`, `/ops` page and JSON, `/api/state` |
 
+`/ops` and `/api` handlers are plain `def` (Starlette threadpool) so SQLite/file work cannot stall `POST /judge` on the event loop. `outcomes.db` is WAL + `synchronous=NORMAL`. Ops readers open `mode=ro` with a short busy timeout and fall back to cached/partial JSON.
+
+To serve the judge from its own process (optional; plists live on the Mac, not in this repo), point the desk at that port and leave `/ops` on 8080:
+
+```bash
+# extra launchd wrapper / one-shot
+uvicorn judge:app --host 127.0.0.1 --port 8081
+export JUDGE_URL="http://127.0.0.1:8081/judge"   # desk + bots; tunnel 8081 if seats are remote
+# keep com.robbrown.jevdesk.ops on 8080 for /ops /book /api
+```
+
 `GET /ops/summary` runs `launchctl list` only. It never kickstarts or unloads anything.
 
 ```bash
@@ -1083,7 +1094,7 @@ ERROR:main.py:malformed question set, stopping cycle: 422 Client Error
 
 On the Mac these are the two launchd agents (see Launchd above). Keep them loaded:
 
-- **`com.robbrown.jevdesk.ops`** — `uvicorn server:app` on 8080: `/judge`, `/book/*`, `/ops`, `/api/*`
+- **`com.robbrown.jevdesk.ops`** — `uvicorn server:app` on 8080: `/judge`, `/book/*`, `/ops`, `/api/*`. `/ops`+`/api` are sync (threadpool). Optional: `uvicorn judge:app` on 8081 and `JUDGE_URL=http://127.0.0.1:8081/judge` so ops SQLite can never share the process.
 - **`com.robbrown.jevdesk.desk`** — `run.py` 15-minute shift. Writes PID to `outbox/run.pid` when daemonized
 - **FomoDesk Chrome** — dedicated profile, `--remote-debugging-port=9222`, `fomo.family` tab logged in (not needed if `FOMO_BEARER` is set)
 - **cloudflared tunnel** (optional) — only if seats run remotely and need to reach the local judge
