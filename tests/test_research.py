@@ -646,12 +646,12 @@ def test_sqlite_connections_are_per_thread(rs):
         src = (ROOT / name).read_text()
         assert "check_same_thread=False" not in src, name
 
-    seen: dict[str, int] = {}
+    seen: dict[str, object] = {}
     errors: list[BaseException] = []
 
     def worker(mod, key):
         try:
-            seen[key] = id(mod._connect())
+            seen[key] = mod._connect()  # keep alive: id() reuse after GC
         except BaseException as e:
             errors.append(e)
 
@@ -665,7 +665,7 @@ def test_sqlite_connections_are_per_thread(rs):
         t.start()
         t.join()
         assert errors == []
-        assert seen[key] != id(mod._connect()), key
+        assert seen[key] is not mod._connect(), key
 
 
 def test_backfill_streams_gzip_logs_not_whole_read(rs, tmp_path, monkeypatch):
