@@ -20,78 +20,61 @@ Then the order goes to the Grok Bot seats: SIZE -> FILLS -> RISK, with CHIEF log
 This is the guide author's setup, not a strategy. Every threshold in `thresholds.py` is
 theirs, tuned to their launches, bank and risk tolerance. The desk trades brand-new
 memecoin launches, which is about as high-risk as trading gets, and the guide itself
-carries a referral link and unverifiable performance claims. Run it in shadow mode for a
-week, read the rows where you disagree, move the numbers, and only then consider
-`--live`. Nothing here is financial advice.
+carries a referral link and unverifiable performance claims. A week of paper data so far
+shows no profitable entry rule. Stay in shadow, keep collecting, and only consider
+`--live` after a rule actually pays. Nothing here is financial advice.
 
 ## Project state
 
-Shadow-first and unproven. The funnel runs end to end, but only against faked collectors
-and a mock judge. Nothing in this repo has been validated against a live market.
+The funnel runs on the live Mac under two launchd jobs (desk + ops). Default mode is
+still shadow: scan, judge, pick, and log — no `book.take`, no live orders unless
+`CONFIRM_LIVE=yes` and `--live`. Paper ledgers (`young_trail` and its variants, the 60s
+fast ledger, and the Helius rug-signal ledger) sit beside the desk and do not change
+thresholds, pick, filter, or trade logic.
 
-What the 16 tests cover (`python -m pytest -q`, no network, no key):
+**Current finding:** a week of paper data shows no profitable entry rule yet. Treat
+`thresholds.py` as the guide author's starting point, not a validated edge. Keep
+collecting research.db / outcomes / young_trail rows; do not promote a rule from one
+quiet week.
 
-- kill ordering and reason strings for all four filter stages
-- wire shape of the `market`, `solana`, `bsc` and `robinhood` question sets
-- `pick`: one option per candidate, both gates at their inclusive limit, declines below
-  either gate, declines on an off-list choice, declines on no survivors, `NO_SOCIAL_CUT`
-- a malformed question set raising instead of retrying
-- book invariants: one position at a time, release, reasoned bench
-- two full cycles: shadow never takes the book, and a held position skips the scan. The
-  cycle fixture is mixed on purpose so each stage kills something, and the test asserts
-  every token is accounted for exactly once across bench, the three named kill stages and
-  the judge.
-- `collect.normalise` and `collect.clean_handle`
+The pytest suite is offline and keyless (`python -m pytest -q`). CI runs it on every
+push and pull request across Python 3.10 through 3.14. Dependencies are pinned.
 
-What is not covered:
-
-- **Every network path.** `universe`, `shortlist`, `trade_counts` and `dossier` are
-  monkeypatched in the cycle tests. `fomo_api.py` — CDP, Privy extraction, refresh — has
-  no coverage at all, and the FOMO `filterTokens` envelope is undocumented and unverified.
-- **The real judge.** `judge.py` and `server.py` never run under test, so `DESK_SECRET`
-  auth and `/book/release` are unproven. `mock_judge.py` stands in everywhere.
-- **The `social` question set.** `FakeDesk.read_x` returns `None`, so the social branch in
-  `run_once` is never entered and every test token carries the `NO_SOCIAL_CUT`.
-- **Live mode.** Every cycle test passes `shadow=True` or exercises the held path, so the
-  `book.take(order)` at the end of `run_once` is never reached.
-- **Base.** `CHAIN_SET` routes net 8453 to the `bsc` set deliberately, but the fixtures are
-  Solana only, so that routing is untested.
-- **`desk.py` entirely** — bank, Telegram, seat handoff — and `run.py`'s flags.
-
-A note on the `pick` tests: `mock_judge` is deterministic, and for the three-candidate
-fixture its `worth_trading_at_all` lands at 0.584 against a `PICK_MIN_WORTH` of 0.60. Any
-test that drives `pick` through the mock therefore only ever sees `None`. The gate tests
-feed both gate values in through a stub instead, and read their limits from
-`thresholds.py`, so retuning a threshold moves the tests with it.
-
-CI runs the suite on every push and pull request across Python 3.10 through 3.14, so the
-version floor above is checked rather than claimed. Dependencies are pinned, so a green
-run a month from now means the same thing it means today.
-
-Still outstanding: every number in `thresholds.py` is the guide author's rather than
-yours.
+Still true: every number in `thresholds.py` is the guide author's rather than yours.
 
 ## Files
 
 | file | seat | what it does |
 |---|---|---|
 | `judge.py` | JUDGE | FastAPI service. Holds the only TypeSafe key. Answers typed questions, decides nothing. |
-| `server.py` | JUDGE | `judge.py` plus `/book/held` and `/book/release` for RISK. Run this one with uvicorn. |
+| `server.py` | JUDGE / OPS | `judge.py` plus `/book/*`, the `/ops` page, and the read-only `/ops/*` JSON. |
+| `ops.html` | OPS | Desk page. No external URLs. Loads `/ops/summary`, briefing, paper ledgers, research. |
+| `ops_summary.py` | OPS | Cached `/ops/summary` aggregate. `launchctl list` only (never kickstart). |
 | `questions.py` | — | Every question the desk can ask. The one file you will reread. |
 | `collect.py` | SCAN, VET | GeckoTerminal universe, FOMO shortlist, DexScreener trade counts, dossier, Solana RPC. |
-| `fomo_api.py` | SCAN | FOMO client. Pulls the Privy bearer out of your logged-in Chrome over CDP. |
+| `fomo_api.py` | SCAN | FOMO client. Pulls the Privy bearer out of the FomoDesk Chrome profile over CDP. |
 | `thresholds.py` | — | Every number. Retune here and nowhere else. |
 | `filter.py` | — | The kills, in cost order: free -> trade -> chain -> soft. |
 | `pick.py` | CHIEF | One Choice over the survivors plus the `worth_trading_at_all` gate. |
 | `book.py` | — | SQLite: one open position, reasoned bench. RISK is the only caller of `release()`. |
 | `main.py` | SHIFT | `run_once` and the 15-minute loop. `shadow=True` by default. |
-| `desk.py` | — | The Grok Bot side seen from Python: bank, SOCIAL read, shadow log, Telegram, seat handoff. |
+| `desk.py` | — | Bank, X read, shadow log, Telegram, seat handoff. |
 | `run.py` | — | Entrypoint. `--once`, `--live`, `--mock-judge`, `--bench`. |
+| `x_lookup.py` | SOCIAL | Keyless fxtwitter lookup when `SOCIAL_URL` is unset. Capped per cycle. |
+| `coinalyze.py` | OPS | Log-only market mood. Never feeds filter, pick, or thresholds. |
+| `outcomes.py` | research | 6h path drain into `outcomes.db`. CoinGecko Demo / free GeckoTerminal. |
+| `gt_api.py` | research | Onchain helper: free GT, Demo, Pro. Demo monthly cap 9000. |
+| `research.py` | research | `research.db` snapshots, 60s marks, labels, CLI, backfill. |
+| `cycle_history.py` | OPS | Cycle store + morning briefing (`/ops/briefing`). |
+| `young_trail.py` | paper | $50 paper ledger on free-passers younger than 60 min. |
+| `young_trail_variants.py` | paper | Exit-rule replay on the same per-cycle marks. |
+| `young_trail_fast.py` | paper | Same entries, baseline + `tp_50`, evaluated on 60s Dex marks. |
+| `young_trail_helius.py` | paper | Solana rug-signal paper exits from budgeted Helius RPC. |
 | `judge_client.py` | bots | Six lines. The only place a bot touches the network for a judgement. |
 | `mock_judge.py` | — | Keyless stand-in for Jev so the funnel can be tested. Never trade against it. |
 | `prompts/` | bots | Paste-ready prompts: HANDOFF, SOCIAL, CHIEF, SIZE, FILLS, RISK. |
-| `tests/` | — | `python -m pytest -q`: filter order, question wire shape, pick gating, book, a full faked cycle. |
-| `requirements.in` | — | The five direct dependencies. Edit this one. |
+| `tests/` | — | `python -m pytest -q`. No network, no keys. |
+| `requirements.in` | — | Direct dependencies. Edit this one. |
 | `requirements.txt` | — | Compiled lock, fully pinned. Install this one. Never hand-edit. |
 
 ## Setup
@@ -100,7 +83,7 @@ yours.
 python3 -m venv .venv && source .venv/bin/activate      # python 3.10+
 pip install -r requirements.txt
 cp .env.example .env                                     # fill it in, then: set -a; source .env; set +a
-python -m pytest -q                                      # should print "16 passed" — no keys needed
+python -m pytest -q                                      # full suite, no keys needed
 ```
 
 Always run tools as `python -m <tool>` rather than the bare executable. A bare `pytest`
@@ -162,27 +145,70 @@ curl -X POST $JUDGE_URL -H "Authorization: Bearer $DESK_SECRET" -H "Content-Type
 `answers.shape.choice` must be one of your options, probabilities must sum to ~1, and
 `model` must be a version string, not an alias. If any of the three is off, stop there.
 
-### 2. FOMO session
+### 2. FomoDesk Chrome token flow
 
-Launch the Chrome profile you use for FOMO with remote debugging and leave a
-`fomo.family` tab open:
+FOMO has no public API. The desk uses your own logged-in session.
+
+Use a **dedicated Chrome profile** (FomoDesk) started with remote debugging, and leave a
+`fomo.family` tab open in **that** window — not your everyday Chrome:
 
 ```bash
-open -a "Google Chrome" --args --remote-debugging-port=9222      # mac
+# mac — dedicated user-data-dir, CDP on 9222
+open -na "Google Chrome" --args --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/FomoDesk"
 ```
 
-`fomo_api.Fomo.token()` reads the Privy token out of that tab's localStorage and
-refreshes it before every cycle (it dies roughly hourly; that is normal). If you would
-rather not expose CDP, paste the token into `FOMO_BEARER` instead; it will expire in an
-hour and the desk will tell you.
+Stay logged in there. Each cycle `Fomo.token()` connects to `CDP_URL` (default
+`http://127.0.0.1:9222`), finds the `fomo.family` tab, and reads the Privy access token
+from `localStorage` (`privy:token` or `privy:access_token`). The token dies roughly
+hourly; the desk refreshes it on its own. Never log or print the bearer.
 
-The FOMO `filterTokens` response envelope is undocumented. `fomo_api._row` maps the field
-names the guide lists (`marketCap, liquidity, volume24, holders, priceUSD, change5m..change24,
-createdAt`) and tolerates a list or a dict envelope. If your first `--once` run logs
-"malformed row" for every token, print one raw row and adjust `_row`; nothing downstream
-needs to change.
+`/ops` has **Fix FOMO Login** (`POST /api/fomo_activate` with header
+`X-Ops-Action: activate-fomo`). That brings the FomoDesk tab to the front, or opens
+`fomo.family` in that CDP Chrome if no tab exists. Log in in **that** window.
 
-### 3. The shift
+If you would rather not expose CDP, set `FOMO_BEARER` yourself. It still expires in about
+an hour.
+
+The FOMO `filterTokens` envelope is undocumented. `fomo_api._row` maps the field names
+the guide lists and tolerates a list or a dict envelope. If `--once` logs "malformed row"
+for every token, print one raw row and adjust `_row`.
+
+### 3. Launchd services
+
+On the Mac the two long-running processes are launchd agents (labels from
+`ops_summary.py`). Plists live on the operator machine under
+`~/Library/LaunchAgents/`, not in this repo.
+
+| label | process | what it does |
+|---|---|---|
+| `com.robbrown.jevdesk.desk` | `run.py` | 15-minute shift: universe, FOMO, kills, judge, paper ledgers, research snapshots |
+| `com.robbrown.jevdesk.ops` | `uvicorn server:app` | Judge, `/book/*`, `/ops` page and JSON, `/api/state` |
+
+`GET /ops/summary` runs `launchctl list` only. It never kickstarts or unloads anything.
+
+```bash
+# status
+launchctl list | grep jevdesk
+
+# restart one or both (gui domain, current user)
+launchctl kickstart -k "gui/$(id -u)/com.robbrown.jevdesk.desk"
+launchctl kickstart -k "gui/$(id -u)/com.robbrown.jevdesk.ops"
+```
+
+If kickstart is unavailable, bootout then bootstrap the plist:
+
+```bash
+UID=$(id -u)
+launchctl bootout "gui/$UID/com.robbrown.jevdesk.desk"
+launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/com.robbrown.jevdesk.desk.plist"
+```
+
+Start both from the same repo root (or set `DESK_DB` / `DESK_OUTBOX` to absolute paths)
+so the book and outbox stay shared. After a restart, wait one cycle for
+`outbox/state.json` and confirm `/ops` shows both PIDs.
+
+### 4. The shift
 
 ```bash
 export JUDGE_URL="https://<tunnel>/judge" DESK_SECRET="..." BANK_USD=1000
@@ -200,7 +226,7 @@ disagree. That is where your thresholds come from.
 CONFIRM_LIVE=yes python run.py --live      # after the shadow week, not before
 ```
 
-### 4. The Grok Bot seats
+### 5. The Grok Bot seats
 
 Paste `prompts/HANDOFF.txt` above the prompt of every seat that makes a judgement
 (SCAN, VET, SOCIAL, CHIEF), then the seat's own file. SIZE, FILLS and RISK get no judge
@@ -210,8 +236,8 @@ skill; skills are shared across every bot on the desk.
 Two integration points on the Python side, both optional:
 
 - `SOCIAL_URL`: an endpoint your SOCIAL bot serves. `POST {"x_handle": "..."}` returns
-  the X block from `prompts/SOCIAL.txt`. Unset means no social read; the token carries
-  the gap and `NO_SOCIAL_CUT` (0.60) shrinks the ticket.
+  the X block from `prompts/SOCIAL.txt`. Unset: in-desk `x_lookup` (fxtwitter). Failure
+  still applies `NO_SOCIAL_CUT` (0.60).
 - `SEATS_WEBHOOK_URL`: CHIEF's inbox. A finished order is POSTed there. Unset means it is
   written to `outbox/orders/` for you to hand over.
 
@@ -230,9 +256,24 @@ python run.py --once --mock-judge                # funnel end to end, still need
 
 ## Budget
 
-GeckoTerminal allows 10 calls/min: six list fresh pools (3 chains x 2 pages), three are
-left for dossiers per cycle. Want more dossiers, set `universe(pages=1)` and get six.
-Jev is $0.042/Mtok in, output free: roughly ten calls of ~1,400 tokens per cycle, 96
+**Desk GeckoTerminal (free):** about 10 calls/min historically; the live desk paces closer
+to 5/min so outcomes can share the pipe. Six list fresh pools (3 chains × 2 pages), a
+few left for dossiers. `universe(pages=1)` frees slots if 429s persist.
+
+**Outcomes CoinGecko Demo:** set `COINGECKO_API_KEY` (name only — never log the value)
+and `COINGECKO_PLAN=demo`. Hard cap **9000 calls/month**, split across remaining days.
+In-window spacing is 2s. When the month or today's share is gone, outcomes fall back to
+free GeckoTerminal. Demo is outcomes/backtest only, not the live universe scan.
+
+**Outcomes free GeckoTerminal:** ~7s spacing in the bulk window; daytime trickle
+(`OUTCOMES_TRICKLE_SEC`, default 20s) outside `OUTCOMES_WINDOW` (default 01:00–06:00
+local).
+
+**Helius / Solana RPC:** `SOLANA_RPC_URL` (name only — never log the value). Desk
+dossiers and the paper Helius ledger share it. The paper ledger caps calls per 60s tick
+and per UTC day (defaults 12 / 3000). Errors go through `safe_err`.
+
+**Jev:** $0.042/Mtok in, output free: roughly ten calls of ~1,400 tokens per cycle, 96
 cycles a day, about six cents a day.
 
 ## Failure handling
@@ -267,12 +308,12 @@ The desk connects to these external services:
 - Required for: Shadow mode and live trading
 - Failure: Cycle stops. 401/403 triggers automatic refresh from Chrome
 
-**Chrome CDP / Privy session** — required only if no FOMO_BEARER
-- Purpose: Extracts live Privy bearer token from logged-in Chrome profile's localStorage
-- Connection: `CDP_URL` (default 127.0.0.1:9222) to Chrome remote debugging port
+**FomoDesk Chrome CDP / Privy session** — required only if no `FOMO_BEARER`
+- Purpose: Reads the Privy bearer from the dedicated FomoDesk profile's `fomo.family` tab
+- Connection: `CDP_URL` (default `http://127.0.0.1:9222`)
 - Required for: FOMO access when `FOMO_BEARER` is not set
-- Failure: FOMO becomes unreachable
-- Note: If using `scripts/launch-fomo-chrome.sh`, this script starts Chrome with the correct profile and debugging port
+- Failure: FOMO becomes unreachable; `/ops` **Fix FOMO Login** activates or opens the tab
+- Never log the bearer or the RPC URL
 
 **GeckoTerminal api.geckoterminal.com** — required
 - Purpose: Universe scan (new_pools) and detailed dossiers (token info, pool data, social handles)
@@ -286,11 +327,21 @@ The desk connects to these external services:
 - Required for: trade_kill stage
 - Failure: 429 means lower `DEX_BUDGET` in main.py
 
-**Solana mainnet RPC api.mainnet-beta.solana.com** — conditional
-- Purpose: Fetches on-chain concentration data (top holder percentages) for Solana tokens
-- Connection: HTTPS JSON-RPC, no auth
-- Required for: Solana dossiers only (not BSC/Base/Robinhood)
-- Failure: Dossier throws, token benched as `dossier_failed`
+**Solana RPC via `SOLANA_RPC_URL`** — conditional
+- Purpose: Top-wallet concentration for Solana dossiers; paper Helius rug-signal checks
+- Connection: HTTPS JSON-RPC. Set the env var name only; never log or print the value
+- Required for: Solana dossiers (not BSC/Base/Robinhood). Paper Helius ledger is optional
+- Failure: Dossier throws, token benched as `dossier_failed`. Paper Helius fails open
+
+**CoinGecko onchain (`COINGECKO_API_KEY`)** — optional, outcomes only on Demo
+- Purpose: 6h OHLCV for `outcomes.db` (same payload shape as GeckoTerminal)
+- Connection: Demo or Pro header. Never log the key
+- Failure: Fall back to free GeckoTerminal. Demo stops the key at 9000 calls/month
+
+**Coinalyze (`COINALYZE_API_KEY`)** — optional, log-only
+- Purpose: Market-mood tag on `/ops` and the briefing
+- Connection: Never log the key. Missing key skips the fetch; the cycle continues
+- Failure: One INFO line; never feeds filter, pick, or thresholds
 
 **TypeSafe judge via local uvicorn** — required
 - Purpose: AI judgement calls for market/chain/social question sets
@@ -310,11 +361,10 @@ The desk connects to these external services:
 - Required for: Remote Grok Bot seats (not needed if bots run on same machine)
 - Failure: Bots cannot reach judge
 
-**SOCIAL_URL** — optional X/Twitter seat
-- Purpose: SOCIAL bot endpoint that scrapes X profile data for social question set
-- Connection: `POST {"x_handle": "..."}` returns X block (followers, verified, age, bio)
-- Required for: social question set (adds ~0.10 to ticket sizing when present)
-- Failure: Unset or unreachable means `NO_SOCIAL_CUT` applied (0.60 size factor)
+**SOCIAL_URL / in-desk X lookup** — optional bot, else keyless fxtwitter
+- Purpose: X profile block for the social question set
+- Connection: `POST {"x_handle": "..."}` if `SOCIAL_URL` is set; otherwise `x_lookup.py`
+- Failure: Unset or error means `NO_SOCIAL_CUT` (0.60 size factor)
 
 **SEATS_WEBHOOK_URL** — optional live seat handoff
 - Purpose: CHIEF's inbox for finished orders
@@ -328,30 +378,143 @@ The desk connects to these external services:
 - Required for: Operator notifications
 - Failure: Silently skipped if not configured
 
-Environment variable reference: `BANK_USD`, `DESK_SECRET`, `JUDGE_URL`, `TYPESAFE_API_KEY`, `FOMO_BEARER`, `CDP_URL`, `SOCIAL_URL`, `SEATS_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DESK_DB`, `JUDGE_MOCK`, `CONFIRM_LIVE`
+Environment variable **names** (never commit or log values): `BANK_USD`, `DESK_SECRET`,
+`JUDGE_URL`, `TYPESAFE_API_KEY`, `FOMO_BEARER`, `CDP_URL`, `SOCIAL_URL`,
+`SEATS_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DESK_DB`, `DESK_OUTBOX`,
+`JUDGE_MOCK`, `CONFIRM_LIVE`, `SOLANA_RPC_URL`, `COINALYZE_API_KEY`, `COINGECKO_API_KEY`,
+`COINGECKO_PLAN`, `OUTCOMES_WINDOW`, `OUTCOMES_TRICKLE_SEC`, `X_LOOKUPS_PER_CYCLE`,
+`X_LOOKUP_BUDGET_SEC`.
 
 ## Ops panel
 
-A minimal ops panel provides visibility into the running desk with real cycle data only.
+`GET /ops` serves `ops.html` (no external URLs, no secrets in payloads). The page is the
+redesigned desk: health, young_trail curve, paper ledgers, rugs-vs-runners, a read-only
+SQL box, outcomes drain, API budget, Coinalyze mood, morning briefing, and the local
+FOMO activate control. `GET /ops/summary` is cached 30s; every section fails open via
+`safe_err`. Bind the ops process to localhost.
 
-**Start the judge and open the panel:**
+| endpoint | what |
+|---|---|
+| `GET /ops` | Desk HTML |
+| `GET /ops/summary` | Read-only aggregate (30s cache): launchd PIDs, cycle health, judge-hi, outcomes drain, budget, Coinalyze, young_trail curve |
+| `GET /ops/briefing` | Last-24h briefing + 7-day trends |
+| `GET /ops/briefing?compact=1` | `date_local`, `generated_at_iso`, markdown, morning only (small) |
+| `GET /ops/young_trail` | Paper young_trail ledger (simulated, no live orders) |
+| `GET /ops/young_trail_variants` | Exit-variant ranking on the same per-cycle marks |
+| `GET /ops/young_trail_fast` | 60s-mark ledger vs per-cycle, same entries |
+| `GET /ops/young_trail_helius` | Helius rug-signal paper ledger vs fast vs per-cycle |
+| `GET /ops/research/query?sql=` | Read-only `SELECT` on `research.db` (limit 500) |
+| `GET /ops/research/report?kind=` | Canned `rugs` / `runners` / `features` |
+| `GET /ops/backtest` | Latest weekly signal-backtest JSON |
+| `GET /api/state` | `outbox/state.json` |
+| `GET /api/shadow_ledger` | Hypothetical shadow PnL |
+| `GET /api/fomo_status` | Bearer present / CDP reachable — never the token |
+| `POST /api/fomo_activate` | Bring the FomoDesk `fomo.family` tab forward |
+
+Empty states: if `/ops` says no `state.json` yet, wait for a cycle. The page never
+invents demo tokens.
+
+## young_trail paper test
+
+Paper only. A token that free-passes with `age_minutes < 60` is bought once (first tid)
+at a $50 ticket. Marks use DexScreener, never GeckoTerminal. Does not change
+`young_trail` live rules from the cycle's point of view, and does not change
+`thresholds.py`, `pick.py`, `filter.py`, `questions.py`, or `collect.py`. Same experiment
+end as the live week: **2026-10-20 7:38 AM ET**.
+
+**Baseline exits** (whichever first): hard stop −30% from entry, 30% trail from peak
+(price ≤ peak × 0.7), time exit at 6h.
+
+**Per-cycle variants** (`young_trail_variants`, same marks, ~15 min cadence):
+
+| id | lever |
+|---|---|
+| `baseline` | SL −30, trail 30%, 6h |
+| `tp_50` / `tp_100` | take-profit +50% / +100% |
+| `half_50_trail` | sell half at +50%, then trail 30% |
+| `trail_20` / `trail_40` | tighter / wider trail |
+| `sl_20` | tighter stop −20% |
+| `time_1h` / `time_2h` / `time_3h` | earlier time exits |
+| `be_after_30` | breakeven stop after +30% |
+
+**`young_trail_fast`:** copies the same tids and entry prices from deploy onward. Evaluates
+baseline + `tp_50` on every 60s Dex sampler mark (intra-cycle moves the cycle ledger
+misses).
+
+**`young_trail_helius`:** Solana entries only. At entry, snapshots the FOMO creator (if
+already known), top 10 holders, and the LP/pool SOL reserve. On each 60s tick, budgeted
+Helius RPC (`SOLANA_RPC_URL`) checks for a ≥20% dev sell, ≥30% top-3 holder sell, or
+≥25% pool SOL drop. First fire is a paper exit. Signals are joined to `token_labels` /
+`outcomes` for precision, recall, and lead time in minutes.
+
+`/ops` compares helius vs fast vs per-cycle P&L on the same entries.
+
+## research.db
+
+Queryable store at `outbox/research.db` (WAL). Log and analysis only — never called from
+filter, judge, pick, or order paths. No live orders.
+
+| table | contents |
+|---|---|
+| `token_snapshots` | Per-cycle token row: age, price, liq, mcap, vol, buys/sells, holders, top wallet / top10 / dev, X, stage, kill, judge, regime, `origin` |
+| `fast_marks` | 60s DexScreener batch marks (price, liq, fdv, vol) |
+| `token_labels` | First sighting / first free-pass, peak×, horizon returns, `rugged`, `rug_ts`, `runner` |
+| `research_meta` | Small key/value (sampler, vacuum) |
+
+Rows carry `origin='live'` or `origin='backfill:<source>'`. A **rug** is a ≥80% liquidity
+drop from the post-entry peak, or price ≤ 1% of entry. A **runner** peaked at ≥2× before
+any rug.
 
 ```bash
-python run.py              # start the shift (or leave it running)
+python research.py sql "SELECT ticker, peak_x, time_to_rug_min FROM token_labels WHERE rugged=1"
+python research.py report rugs|runners|features
+python research.py backfill              # all available history
+python research.py labels
+python research.py vacuum                # weekly is automatic
 ```
 
-Then visit `http://localhost:8080/ops` in your browser.
+**Backfill** (idempotent) reads cycle_history, rotated `run.log`s, cycle JSON, shadow
+jsonl / shadow_kills, young_trail + variants, outcomes candles, X cache, and Coinalyze.
+Tokens still missing post-sighting prices are queued for the off-peak outcomes fetcher
+(capped). The 60s sampler also drives the paper `young_trail_fast` and
+`young_trail_helius` ledgers on prices it already fetched.
 
-**What it shows:**
-- Last cycle outcome (NO TRADE / SHADOW / ORDER / HOLDING)
-- Seen / benched / judged counts
-- Kill histograms by stage (free/trade/chain/soft) with reason counts
-- Held positions from the book
-- Per-token stage/reason rows (real data only, no demo tokens)
+## Outcomes drain
 
-**Data source:** The desk writes `outbox/state.json` at the end of each cycle. The panel fetches `/api/state` every 20 seconds.
+`outcomes.db` stores 6h OHLCV paths after an entry (or a queued sighting). A background
+worker drains `fetch_jobs`:
 
-**Empty states:** If you see "No state.json yet", wait for a cycle to complete. The panel never invents demo tokens.
+- **Bulk window:** `OUTCOMES_WINDOW` (default 01:00–06:00 local).
+- **Daytime trickle:** one call every `OUTCOMES_TRICKLE_SEC` (default 20s) so the desk
+  keeps most of the free GT budget.
+- **CoinGecko Demo:** `COINGECKO_API_KEY` + `COINGECKO_PLAN=demo`. 9000 calls/month, daily
+  remaining/days_left share, 2s spacing. Cap reached → free GeckoTerminal for the rest of
+  the month.
+- **Free GeckoTerminal:** ~7s in-window spacing; desk scan stays on free GT even when Demo
+  is on.
+- Schema steps are idempotent and commit independently (live-DB safe).
+
+`/ops/summary` shows complete / pending live / pending backfill / dead and whether the
+drain is in-window or trickling.
+
+## Coinalyze market mood
+
+Log-only. Set `COINALYZE_API_KEY` (never log the value). At most once per 15 minutes;
+a missing key, timeout, or 429 skips the fetch and cannot fail a cycle.
+
+Tags (first match wins): `long_flush` (long-liq USD share ≥ 0.70), `risk_on` (majors and
+meme funding > 0 and OI change > 0), `risk_off` (majors funding < 0, or OI down and meme
+funding < 0), else `neutral`. Majors: BTC, SOL, BNB. Memes: WIF, BONK, POPCAT. Shown on
+`/ops` and in the briefing. Never wired into filter, pick, or thresholds.
+
+## X lookup
+
+When `SOCIAL_URL` is unset, `desk.read_x` uses `x_lookup.py` (keyless fxtwitter mirror).
+Fail open: any error is `None` and `NO_SOCIAL_CUT` still applies. Cache is
+`outbox/x_cache.db` (positive ~30 min, negative ~10 min). Caps: `X_LOOKUPS_PER_CYCLE`
+(default 15) and `X_LOOKUP_BUDGET_SEC` (default 60). Only tokens that reached the judge
+step should call it. `x_kind` is `official` or `borrowed` (celebrity / huge / far-older
+account) and is not cached.
 
 ## Trade Decision Logic
 
@@ -580,7 +743,7 @@ graph TB
     N -->|OK| P{Pass chain_kill?}
     P -->|No| J
     P -->|Yes| Q{X handle?}
-    Q -->|Yes| R[SOCIAL_URL<br/>X profile data]
+    Q -->|Yes| R[SOCIAL_URL or x_lookup<br/>X profile data]
     Q -->|No| S[Judge: market + chain sets]
     R --> T[Judge: market + chain + social]
     T --> U{Pass soft_kill?}
@@ -778,12 +941,13 @@ sequenceDiagram
    - Checks: top wallet ≤5% (Solana), top 10 ≤60%, holders ≥80, authority closed (Solana), not honeypot (BSC/Base)
    - **NO TRADE path**: All survivors killed → bench each for 90–100k min (facts bench longest), cycle ends with `chain {honeypot: X, authority_open: Y, ...}` in stats
 
-10. **Social lookup** (optional, `desk.read_x()`)
-    - Condition: `x_handle` exists in dossier AND `SOCIAL_URL` env var set
-    - Endpoint: `POST $SOCIAL_URL` with `{"x_handle": "..."}`
-    - Data: followers, verified, account age, bio (collected by SOCIAL bot's X plugin)
-    - **Failure handling**: HTTP error or timeout → returns `None`, no bench (token not at fault)
-    - **Missing social**: Applies `NO_SOCIAL_CUT = 0.60` size factor in pick/single-survivor order
+10. **Social lookup** (`desk.read_x()`)
+    - Condition: `x_handle` exists in the dossier
+    - If `SOCIAL_URL` is set: `POST` `{"x_handle": "..."}` to the SOCIAL bot
+    - Else: in-desk `x_lookup.read_x` (fxtwitter, no key), capped per cycle
+    - Data: followers, verified, account age, bio, `x_kind` (official vs borrowed)
+    - **Failure handling**: error or timeout → `None`, no bench (token not at fault)
+    - **Missing social**: `NO_SOCIAL_CUT = 0.60` size factor on the order
 
 11. **Judge stage** (`judge_client.judge()`)
     - Endpoint: `POST $JUDGE_URL/judge` with `Authorization: Bearer $DESK_SECRET`
@@ -917,9 +1081,11 @@ ERROR:main.py:malformed question set, stopping cycle: 422 Client Error
 
 ### Always-on sidecars
 
-These processes must run continuously:
+On the Mac these are the two launchd agents (see Launchd above). Keep them loaded:
 
-- **uvicorn server:app** on port 8080 — serves `/judge`, `/book/held`, `/book/release`
-- **Chrome with remote debugging** on port 9222 — if using CDP for FOMO bearer refresh (not needed if `FOMO_BEARER` is set). Launch with `scripts/launch-fomo-chrome.sh` if present.
-- **cloudflared tunnel** (optional) — only if seats run remotely and need to reach local judge
-- **run.py** — the desk itself. Writes PID to `outbox/run.pid` when daemonized.
+- **`com.robbrown.jevdesk.ops`** — `uvicorn server:app` on 8080: `/judge`, `/book/*`, `/ops`, `/api/*`
+- **`com.robbrown.jevdesk.desk`** — `run.py` 15-minute shift. Writes PID to `outbox/run.pid` when daemonized
+- **FomoDesk Chrome** — dedicated profile, `--remote-debugging-port=9222`, `fomo.family` tab logged in (not needed if `FOMO_BEARER` is set)
+- **cloudflared tunnel** (optional) — only if seats run remotely and need to reach the local judge
+
+Restart with `launchctl kickstart -k gui/$(id -u)/com.robbrown.jevdesk.{desk,ops}`.
