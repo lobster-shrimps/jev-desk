@@ -315,16 +315,29 @@ def sync_entries(now: float | None = None) -> int:
     return n
 
 
+def _never_marked_after_entry(row) -> bool:
+    """True when last_mark_ts is still the entry stamp (no post-entry mark)."""
+    entry_ts = _num(row["entry_ts"])
+    last_mark_ts = _num(row["last_mark_ts"])
+    if entry_ts is None or last_mark_ts is None:
+        return True
+    return last_mark_ts <= entry_ts + 1e-9
+
+
 def _close(db: sqlite3.Connection, tid: str, variant: str, exit_ts: float,
            exit_price: float, reason: str, peak: float, peak_ts: float,
-           time_to_peak_sec: float) -> None:
+           time_to_peak_sec: float, *, unmarked: bool = False) -> None:
     entry = db.execute(
         "SELECT entry_price FROM young_trail_fast WHERE tid = ? AND variant = ?",
         (tid, variant),
     ).fetchone()
     if entry is None:
         return
-    pnl = pnl_usd(exit_price, float(entry["entry_price"]))
+    if unmarked:
+        reason = "unmarked"
+        pnl = None
+    else:
+        pnl = pnl_usd(exit_price, float(entry["entry_price"]))
     db.execute(
         """UPDATE young_trail_fast
            SET peak = ?, peak_ts = ?, time_to_peak_sec = ?,
@@ -335,10 +348,16 @@ def _close(db: sqlite3.Connection, tid: str, variant: str, exit_ts: float,
          float(exit_price), float(exit_ts),
          float(exit_ts), float(exit_price), reason, pnl, tid, variant),
     )
-    log.info(
-        "young_trail_fast exit tid=%s variant=%s reason=%s pnl_usd=%.2f paper=1",
-        tid, variant, reason, pnl,
-    )
+    if pnl is None:
+        log.info(
+            "young_trail_fast exit tid=%s variant=%s reason=%s pnl_usd=null paper=1",
+            tid, variant, reason,
+        )
+    else:
+        log.info(
+            "young_trail_fast exit tid=%s variant=%s reason=%s pnl_usd=%.2f paper=1",
+            tid, variant, reason, pnl,
+        )
 
 
 def on_marks(prices: dict | None, now: float | None = None) -> dict:
@@ -384,8 +403,13 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
             peak = float(state.get("peak") or peak)
             if decision:
                 reason, exit_px = decision
+                unmarked = (
+                    reason == "time"
+                    and px is None
+                    and _never_marked_after_entry(row)
+                )
                 _close(db, tid, row["variant"], ts, exit_px, reason,
-                       peak, peak_ts, time_to_peak)
+                       peak, peak_ts, time_to_peak, unmarked=unmarked)
                 closed += 1
                 continue
             if px is None:
@@ -458,9 +482,13 @@ def _variant_summary(variant: str) -> dict:
     try:
         opens = open_rows(variant)
         closes = closed_rows(variant, limit=None)
-        wins = sum(1 for c in closes if (c.get("pnl_usd") or 0) > 0)
-        n = len(closes)
-        realized = sum(c.get("pnl_usd") or 0 for c in closes)
+        counted = [
+            c for c in closes
+            if c.get("exit_reason") != "unmarked" and c.get("pnl_usd") is not None
+        ]
+        wins = sum(1 for c in counted if (c.get("pnl_usd") or 0) > 0)
+        n = len(counted)
+        realized = sum(c.get("pnl_usd") or 0 for c in counted)
         return {
             "variant": variant,
             "open_count": len(opens),

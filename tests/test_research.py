@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -72,6 +73,31 @@ def test_wal_and_schema(rs):
     assert str(mode).lower() == "wal"
     names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"token_snapshots", "fast_marks", "token_labels"} <= names
+
+
+def test_connect_skips_wal_pragma_when_already_wal(rs):
+    first = rs._connect()
+    assert str(first.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+    rs.reset()
+    issued = []
+    real_connect = sqlite3.connect
+
+    def wrapped(*a, **k):
+        conn = real_connect(*a, **k)
+
+        def tracer(sql):
+            text = "".join(str(sql).split()).lower()
+            if "journal_mode=" in text:
+                issued.append(sql)
+
+        conn.set_trace_callback(tracer)
+        return conn
+
+    with patch.object(rs.sqlite3, "connect", side_effect=wrapped):
+        second = rs._connect()
+        mode = str(second.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    assert mode == "wal"
+    assert issued == []
 
 
 def test_live_snapshot_origin_is_live(rs):

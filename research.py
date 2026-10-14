@@ -166,7 +166,10 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=LOCK_TIMEOUT_SEC)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        mode = str(row[0]).lower() if row else ""
+        if mode != "wal":
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
     except Exception as e:
         log.warning("research wal: %s", safe_err(e))
@@ -766,7 +769,8 @@ def fetch_dex_batch(tids: list[str], entries: dict | None = None,
                     ) -> dict[str, dict]:
     """DexScreener /latest/dex/tokens/<comma list up to 30>. 5s timeout. No GT.
 
-    Marks pass price_guard (mint match, liq >= $1,000, unconfirmed spikes skipped).
+    Marks pass price_guard (mint match, liq >= $1,000, unconfirmed spikes
+    skipped; illiquid upward junk with an anchor drains at 0).
     """
     import price_guard
     addrs = []
