@@ -159,6 +159,28 @@ def test_catnip_pumpswap_quote_drains_at_zero(caplog):
     young_trail_fast.reset()
 
 
+def test_pumpfun_low_mcap_upward_quote_is_not_drained():
+    """pump.fun, no liq field, $900 mcap, 9e-7 after a 5e-7 crash anchor.
+
+    Failed low_mcap must skip, never drain-at-0, so the last price is kept.
+    """
+    mint = "PumpLowMcap11111111111111111111111111111"
+    tid = f"{mint}:1399811149"
+    entry = 4e-6
+    prev = 5e-7
+    quote = 9e-7
+    pair = _pumpfun_pair(mint, quote, market_cap=900)
+    assert "liquidity" not in pair
+    assert price_guard.is_pumpfun(pair)
+    assert price_guard.pair_liq_reported(pair) is None
+    assert price_guard.pair_reject_reason(pair, mint) == "low_mcap"
+    assert quote > price_guard.CRASH_MAX_X_PREV * prev
+    mark = price_guard.mark_from_pairs(
+        [pair], mint, entry=entry, prev=prev, tid=tid, now=T0,
+    )
+    assert mark is None  # skipped; never recorded as drained
+
+
 def test_upward_low_liq_without_anchor_still_skipped():
     mint = "NoAnchorMint111"
     mark = price_guard.mark_from_pairs(

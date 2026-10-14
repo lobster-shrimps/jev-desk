@@ -770,7 +770,8 @@ def fetch_dex_batch(tids: list[str], entries: dict | None = None,
     """DexScreener /latest/dex/tokens/<comma list up to 30>. 5s timeout. No GT.
 
     Marks pass price_guard (mint match, liq >= $1,000, unconfirmed spikes
-    skipped; illiquid upward junk with an anchor drains at 0).
+    skipped; non-pump.fun reported-liq-under-$1,000 upward junk with an
+    anchor drains at 0).
     """
     import price_guard
     addrs = []
