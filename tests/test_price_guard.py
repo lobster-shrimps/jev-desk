@@ -110,9 +110,10 @@ def test_pumpfun_pair_with_no_liquidity_field_is_accepted():
     assert price_guard.pair_reject_reason(cheap, mint) == "low_mcap"
 
 
-def test_catnip_pumpswap_quote_is_rejected(caplog):
+def test_catnip_pumpswap_quote_drains_at_zero(caplog):
     caplog.set_level(logging.INFO)
     # pumpswap reports $0.02 liquidity and ~10,000× entry. Still low_liq.
+    # Upward junk with a valid anchor must drain at 0 so SL/trail fire.
     pairs = [_pair(
         CATNIP_MINT, CATNIP_SPIKE, 0.02, symbol="Catnip", dexId="pumpswap",
         marketCap=9_000_000,
@@ -121,12 +122,71 @@ def test_catnip_pumpswap_quote_is_rejected(caplog):
     mark = price_guard.mark_from_pairs(
         pairs, CATNIP_MINT, entry=CATNIP_ENTRY, prev=CATNIP_ENTRY, tid=CATNIP_TID,
     )
-    assert mark is None
+    assert mark is not None
+    assert mark["source"] == "drained"
+    assert mark["price_usd"] == 0.0
     assert price_guard.pair_reject_reason(pairs[0], CATNIP_MINT) == "low_liq"
     blob = caplog.text
-    assert "price_guard skip" in blob
+    assert "price_guard drain" in blob
     assert CATNIP_TID in blob
     assert "TYPESAFE" not in blob
+
+    import young_trail
+    import young_trail_fast
+    young_trail.reset()
+    young_trail_fast.reset()
+    young_trail.set_time_fn(lambda: T0)
+    young_trail_fast.set_time_fn(lambda: T0)
+    assert young_trail.enter(
+        CATNIP_TID, {"ticker": "CAT", "chain": "solana"}, CATNIP_ENTRY, now=T0,
+    )
+    n = young_trail_fast.sync_entries(now=T0)
+    assert n >= 1
+    stats = young_trail.mark_open({CATNIP_TID: 0.0}, now=T0 + 60)
+    assert stats["closed"] == 1
+    row = young_trail.closed_rows()[0]
+    assert row["exit_reason"] == "sl"
+    assert row["exit_price"] == pytest.approx(0.0)
+    assert row["pnl_usd"] < 0
+    young_trail_fast.on_marks({CATNIP_TID: 0.0}, now=T0 + 60)
+    fast_closed = [
+        r for r in young_trail_fast.closed_rows(limit=None) if r["tid"] == CATNIP_TID
+    ]
+    assert fast_closed
+    assert {r["exit_reason"] for r in fast_closed} <= {"sl", "trail"}
+    assert all(r["exit_price"] == pytest.approx(0.0) for r in fast_closed)
+    young_trail.reset()
+    young_trail_fast.reset()
+
+
+def test_pumpfun_low_mcap_upward_quote_is_not_drained():
+    """pump.fun, no liq field, $900 mcap, 9e-7 after a 5e-7 crash anchor.
+
+    Failed low_mcap must skip, never drain-at-0, so the last price is kept.
+    """
+    mint = "PumpLowMcap11111111111111111111111111111"
+    tid = f"{mint}:1399811149"
+    entry = 4e-6
+    prev = 5e-7
+    quote = 9e-7
+    pair = _pumpfun_pair(mint, quote, market_cap=900)
+    assert "liquidity" not in pair
+    assert price_guard.is_pumpfun(pair)
+    assert price_guard.pair_liq_reported(pair) is None
+    assert price_guard.pair_reject_reason(pair, mint) == "low_mcap"
+    assert quote > price_guard.CRASH_MAX_X_PREV * prev
+    mark = price_guard.mark_from_pairs(
+        [pair], mint, entry=entry, prev=prev, tid=tid, now=T0,
+    )
+    assert mark is None  # skipped; never recorded as drained
+
+
+def test_upward_low_liq_without_anchor_still_skipped():
+    mint = "NoAnchorMint111"
+    mark = price_guard.mark_from_pairs(
+        [_pair(mint, 0.009, 0.02, dexId="pumpswap")], mint, tid="x:1399811149",
+    )
+    assert mark is None
 
 
 def test_single_pool_spike_accepted_after_two_consecutive_confirms():
@@ -341,11 +401,14 @@ def test_drain_mark_zero_fires_stop():
     young_trail.reset()
 
 
-def test_fast_marks_skip_catnip_and_low_liq(rs_env, caplog):
+def test_fast_marks_drain_catnip_and_low_liq(rs_env, caplog):
     import research
+    import young_trail_fast
     caplog.set_level(logging.INFO)
     t0 = T0
     research.set_time_fn(lambda: t0)
+    young_trail_fast.reset()
+    young_trail_fast.set_time_fn(lambda: t0)
     research.on_cycle({
         "seen": 1, "benched": 0, "judged": 0, "requeued": 0,
         "free": {}, "trade": {}, "chain": {}, "soft": {},
@@ -371,10 +434,19 @@ def test_fast_marks_skip_catnip_and_low_liq(rs_env, caplog):
 
     research.set_get_fn(get)
     out = research.tick_sampler(now=t0 + 30)
-    assert out["marks"] == 0
+    assert out["marks"] == 1
     rows = research.run_sql("SELECT * FROM fast_marks")
-    assert rows == []
-    assert "price_guard skip" in caplog.text
+    assert len(rows) == 1
+    assert rows[0]["price_usd"] == pytest.approx(0.0)
+    assert rows[0]["source"] == "drained"
+    assert "price_guard drain" in caplog.text
+    fast_closed = [
+        r for r in young_trail_fast.closed_rows(limit=None) if r["tid"] == CATNIP_TID
+    ]
+    assert fast_closed
+    assert {r["exit_reason"] for r in fast_closed} <= {"sl", "trail"}
+    assert all(r["exit_price"] == pytest.approx(0.0) for r in fast_closed)
+    young_trail_fast.reset()
 
 
 class _DexResp:

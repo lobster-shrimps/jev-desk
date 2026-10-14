@@ -93,6 +93,43 @@ def test_60s_mark_hits_sl_while_cycle_still_open(ytf):
     assert yt.closed_rows() == []
 
 
+def test_unmarked_time_exit_excluded_from_pnl(ytf):
+    """No post-entry mark → close as unmarked, leave out of P&L stats."""
+    yt, fast = ytf
+    yt.consider_entries([_tok()], now=T0)
+    assert fast.sync_entries(now=T0) == 2
+    stats = fast.on_marks({}, now=T0 + 6 * 3600)
+    assert stats["closed"] == 2
+    closed = fast.closed_rows(limit=None)
+    assert closed
+    assert all(r["exit_reason"] == "unmarked" for r in closed)
+    assert all(r["pnl_usd"] is None for r in closed)
+    summary = fast.ops_payload()["summary"]["baseline"]
+    assert summary["closed_count"] == 0
+    assert summary["winning_trades"] == 0
+    assert summary["losing_trades"] == 0
+    assert summary["realized_pnl_usd"] == pytest.approx(0.0)
+
+
+def test_time_exit_uses_last_valid_mark(ytf):
+    yt, fast = ytf
+    yt.consider_entries([_tok()], now=T0)
+    fast.on_sampler_tick({TID: 1.10}, now=T0 + 60)
+    opens = [r for r in fast.open_rows() if r["variant"] == "baseline"]
+    assert opens
+    assert opens[0]["last_price"] == pytest.approx(1.10)
+    stats = fast.on_marks({}, now=T0 + 6 * 3600)
+    assert stats["closed"] >= 1
+    base = [r for r in fast.closed_rows(limit=None) if r["variant"] == "baseline"]
+    assert len(base) == 1
+    assert base[0]["exit_reason"] == "time"
+    assert base[0]["exit_price"] == pytest.approx(1.10)
+    assert base[0]["pnl_usd"] == pytest.approx(5.0)
+    summary = fast.ops_payload()["summary"]["baseline"]
+    assert summary["closed_count"] == 1
+    assert summary["realized_pnl_usd"] == pytest.approx(5.0)
+
+
 def test_tp_50_on_60s_mark(ytf):
     yt, fast = ytf
     yt.consider_entries([_tok()], now=T0)

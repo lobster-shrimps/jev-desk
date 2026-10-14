@@ -290,8 +290,13 @@ def mark_from_pairs(pairs, mint: str | None, *, entry=None, prev=None,
 
     Mint must match. low_liq / low_mcap reject only upward marks. If those
     checks fail but price is ≤ 1.3× the last accepted mark, accept as a
-    crash. A once-valid token with no usable price records source='drained'
-    at the pair's price or 0 so stops can fire.
+    crash. An upward rejected quote with a valid anchor records
+    source='drained' at 0 only when the pair is not pump.fun and reported
+    liquidity is a number under $1,000 (Catnip-style junk must not leave
+    the position on a stale price). pump.fun / missing-liq / low_mcap
+    upward rejects skip the mark so the last price is kept. A once-valid
+    token with no usable price records source='drained' at the pair's
+    price or 0.
     """
     matching = mint_match_pairs(pairs, mint)
     if not matching:
@@ -322,6 +327,16 @@ def mark_from_pairs(pairs, mint: str | None, *, entry=None, prev=None,
         if raw_px <= CRASH_MAX_X_PREV * anchor:
             _log_guard(tid, "crash", px=raw_px, prev=anchor, reason=reason)
             return _mark_payload(best, raw_px, "crash")
+        reported = pair_liq_reported(best)
+        if (
+            not is_pumpfun(best)
+            and reported is not None
+            and reported < MIN_LIQ_USD
+        ):
+            _log_guard(
+                tid, "drain", px=0.0, prev=anchor, reason=reason, rejected_px=raw_px,
+            )
+            return _mark_payload(best, 0.0, "drained")
         _log_guard(tid, "skip", reason=reason, px=raw_px, prev=anchor)
         return None
 
