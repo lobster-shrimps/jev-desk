@@ -241,6 +241,106 @@ def test_variants_fast_helius_skip_rejected_marks():
     young_trail_helius.reset()
 
 
+def test_drained_pool_crash_fires_young_trail_and_fast_stops():
+    """Token at 1e-6, pool drains to $1 liq quoting 1e-8 → SL / trail."""
+    import young_trail
+    import young_trail_fast
+    young_trail.reset()
+    young_trail_fast.reset()
+    young_trail.set_time_fn(lambda: T0)
+    young_trail_fast.set_time_fn(lambda: T0)
+    mint = "RugMint111111111111111111111111111111111"
+    tid = f"{mint}:1399811149"
+    entry = 1e-6
+    crash = 1e-8
+    assert young_trail.enter(tid, {"ticker": "RUG", "chain": "solana"}, entry, now=T0)
+    n = young_trail_fast.sync_entries(now=T0)
+    assert n >= 1
+    pair = _pair(mint, crash, 1.0, dexId="pumpswap")
+    assert price_guard.pair_reject_reason(pair, mint) == "low_liq"
+    mark = price_guard.mark_from_pairs(
+        [pair], mint, entry=entry, prev=entry, tid=tid, now=T0 + 60,
+    )
+    assert mark is not None
+    assert mark["source"] == "crash"
+    assert mark["price_usd"] == pytest.approx(crash)
+    stats = young_trail.mark_open({tid: crash}, now=T0 + 60)
+    assert stats["closed"] == 1
+    row = young_trail.closed_rows()[0]
+    assert row["exit_reason"] == "sl"
+    assert row["exit_price"] == pytest.approx(crash)
+    assert row["pnl_usd"] < 0
+    young_trail_fast.on_marks({tid: crash}, now=T0 + 60)
+    fast_closed = [
+        r for r in young_trail_fast.closed_rows(limit=None) if r["tid"] == tid
+    ]
+    assert fast_closed
+    assert {r["exit_reason"] for r in fast_closed} <= {"sl", "trail"}
+    assert all(r["exit_price"] == pytest.approx(crash) for r in fast_closed)
+    young_trail.reset()
+    young_trail_fast.reset()
+
+
+def test_replay_downward_crash_marks_are_accepted():
+    """Replay-style: once-valid tokens, drained pools, downward prints."""
+    replay = [
+        ("tokA:1399811149", 1.2e-6, 4.1e-7, 1.0, "pumpswap"),
+        ("tokB:1399811149", 8e-6, 1e-8, 12.0, "raydium"),
+        ("tokC:1399811149", 3e-5, 2.5e-5, 0.4, "pumpswap"),
+        ("tokD:1399811149", 1e-4, 2e-5, None, "pumpfun"),
+    ]
+    accepted = 0
+    for tid, prev, px, liq, dex in replay:
+        mint = tid.split(":")[0]
+        assert px <= 1.3 * prev
+        if dex == "pumpfun":
+            pair = _pumpfun_pair(mint, px, market_cap=200)
+        else:
+            pair = _pair(mint, px, liq, dexId=dex)
+        mark = price_guard.mark_from_pairs(
+            [pair], mint, entry=prev, prev=prev, tid=tid, now=T0,
+        )
+        assert mark is not None, tid
+        assert mark["price_usd"] == pytest.approx(px)
+        assert mark["source"] == "crash"
+        accepted += 1
+    assert accepted == len(replay)
+    # Time exit on a crash print uses it, not the stale last_price.
+    import young_trail
+    assert young_trail.decide_exit(
+        1e-6, 1e-6, 9e-7, T0, T0 + 6 * 3600, last_price=1e-6,
+    ) == ("time", 9e-7)
+
+
+def test_drain_mark_zero_fires_stop():
+    mint = "DryMint111"
+    tid = f"{mint}:1399811149"
+    pair = _pair(mint, 0.0, 1.0, dexId="pumpswap")
+    mark = price_guard.mark_from_pairs(
+        [pair], mint, entry=1e-6, prev=1e-6, tid=tid,
+    )
+    assert mark is not None
+    assert mark["source"] == "drained"
+    assert mark["price_usd"] == 0.0
+    missing = dict(_pair(mint, 1e-6, 1.0, dexId="pumpswap"))
+    missing.pop("priceUsd")
+    drained = price_guard.mark_from_pairs(
+        [missing], mint, entry=1e-6, prev=1e-6, tid=tid,
+    )
+    assert drained["source"] == "drained"
+    assert drained["price_usd"] == 0.0
+    import young_trail
+    young_trail.reset()
+    young_trail.set_time_fn(lambda: T0)
+    young_trail.enter(tid, {"ticker": "DRY", "chain": "solana"}, 1e-6, now=T0)
+    stats = young_trail.mark_open({tid: 0.0}, now=T0 + 60)
+    assert stats["closed"] == 1
+    row = young_trail.closed_rows()[0]
+    assert row["exit_reason"] == "sl"
+    assert row["exit_price"] == pytest.approx(0.0)
+    young_trail.reset()
+
+
 def test_fast_marks_skip_catnip_and_low_liq(rs_env, caplog):
     import research
     caplog.set_level(logging.INFO)

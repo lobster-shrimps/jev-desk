@@ -256,11 +256,11 @@ def _price_of(mark) -> float | None:
     if isinstance(mark, dict):
         for key in ("price_usd", "price", "priceUsd"):
             px = _num(mark.get(key))
-            if px is not None and px > 0:
+            if px is not None and px >= 0:
                 return px
         return None
     px = _num(mark)
-    return px if px is not None and px > 0 else None
+    return px if px is not None and px >= 0 else None
 
 
 def _row_dict(row: sqlite3.Row) -> dict:

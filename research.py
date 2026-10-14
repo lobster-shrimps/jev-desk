@@ -807,7 +807,7 @@ def fetch_dex_batch(tids: list[str], entries: dict | None = None,
                 tid=tid,
                 now=now,
             )
-            if mark and mark.get("price_usd"):
+            if mark is not None and mark.get("price_usd") is not None:
                 out[tid] = mark
     return out
 
@@ -831,7 +831,7 @@ def tick_sampler(now: float | None = None) -> dict:
         with _locked() as db:
             for tid in tids:
                 mark = prices.get(tid)
-                if not mark or not mark.get("price_usd"):
+                if not mark or mark.get("price_usd") is None:
                     continue
                 if _insert_mark(db, {
                     "ts": ts, "ts_sec": int(ts), "tid": tid,
@@ -843,7 +843,7 @@ def tick_sampler(now: float | None = None) -> dict:
                     "vol_5m": mark.get("vol_5m"),
                     "vol_1h": mark.get("vol_1h"),
                     "vol_h24": mark.get("vol_h24"),
-                    "source": "dex_batch",
+                    "source": mark.get("source") or "dex_batch",
                     "origin": "live",
                 }):
                     n += 1
@@ -854,7 +854,7 @@ def tick_sampler(now: float | None = None) -> dict:
             px_map = {
                 tid: mark.get("price_usd")
                 for tid, mark in prices.items()
-                if isinstance(mark, dict) and mark.get("price_usd")
+                if isinstance(mark, dict) and mark.get("price_usd") is not None
             }
             young_trail_fast.on_sampler_tick(px_map, ts)
         except Exception as e:
@@ -864,7 +864,7 @@ def tick_sampler(now: float | None = None) -> dict:
             px_map = {
                 tid: mark.get("price_usd")
                 for tid, mark in prices.items()
-                if isinstance(mark, dict) and mark.get("price_usd")
+                if isinstance(mark, dict) and mark.get("price_usd") is not None
             }
             young_trail_helius.on_sampler_tick(px_map, ts)
         except Exception as e:

@@ -3,6 +3,8 @@
 Paper/analysis only. Used by young_trail, variants, fast, helius, and
 research fast_marks. Never called from filter, judge, pick, or live orders.
 Fail open: a rejected mark is skipped, never used as peak or exit.
+low_liq / low_mcap reject only upward marks; crashes and drains still
+reach stops and trails.
 """
 from __future__ import annotations
 
@@ -17,10 +19,13 @@ MIN_MCAP_USD = 1000.0
 MAX_X_ENTRY = 20.0
 MAX_X_PREV = 10.0
 CONFIRM_TOL = 0.30
+# Failed liq/mcap is only fatal on the way up. A print ≤ this vs the last
+# accepted mark is a crash and must reach stops/trails.
+CRASH_MAX_X_PREV = 1.0 + CONFIRM_TOL
 
 # Last unconfirmed spike px per tid. A second consecutive mark within ±30%
 # confirms a >20× entry / >10× previous jump on single-pool tokens.
-_pending_spikes: dict[str, float] = {}
+_pending_spikes: dict[str, tuple[float, float | None]] = {}
 
 
 def _num(value, default=None):
@@ -92,12 +97,14 @@ def pair_mcap_usd(pair) -> float | None:
     return _num(pair.get("fdv"))
 
 
-def pair_price_usd(pair) -> float | None:
+def pair_price_usd(pair, *, allow_zero: bool = False) -> float | None:
     if not isinstance(pair, dict):
         return None
     for key in ("priceUsd", "price_usd", "price"):
         n = _num(pair.get(key))
-        if n is not None and n > 0:
+        if n is None:
+            continue
+        if n > 0 or (allow_zero and n >= 0):
             return n
     return None
 
@@ -186,20 +193,23 @@ def accept_price(px, *, entry=None, prev=None, seconds=None, tid=None,
     A >20× entry or >10× previous mark needs a second source within ±30%,
     or two consecutive marks (later `now`) for the same tid within ±30%.
     Same-tick callers sharing `now` do not confirm each other.
+    Zero is a drain print and is accepted so stops can fire.
     """
     n = _num(px)
-    if n is None or n <= 0:
+    if n is None or n < 0:
         return None
-    others = [s for s in (seconds or []) if _num(s) is not None]
     key = str(tid) if tid else None
+    if n == 0:
+        if key:
+            _pending_spikes.pop(key, None)
+        return 0.0
+    others = [s for s in (seconds or []) if _num(s) is not None]
     stamp = _num(now)
     if is_spike(n, entry=entry, prev=prev):
         if confirmed_by_second(n, others):
             if key:
                 _pending_spikes.pop(key, None)
             return n
-        # Single-pool: no other pair this tick. A later mark within ±30%
-        # of the previous rejected spike confirms the jump.
         pending = _pending_spikes.get(key) if key else None
         if not others and pending is not None:
             prev_px, prev_ts = pending
@@ -222,57 +232,106 @@ def accept_price(px, *, entry=None, prev=None, seconds=None, tid=None,
     return n
 
 
-def mark_from_pairs(pairs, mint: str | None, *, entry=None, prev=None,
-                    tid=None, now=None) -> dict | None:
-    """Highest-liq qualifying pair, with spike confirm from a second pair
-    or two consecutive marks within ±30% (single-pool).
-
-    Mint must match. Liq < $1,000 rejects pairs that report a liquidity
-    number. pumpfun / missing-liq pairs use marketCap < $1,000 instead.
-    """
+def _pair_list(pairs) -> list:
     if isinstance(pairs, dict):
         raw = pairs.get("pairs") or pairs.get("data") or [pairs]
     else:
         raw = pairs
     if not isinstance(raw, list):
-        raw = []
-    quals = qualifying_pairs(raw, mint)
-    if not quals:
-        if raw:
-            reasons = []
-            for p in raw:
-                r = pair_reject_reason(p, mint)
-                if r:
-                    reasons.append(r)
-            reason = reasons[0] if reasons else "no_qualifying_pair"
-            try:
-                log.info(
-                    "price_guard skip tid=%s reason=%s n_pairs=%d",
-                    tid, reason, len(raw),
-                )
-            except Exception as e:
-                log.warning("price_guard log: %s", safe_err(e))
-        return None
-    best = max(quals, key=pair_liq_usd)
-    px = pair_price_usd(best)
-    others = [pair_price_usd(p) for p in quals if p is not best]
-    accepted = accept_price(
-        px, entry=entry, prev=prev, seconds=others, tid=tid, now=now,
-    )
-    if accepted is None:
-        return None
-    base = best.get("baseToken") if isinstance(best.get("baseToken"), dict) else {}
-    vol = best.get("volume") if isinstance(best.get("volume"), dict) else {}
+        return []
+    return [p for p in raw if isinstance(p, dict)]
+
+
+def mint_match_pairs(pairs, mint: str | None) -> list[dict]:
+    out = []
+    for p in _pair_list(pairs):
+        if mint and not addrs_equal(pair_base_addr(p), mint):
+            continue
+        out.append(p)
+    return out
+
+
+def _anchor(prev=None, entry=None) -> float | None:
+    n = _num(prev)
+    if n is not None and n > 0:
+        return n
+    n = _num(entry)
+    return n if n is not None and n > 0 else None
+
+
+def _log_guard(tid, action, **extra) -> None:
+    try:
+        bits = " ".join(f"{k}={v}" for k, v in extra.items())
+        log.info("price_guard %s tid=%s %s", action, tid, bits)
+    except Exception as e:
+        log.warning("price_guard log: %s", safe_err(e))
+
+
+def _mark_payload(pair: dict, px: float, source: str) -> dict:
+    base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+    vol = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
     return {
-        "price_usd": accepted,
-        "liq_usd": pair_liq_reported(best),
-        "fdv": _num(best.get("fdv") or best.get("marketCap")),
+        "price_usd": px,
+        "liq_usd": pair_liq_reported(pair),
+        "fdv": _num(pair.get("fdv") or pair.get("marketCap")),
         "vol_5m": _num(vol.get("m5")) if vol else None,
         "vol_1h": _num(vol.get("h1")) if vol else None,
         "vol_h24": _num(vol.get("h24")) if vol else None,
-        "chain": best.get("chainId"),
+        "chain": pair.get("chainId"),
         "ticker": base.get("symbol") if isinstance(base, dict) else None,
+        "source": source,
     }
+
+
+def mark_from_pairs(pairs, mint: str | None, *, entry=None, prev=None,
+                    tid=None, now=None) -> dict | None:
+    """Highest-liq qualifying pair, with spike confirm from a second pair
+    or two consecutive marks within ±30% (single-pool).
+
+    Mint must match. low_liq / low_mcap reject only upward marks. If those
+    checks fail but price is ≤ 1.3× the last accepted mark, accept as a
+    crash. A once-valid token with no usable price records source='drained'
+    at the pair's price or 0 so stops can fire.
+    """
+    matching = mint_match_pairs(pairs, mint)
+    if not matching:
+        _log_guard(
+            tid, "skip",
+            reason="base_mint_mismatch" if mint else "no_pairs",
+            n_pairs=len(_pair_list(pairs)),
+        )
+        return None
+    quals = [p for p in matching if pair_reject_reason(p, mint) is None]
+    if quals:
+        best = max(quals, key=pair_liq_usd)
+        px = pair_price_usd(best)
+        others = [pair_price_usd(p) for p in quals if p is not best]
+        accepted = accept_price(
+            px, entry=entry, prev=prev, seconds=others, tid=tid, now=now,
+        )
+        if accepted is None:
+            return None
+        return _mark_payload(best, accepted, "dex_batch")
+
+    best = max(matching, key=pair_liq_usd)
+    reason = pair_reject_reason(best, mint) or "no_qualifying_pair"
+    raw_px = pair_price_usd(best, allow_zero=True)
+    anchor = _anchor(prev, entry)
+
+    if anchor is not None and raw_px is not None and raw_px > 0:
+        if raw_px <= CRASH_MAX_X_PREV * anchor:
+            _log_guard(tid, "crash", px=raw_px, prev=anchor, reason=reason)
+            return _mark_payload(best, raw_px, "crash")
+        _log_guard(tid, "skip", reason=reason, px=raw_px, prev=anchor)
+        return None
+
+    if anchor is not None:
+        drain_px = 0.0 if raw_px is None else float(raw_px)
+        _log_guard(tid, "drain", px=drain_px, prev=anchor, reason=reason)
+        return _mark_payload(best, drain_px, "drained")
+
+    _log_guard(tid, "skip", reason=reason, n_pairs=len(matching))
+    return None
 
 
 def price_from_pairs(pairs, mint: str | None, *, entry=None, prev=None,

@@ -127,7 +127,7 @@ def decide_variant_tick(
     window_sec = float(rule.get("window_sec", 6 * 3600))
     sl_price = float(entry_price) * (1.0 + sl_pct)
     px = _f(price, None)
-    if px is not None and px <= 0:
+    if px is not None and px < 0:
         px = None
     if px is not None:
         state["peak"] = max(state["peak"], px)

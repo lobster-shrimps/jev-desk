@@ -241,12 +241,21 @@ def decide_exit(entry_price: float, peak: float, price: float | None,
 
     SL -30% from entry, trail 30% from peak (price <= peak * 0.7), time at 6h.
     Price stops beat the time stop in the same tick (stopsim order).
-    A 6h exit with no current price uses last marked price, never peak.
+    A 6h exit with a current mark (including drain 0) uses that mark.
+    With no current price it uses last marked price, never peak.
     """
     sl_price = float(entry_price) * (1.0 + SL_PCT)
     trail_price = float(peak) * (1.0 - TRAIL_PCT)
-    if price is not None and price > 0:
-        px = float(price)
+    px = None
+    if price is not None:
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            px = None
+        else:
+            if px < 0:
+                px = None
+    if px is not None:
         hit_sl = px <= sl_price
         hit_trail = px <= trail_price
         if hit_sl or hit_trail:
@@ -403,7 +412,7 @@ def fetch_dex_prices(tids: list[str], *, cap: int | None = None,
         px = fetch_dex_price(
             tid, entry=entries.get(tid), prev=prevs.get(tid), now=now,
         )
-        if px:
+        if px is not None:
             out[tid] = px
     return out
 
@@ -578,7 +587,7 @@ def mark_open(prices: dict[str, float] | None = None, now: float | None = None) 
                 if _close_row(tid, ts, exit_px, reason, peak):
                     closed += 1
                 continue
-            if px is None or px <= 0:
+            if px is None:
                 stale += 1
                 continue
             db = _connect()
