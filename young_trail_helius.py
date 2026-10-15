@@ -195,6 +195,15 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
     _schema_step(conn, "yth_exit_reason", lambda: conn.execute(
         "ALTER TABLE young_trail_helius ADD COLUMN exit_reason TEXT"
     ))
+    _schema_step(conn, "yth_reset_stale_last_mark_ts", lambda: conn.execute(
+        """UPDATE young_trail_helius
+           SET last_mark_ts = entry_ts
+         WHERE exit_ts IS NULL
+           AND last_price IS NOT NULL
+           AND entry_price IS NOT NULL
+           AND abs(last_price - entry_price)
+               <= 1e-9 * max(abs(entry_price), 1e-18)"""
+    ))
 
 
 def _connect() -> sqlite3.Connection:
@@ -974,15 +983,41 @@ def _table_exists(db: sqlite3.Connection, name: str) -> bool:
         return False
 
 
+def _row_get(row, key, default=None):
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _prices_equal(a, b) -> bool:
+    """Relative equality: abs(a-b) <= 1e-9 * max(abs(b), tiny)."""
+    aa, bb = _num(a), _num(b)
+    if aa is None or bb is None:
+        return False
+    return abs(aa - bb) <= 1e-9 * max(abs(bb), 1e-18)
+
+
 def _is_real_mark(row) -> bool:
-    """True when last_mark_ts is after entry (not the entry seed)."""
-    entry_ts = _num(row["entry_ts"] if not isinstance(row, dict) else row.get("entry_ts"))
-    last_mark_ts = _num(
-        row["last_mark_ts"] if not isinstance(row, dict) else row.get("last_mark_ts"),
-    )
+    """True when last_price is a post-entry mark, not the entry seed.
+
+    last_mark_ts advancing while last_price stays at entry is not a mark
+    (legacy rows that then time-exited at $0.00).
+    """
+    entry_ts = _num(_row_get(row, "entry_ts"))
+    last_mark_ts = _num(_row_get(row, "last_mark_ts"))
     if entry_ts is None or last_mark_ts is None:
         return False
-    return last_mark_ts > entry_ts + 1e-9
+    if last_mark_ts <= entry_ts + 1e-9:
+        return False
+    last_px = _num(_row_get(row, "last_price"))
+    if last_px is None:
+        return False
+    if _prices_equal(last_px, _row_get(row, "entry_price")):
+        return False
+    return True
 
 
 def _mint_like(tid: str) -> tuple[str, str]:
@@ -997,11 +1032,13 @@ def _latest_stored_mark(
     after_ts: float | None = None,
     before_ts: float | None = None,
     db: sqlite3.Connection | None = None,
+    skip_price=None,
 ) -> tuple[float | None, float | None]:
     """Freshest stored guarded price for this tid/mint. No network. Fail open.
 
     Sources: young_trail, young_trail_fast, young_trail_marks, research.fast_marks.
-    Entry-seed stamps (ts <= after_ts) are ignored.
+    Entry-seed stamps (ts <= after_ts) and prices equal to skip_price (the
+    row's own entry) are ignored.
     """
     candidates: list[tuple[float, float]] = []
 
@@ -1019,6 +1056,8 @@ def _latest_stored_mark(
             return
         if before_ts is not None and stamp > float(before_ts) + 1e-9:
             return
+        if skip_price is not None and _prices_equal(price, skip_price):
+            return
         candidates.append((stamp, price))
 
     exact, like = _mint_like(tid)
@@ -1026,7 +1065,7 @@ def _latest_stored_mark(
         conn = db if db is not None else _connect()
         if _table_exists(conn, "young_trail"):
             for r in conn.execute(
-                """SELECT last_price, last_mark_ts, entry_ts FROM young_trail
+                """SELECT last_price, last_mark_ts, entry_ts, entry_price FROM young_trail
                    WHERE tid = ? OR tid LIKE ?""",
                 (exact, like),
             ).fetchall():
@@ -1034,11 +1073,13 @@ def _latest_stored_mark(
                     r["last_mark_ts"] is not None
                     and r["entry_ts"] is not None
                     and float(r["last_mark_ts"]) > float(r["entry_ts"]) + 1e-9
+                    and not _prices_equal(r["last_price"], r["entry_price"])
                 ):
                     add(r["last_price"], r["last_mark_ts"])
         if _table_exists(conn, "young_trail_fast"):
             for r in conn.execute(
-                """SELECT last_price, last_mark_ts, entry_ts FROM young_trail_fast
+                """SELECT last_price, last_mark_ts, entry_ts, entry_price
+                   FROM young_trail_fast
                    WHERE tid = ? OR tid LIKE ?""",
                 (exact, like),
             ).fetchall():
@@ -1046,6 +1087,7 @@ def _latest_stored_mark(
                     r["last_mark_ts"] is not None
                     and r["entry_ts"] is not None
                     and float(r["last_mark_ts"]) > float(r["entry_ts"]) + 1e-9
+                    and not _prices_equal(r["last_price"], r["entry_price"])
                 ):
                     add(r["last_price"], r["last_mark_ts"])
         if _table_exists(conn, "young_trail_marks"):
@@ -1087,19 +1129,21 @@ def _close_price_for(
     now: float | None = None,
     *,
     trust_self: bool = True,
+    db: sqlite3.Connection | None = None,
 ) -> tuple[float | None, float | None]:
     """Freshest real mark on this row or from other ledgers. Never the entry seed."""
-    entry_ts = _num(row["entry_ts"] if not isinstance(row, dict) else row.get("entry_ts"))
+    entry_ts = _num(_row_get(row, "entry_ts"))
+    entry_px = _num(_row_get(row, "entry_price"))
     if trust_self and _is_real_mark(row):
-        last_px = _num(row["last_price"] if not isinstance(row, dict) else row.get("last_price"))
-        last_ts = _num(
-            row["last_mark_ts"] if not isinstance(row, dict) else row.get("last_mark_ts"),
-        )
+        last_px = _num(_row_get(row, "last_price"))
+        last_ts = _num(_row_get(row, "last_mark_ts"))
         if last_px is not None:
             return last_px, last_ts
-    tid = row["tid"] if not isinstance(row, dict) else row.get("tid")
+    tid = _row_get(row, "tid")
     before = float(now) if now is not None else None
-    return _latest_stored_mark(tid, after_ts=entry_ts, before_ts=before)
+    return _latest_stored_mark(
+        tid, after_ts=entry_ts, before_ts=before, db=db, skip_price=entry_px,
+    )
 
 
 def _mark_is_fresh(mark_ts: float | None, now: float) -> bool:
@@ -1124,6 +1168,7 @@ def _apply_tick_prices(db: sqlite3.Connection, rows, prices: dict, ts: float) ->
         if px is None:
             stored, stored_ts = _latest_stored_mark(
                 tid, after_ts=float(row["entry_ts"]), before_ts=ts,
+                db=db, skip_price=entry_px,
             )
             if stored is None or stored_ts is None:
                 continue
@@ -1257,7 +1302,7 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
         for row in still_open:
             if ts < float(row["entry_ts"]) + WINDOW_SEC:
                 continue
-            px, _mark_ts = _close_price_for(row, ts, trust_self=True)
+            px, _mark_ts = _close_price_for(row, ts, trust_self=True, db=db)
             if px is None:
                 _close(db, row["tid"], ts, None, None, exit_reason="unmarked",
                        unmarked=True)
@@ -1326,7 +1371,7 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
                     _record_extra_signal(db, tid, sig, ts, px_log)
                 signals += len(fired)
                 continue
-            px, mark_ts = _close_price_for(live, ts, trust_self=True)
+            px, mark_ts = _close_price_for(live, ts, trust_self=True, db=db)
             if px is None or not _mark_is_fresh(mark_ts, ts):
                 _close(db, tid, ts, None, fired[0], exit_reason="unmarked",
                        unmarked=True)
@@ -1617,8 +1662,10 @@ def _open_repair_db(path) -> sqlite3.Connection:
 
 
 def plan_zero_exit_repairs(path) -> list[dict]:
-    """Closed rows with exit ≈ entry, recomputed from stored marks.
+    """Closed rows with exit ≈ entry (including 'time' closes), recomputed.
 
+    Ignores the row's own last_price/exit_price when it equals entry.
+    No stored mark → unmarked, pnl_usd NULL (never $0.00).
     `path` is required. Refuses the live outcomes.db.
     """
     conn = _open_repair_db(path)
@@ -1626,10 +1673,20 @@ def plan_zero_exit_repairs(path) -> list[dict]:
         rows = conn.execute(
             """SELECT * FROM young_trail_helius
                WHERE exit_ts IS NOT NULL
-                 AND exit_price IS NOT NULL
                  AND entry_price IS NOT NULL
-                 AND abs(exit_price - entry_price)
-                     <= 1e-9 * max(abs(entry_price), 1e-18)
+                 AND (
+                   (
+                     exit_price IS NOT NULL
+                     AND abs(exit_price - entry_price)
+                         <= 1e-9 * max(abs(entry_price), 1e-18)
+                   )
+                   OR (
+                     exit_reason = 'time'
+                     AND last_price IS NOT NULL
+                     AND abs(last_price - entry_price)
+                         <= 1e-9 * max(abs(entry_price), 1e-18)
+                   )
+                 )
                ORDER BY exit_ts"""
         ).fetchall()
         plan = []
@@ -1639,6 +1696,7 @@ def plan_zero_exit_repairs(path) -> list[dict]:
                 after_ts=float(row["entry_ts"]),
                 before_ts=float(row["exit_ts"]),
                 db=conn,
+                skip_price=row["entry_price"],
             )
             old_pnl = _num(row["pnl_usd"])
             if px is None:
@@ -1742,9 +1800,10 @@ def format_repair_diff(plan: list[dict]) -> str:
                 reason=item.get("new_exit_reason"),
             )
         )
+    unmarked_n = sum(1 for item in plan if item.get("new_pnl_usd") is None)
     lines.append(
-        "rows=%d old_pnl_sum=%.2f new_pnl_sum=%.2f (counted=%d)"
-        % (len(plan), old_sum, new_sum, new_counted)
+        "rows=%d counted=%d unmarked=%d old_pnl_sum=%.2f new_pnl_sum=%.2f"
+        % (len(plan), new_counted, unmarked_n, old_sum, new_sum)
     )
     return "\n".join(lines)
 

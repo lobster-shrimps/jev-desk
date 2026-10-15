@@ -886,6 +886,124 @@ def test_repair_works_on_outbox_backups_copy(yth, tmp_path):
     assert still[0] == pytest.approx(0.0)
 
 
+def test_legacy_open_row_time_exits_at_stored_price(yth):
+    """last_mark_ts advanced, last_price still entry → use stored mark, not $0."""
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.sync_entries(now=T0)
+    db = helius._connect()
+    db.execute(
+        """UPDATE young_trail_helius
+           SET last_price = entry_price, last_mark_ts = ?
+           WHERE tid = ? AND exit_ts IS NULL""",
+        (T0 + 60, TID),
+    )
+    db.commit()
+    assert helius.open_rows()[0]["last_price"] == pytest.approx(ENTRY)
+    assert helius.open_rows()[0]["last_mark_ts"] == pytest.approx(T0 + 60)
+    _insert_fast_mark(TID, T0 + 90, 0.40)
+    helius.set_time_fn(lambda: T0 + 6 * 3600)
+    stats = helius.on_marks({}, now=T0 + 6 * 3600)
+    assert stats["closed"] == 1
+    row = helius.closed_rows(limit=None)[0]
+    assert row["exit_reason"] == "time"
+    assert row["exit_price"] == pytest.approx(0.40)
+    assert row["pnl_usd"] == pytest.approx(-30.0)
+    assert row["pnl_usd"] != pytest.approx(0.0)
+
+
+def test_legacy_open_row_no_stored_marks_is_unmarked(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.sync_entries(now=T0)
+    db = helius._connect()
+    db.execute(
+        """UPDATE young_trail_helius
+           SET last_price = entry_price, last_mark_ts = ?
+           WHERE tid = ? AND exit_ts IS NULL""",
+        (T0 + 60, TID),
+    )
+    db.commit()
+    helius.set_time_fn(lambda: T0 + 6 * 3600)
+    stats = helius.on_marks({}, now=T0 + 6 * 3600)
+    assert stats["closed"] == 1
+    row = helius.closed_rows(limit=None)[0]
+    assert row["exit_reason"] == "unmarked"
+    assert row["pnl_usd"] is None
+    assert row["exit_price"] is None
+    summary = helius.ops_payload()["summary"]
+    assert summary["closed_count"] == 0
+    assert summary["realized_pnl_usd"] == pytest.approx(0.0)
+
+
+def test_migration_resets_stale_last_mark_ts_on_open_rows(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.sync_entries(now=T0)
+    db = helius._connect()
+    db.execute(
+        """UPDATE young_trail_helius
+           SET last_price = entry_price, last_mark_ts = ?
+           WHERE tid = ? AND exit_ts IS NULL""",
+        (T0 + 99, TID),
+    )
+    db.commit()
+    helius.init_schema(db)
+    row = helius.open_rows()[0]
+    assert row["last_price"] == pytest.approx(ENTRY)
+    assert row["last_mark_ts"] == pytest.approx(row["entry_ts"])
+
+
+def test_repair_time_close_at_entry_plans_stored_or_null_never_zero(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.sync_entries(now=T0)
+    yt.mark_open({TID: 0.40}, now=T0 + 60)
+    db = helius._connect()
+    db.execute(
+        """UPDATE young_trail_helius
+           SET last_price = entry_price, last_mark_ts = ?,
+               pnl_usd = 0.0, exit_ts = ?, exit_price = entry_price,
+               exit_reason = 'time'
+           WHERE tid = ?""",
+        (T0 + 60, T0 + 6 * 3600, TID),
+    )
+    db.commit()
+    db_path = os.environ["OUTCOMES_DB"]
+    plan = helius.plan_zero_exit_repairs(db_path)
+    assert len(plan) == 1
+    assert plan[0]["new_pnl_usd"] != 0
+    assert plan[0]["new_pnl_usd"] == pytest.approx(-30.0)
+    assert plan[0]["new_exit_price"] == pytest.approx(0.40)
+
+    mint2 = "MintNoStore22222222222222222222222222"
+    tid2 = f"{mint2}:1399811149"
+    yt.consider_entries([_tok(tid=tid2, ticker="NS")], now=T0)
+    helius.sync_entries(now=T0)
+    db = helius._connect()
+    db.execute(
+        """UPDATE young_trail_helius
+           SET last_price = entry_price, last_mark_ts = ?,
+               pnl_usd = 0.0, exit_ts = ?, exit_price = entry_price,
+               exit_reason = 'time'
+           WHERE tid = ?""",
+        (T0 + 60, T0 + 6 * 3600, tid2),
+    )
+    db.commit()
+    plan2 = helius.plan_zero_exit_repairs(db_path)
+    by_tid = {p["tid"]: p for p in plan2}
+    assert by_tid[tid2]["new_pnl_usd"] is None
+    assert by_tid[tid2]["new_exit_reason"] == "unmarked"
+    assert by_tid[tid2]["new_exit_price"] is None
+    assert all(
+        p.get("new_pnl_usd") is None or p["new_pnl_usd"] != 0
+        for p in plan2
+    )
+    diff = helius.format_repair_diff(plan2)
+    assert "unmarked" in diff
+    assert "counted=1" in diff
+
+
 def test_protected_files_untouched():
     for name in (
         "thresholds.py", "questions.py", "pick.py", "filter.py",
