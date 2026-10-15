@@ -532,10 +532,12 @@ Helius RPC (`SOLANA_RPC_URL`) checks for a ≥20% dev sell, ≥30% top-3 holder 
 
 **`young_trail_rugrisk`:** paper analysis on the same young_trail entries, running
 until 20 Oct 2026. At each Solana entry, budgeted Helius RPC (`SOLANA_RPC_URL`)
-computes sniper share (supply bought in the first N slots after pool creation),
-bundled launch buys (several fresh/linked wallets in the creation slot), the
-creator's prior launches and how many rugged (LP pulled, or a `token_labels` rug),
-and the fresh-wallet share among top holders. Non-Solana rows store `n/a`. Three
+pages mint signatures back to the true create slot (up to 5×1000; a truncated
+window is `unavailable` and never skips) and computes sniper share (non-creator
+supply bought in the first N slots), bundled launch buys (3+ non-creator wallets
+in the creation slot), the creator's prior rugs and create-slot buy
+(`dev_initial_share`), and the fresh-wallet share among top holders (creator
+excluded). Non-Solana rows store `n/a`. Three
 skip rules (snipers >30%, bundled, dev with a prior rug) are scored only as a
 counterfactual: P&L of young_trail, fast baseline, and fast `tp_50` on the entries
 that rule would have SKIPPED vs KEPT. Caps sit beside the helius ledger (12/tick,

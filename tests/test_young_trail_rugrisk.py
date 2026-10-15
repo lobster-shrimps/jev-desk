@@ -52,7 +52,7 @@ def _ix(kind, mint):
     return {"parsed": {"type": kind, "info": {"mint": mint}}}
 
 
-def _tx(slot, mint, deltas, ixs=None):
+def _tx(slot, mint, deltas, ixs=None, signer=None):
     """deltas: (owner, pre, post)."""
     pre, post = [], []
     for owner, before, after in deltas:
@@ -64,9 +64,12 @@ def _tx(slot, mint, deltas, ixs=None):
             "mint": mint, "owner": owner,
             "uiTokenAmount": {"uiAmount": after, "amount": str(int(after))},
         })
+    keys = []
+    if signer:
+        keys.append({"pubkey": signer, "signer": True, "writable": True})
     return {
         "slot": slot,
-        "transaction": {"message": {"instructions": ixs or []}},
+        "transaction": {"message": {"accountKeys": keys, "instructions": ixs or []}},
         "meta": {
             "preTokenBalances": pre,
             "postTokenBalances": post,
@@ -84,7 +87,8 @@ def _parsed_token_acc(owner, program=None):
 
 
 def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
-                  creator_txs=None):
+                  creator_txs=None, mint_history=None, extra_txs=None,
+                  signer=None):
     """Scripted Helius RPC. Counts calls. Never hits the network."""
     buys = buys or [
         (CREATE_SLOT, [(S1, 0, 200), (S2, 0, 200), (S3, 0, 100)]),
@@ -102,9 +106,13 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
     for i, (slot, deltas) in enumerate(buys):
         sig = f"mintsig{i:02d}"
         mint_sigs.append({"signature": sig, "slot": slot, "err": None})
-        txs[sig] = _tx(slot, MINT, deltas)
+        txs[sig] = _tx(slot, MINT, deltas, signer=signer)
     # Newest first, like Helius.
     mint_sigs = list(reversed(mint_sigs))
+    if mint_history is not None:
+        mint_sigs = list(mint_history)
+    if extra_txs:
+        txs.update(extra_txs)
 
     creator_txs = creator_txs or [
         ("devcreate", CREATE_SLOT - 50, PRIOR, "initializeMint",
@@ -135,9 +143,18 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
             return {"value": [by.get(a) for a in addrs]}
         if method == "getSignaturesForAddress":
             addr = params[0]
-            limit = (params[1] or {}).get("limit", 20) if len(params) > 1 else 20
+            opts = params[1] if len(params) > 1 and isinstance(params[1], dict) else {}
+            limit = int(opts.get("limit") or 20)
+            before = opts.get("before")
             if addr == MINT:
-                return mint_sigs[:limit]
+                start = 0
+                if before:
+                    ids = [s["signature"] for s in mint_sigs]
+                    try:
+                        start = ids.index(before) + 1
+                    except ValueError:
+                        return []
+                return mint_sigs[start:start + limit]
             if addr == DEV:
                 return creator_sigs[:limit]
             n = int(wallet_n.get(addr, 20))
@@ -219,11 +236,16 @@ def test_pure_sniper_share_and_bundled():
          {"owner": S2, "delta": 10, "slot": 10}],
         10, {S1, S2},
     )
-    assert two["bundled"] is True
+    assert two["bundled"] is False
     one = r.bundled_from_buys(
         [{"owner": S1, "delta": 10, "slot": 10}], 10, {S1},
     )
     assert one["bundled"] is False
+    excluded = r.sniper_share_from_buys(
+        buys, 1000.0, 10, 32, exclude={S1},
+    )
+    assert excluded["sniper_wallets"] == 2
+    assert excluded["sniper_share"] == pytest.approx(0.30)
 
 
 def test_pure_fresh_holder_share():
@@ -651,3 +673,106 @@ def test_unmarked_pnl_excluded_from_counterfactual(ytr):
     assert snipers["skipped"]["n"] == 1
     assert snipers["skipped"]["n_with_pnl"]["young_trail"] == 0
     assert snipers["skipped"]["young_trail_pnl"] == pytest.approx(0.0)
+
+
+def test_truncated_history_unavailable_no_skip_flags(ytr, monkeypatch):
+    _yt, helius, rug = ytr
+    monkeypatch.setattr(rug, "SIG_PAGE_SIZE", 10)
+    monkeypatch.setattr(rug, "MINT_SIG_PAGES", 3)
+    history = [
+        {"signature": f"rec{i:03d}", "slot": 900 - i, "err": None}
+        for i in range(30)
+    ]
+    rpc = _rpc_scripted(mint_history=history)
+    rug.set_rpc_fn(rpc)
+    helius.note_creator(TID, DEV, now=T0)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "unavailable"
+    assert feat.get("reason") == "history_truncated" or feat.get("error") == "history_truncated"
+    assert feat["history_truncated"] is True
+    assert feat["create_slot"] is None
+    assert feat["sniper_share"] is None
+    assert feat["bundled"] is None
+    assert feat["skip_snipers"] is None
+    assert feat["skip_bundled"] is None
+    assert feat["skip_dev_rugs"] is None
+    assert rug.would_skip(feat, "snipers_gt_30") is None
+    assert rug.would_skip(feat, "bundled") is None
+    methods = [c[0] for c in rpc.calls]
+    assert methods.count("getSignaturesForAddress") == 3
+    assert "getTransaction" not in methods
+
+
+def test_paginated_history_uses_true_create_slot(ytr, monkeypatch):
+    _yt, _helius, rug = ytr
+    monkeypatch.setattr(rug, "SIG_PAGE_SIZE", 10)
+    monkeypatch.setattr(rug, "MINT_SIG_PAGES", 5)
+    recent = [
+        {"signature": f"rec{i:03d}", "slot": 600 - i, "err": None}
+        for i in range(20)
+    ]
+    # rec009 is slot 591: a fake first-page "create" that must not win.
+    history = recent + [
+        {"signature": "mintsig00", "slot": CREATE_SLOT, "err": None},
+    ]
+    rpc = _rpc_scripted(
+        mint_history=history,
+        extra_txs={"rec009": _tx(591, MINT, [(WHALE, 0, 900)])},
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["create_slot"] == CREATE_SLOT
+    assert feat["history_truncated"] is False
+    assert feat["sniper_share"] == pytest.approx(0.50)
+    tx_sigs = [c[1][0] for c in rpc.calls if c[0] == "getTransaction"]
+    assert "mintsig00" in tx_sigs
+    assert "rec009" not in tx_sigs
+    assert feat["sniper_wallets"] == 3
+
+
+def test_creator_create_slot_buy_excluded(ytr):
+    _yt, _helius, rug = ytr
+    rpc = _rpc_scripted(
+        buys=[(CREATE_SLOT, [
+            (DEV, 0, 400), (S1, 0, 200), (S2, 0, 200), (S3, 0, 100),
+        ])],
+        supply=1000.0,
+        signer=DEV,
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["sniper_share"] == pytest.approx(0.50)
+    assert feat["sniper_wallets"] == 3
+    assert feat["dev_initial_share"] == pytest.approx(0.40)
+    assert feat["bundled"] is True
+    creators = set((feat.get("features_json") or {}).get("creators") or [])
+    assert DEV in creators
+    # Creator is not a fresh-wallet candidate (only queried for prior-rug history).
+    fresh_addrs = [
+        c[1][0] for c in rpc.calls
+        if c[0] == "getSignaturesForAddress" and c[1][0] not in (MINT, DEV)
+    ]
+    assert DEV not in fresh_addrs
+
+
+def test_two_non_dev_create_slot_buyers_not_bundled(ytr):
+    _yt, _helius, rug = ytr
+    rpc = _rpc_scripted(
+        buys=[(CREATE_SLOT, [(DEV, 0, 200), (S1, 0, 100), (S2, 0, 100)])],
+        signer=DEV,
+        wallet_n={S1: 1, S2: 1, DEV: 8, WHALE: 20, S3: 2},
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["bundled"] is False
+    assert feat["skip_bundled"] is False
+    assert feat["bundled_buys"] == 2
+    assert feat["sniper_wallets"] == 2
+    assert feat["dev_initial_share"] == pytest.approx(0.20)

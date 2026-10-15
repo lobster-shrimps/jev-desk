@@ -45,9 +45,11 @@ BUNDLED_MIN_BUYERS = 3
 FRESH_MAX_SIGS = 2
 DEV_RUG_SKIP = 1
 TOP_HOLDERS = 10
-MINT_SIG_LIMIT = 40
+# Page getSignaturesForAddress newest→oldest, 1000/page, up to 5 pages.
+# Truncated windows never yield a create slot (would skip on false snipers).
+SIG_PAGE_SIZE = 1000
+MINT_SIG_PAGES = 5
 WALLET_SIG_LIMIT = 8
-CREATE_TX_FETCH = 8
 DEV_SIG_LIMIT = 25
 FRESH_WALLET_RPC_CAP = 6
 
@@ -200,6 +202,9 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
       key TEXT PRIMARY KEY,
       value TEXT
     )"""))
+    _schema_step(conn, "ytr_dev_initial_share", lambda: conn.execute(
+        "ALTER TABLE young_trail_rugrisk ADD COLUMN dev_initial_share REAL"
+    ))
 
 
 def _connect() -> sqlite3.Connection:
@@ -539,11 +544,16 @@ def _tok_amt(obj) -> float:
 
 # --- pure feature math (no I/O) -------------------------------------------
 
+def _owner_set(owners) -> set[str]:
+    return {str(x) for x in (owners or set()) if x}
+
+
 def sniper_share_from_buys(buys: list[dict], supply: float, create_slot: int,
-                           n_slots: int) -> dict:
-    """% of supply bought in [create_slot, create_slot+n_slots]. Pure."""
+                           n_slots: int, exclude=None) -> dict:
+    """% of supply bought in [create_slot, create_slot+n_slots], excluding creator."""
     if not supply or supply <= 0 or create_slot is None:
         return {"sniper_share": None, "sniper_wallets": 0, "sniper_amount": 0.0}
+    skip = _owner_set(exclude)
     end = int(create_slot) + max(0, int(n_slots))
     wallets: dict[str, float] = {}
     for b in buys or []:
@@ -551,6 +561,8 @@ def sniper_share_from_buys(buys: list[dict], supply: float, create_slot: int,
         owner = b.get("owner")
         delta = _num(b.get("delta"), 0.0) or 0.0
         if not owner or slot is None or delta <= 0:
+            continue
+        if str(owner) in skip:
             continue
         if int(create_slot) <= int(slot) <= end:
             wallets[str(owner)] = wallets.get(str(owner), 0.0) + float(delta)
@@ -563,13 +575,15 @@ def sniper_share_from_buys(buys: list[dict], supply: float, create_slot: int,
 
 
 def bundled_from_buys(buys: list[dict], create_slot: int,
-                      fresh_owners: set | None = None) -> dict:
-    """Multiple creation-slot buys from distinct (often fresh) wallets. Pure."""
+                      fresh_owners: set | None = None, exclude=None) -> dict:
+    """3+ distinct non-creator buys in the creation slot. Pure."""
     if create_slot is None:
-        return {"bundled": False, "bundled_buys": 0, "create_slot_buyers": 0}
+        return {"bundled": None, "bundled_buys": 0, "create_slot_buyers": 0,
+                "create_slot_fresh": 0}
+    skip = _owner_set(exclude)
     buyers = set()
     fresh = set()
-    known_fresh = {str(x) for x in (fresh_owners or set())}
+    known_fresh = _owner_set(fresh_owners)
     for b in buys or []:
         if b.get("slot") is None or int(b["slot"]) != int(create_slot):
             continue
@@ -577,17 +591,38 @@ def bundled_from_buys(buys: list[dict], create_slot: int,
         delta = _num(b.get("delta"), 0.0) or 0.0
         if not owner or delta <= 0:
             continue
+        if str(owner) in skip:
+            continue
         buyers.add(str(owner))
         if str(owner) in known_fresh:
             fresh.add(str(owner))
     n = len(buyers)
-    bundled = n >= BUNDLED_MIN_BUYERS or (n >= 2 and len(fresh) >= 2)
     return {
-        "bundled": bool(bundled),
+        "bundled": n >= BUNDLED_MIN_BUYERS,
         "bundled_buys": n,
         "create_slot_buyers": n,
         "create_slot_fresh": len(fresh),
     }
+
+
+def dev_initial_share_from_buys(buys: list[dict], supply: float, create_slot: int,
+                               creators) -> float | None:
+    """Creator's create-slot buy as a fraction of supply. Pure."""
+    if not supply or supply <= 0 or create_slot is None:
+        return None
+    owners = _owner_set(creators)
+    if not owners:
+        return None
+    amount = 0.0
+    for b in buys or []:
+        if b.get("slot") is None or int(b["slot"]) != int(create_slot):
+            continue
+        owner = b.get("owner")
+        delta = _num(b.get("delta"), 0.0) or 0.0
+        if not owner or delta <= 0 or str(owner) not in owners:
+            continue
+        amount += float(delta)
+    return amount / float(supply)
 
 
 def fresh_holder_share(holders: list[dict], fresh_owners: set) -> dict:
@@ -640,7 +675,7 @@ def skip_flags(features: dict) -> dict:
 
 def would_skip(row: dict, rule_id: str) -> bool | None:
     """True if this rule would have skipped the entry. None = unknown/n/a."""
-    if not row or row.get("status") == STATUS_NA:
+    if not row or row.get("status") in (STATUS_NA, STATUS_UNAVAILABLE, STATUS_ERROR, STATUS_BUDGET):
         return None
     flags = skip_flags(row)
     by_id = {
@@ -752,6 +787,7 @@ def _owners_for(accounts: list[str], now: float | None = None) -> dict[str, dict
 
 def _signatures(address: str, limit: int = 20, before: str | None = None,
                 now: float | None = None) -> list[dict]:
+    """One getSignaturesForAddress page. Charges the rugrisk budget."""
     opts: dict = {"limit": max(1, min(int(limit), 1000))}
     if before:
         opts["before"] = before
@@ -761,14 +797,72 @@ def _signatures(address: str, limit: int = 20, before: str | None = None,
     for row in rows:
         if not isinstance(row, dict) or not row.get("signature"):
             continue
-        if row.get("err"):
-            continue
         out.append({
             "signature": row["signature"],
             "slot": row.get("slot"),
             "blockTime": row.get("blockTime"),
+            "err": row.get("err"),
         })
     return out
+
+
+def _mint_signature_history(mint: str, now: float | None = None) -> tuple[list[dict], bool, int]:
+    """Page mint signatures newest→oldest until exhausted or the page cap.
+
+    Returns (sigs newest-first, truncated, pages). truncated means the cap
+    (or budget) ran out before a short page, so the true create slot is unknown.
+    """
+    page_size = max(1, min(int(SIG_PAGE_SIZE), 1000))
+    max_pages = max(1, int(MINT_SIG_PAGES))
+    collected: list[dict] = []
+    before = None
+    pages = 0
+    exhausted = False
+    while pages < max_pages:
+        if not _can_charge(1, now):
+            break
+        raw = _signatures(mint, limit=page_size, before=before, now=now)
+        pages += 1
+        if not raw:
+            exhausted = True
+            break
+        collected.extend(raw)
+        if len(raw) < page_size:
+            exhausted = True
+            break
+        before = raw[-1]["signature"]
+    truncated = not exhausted
+    return collected, truncated, pages
+
+
+def _oldest_slot(sigs: list[dict]) -> int | None:
+    for row in reversed(sigs or []):
+        if row.get("slot") is not None:
+            return int(row["slot"])
+    return None
+
+
+def _tx_signers(tx: dict) -> list[str]:
+    """Fee-payer / required signers of a jsonParsed transaction."""
+    if not tx:
+        return []
+    msg = ((tx.get("transaction") or {}).get("message") or {})
+    keys = msg.get("accountKeys") or []
+    signers = []
+    for k in keys:
+        if isinstance(k, dict) and k.get("signer") and k.get("pubkey"):
+            signers.append(str(k["pubkey"]))
+    if signers:
+        return signers
+    n = _num((msg.get("header") or {}).get("numRequiredSignatures"), 0) or 0
+    for i, k in enumerate(keys):
+        if i >= int(n):
+            break
+        if isinstance(k, str):
+            signers.append(k)
+        elif isinstance(k, dict) and k.get("pubkey"):
+            signers.append(str(k["pubkey"]))
+    return signers
 
 
 def _transaction(sig: str, now: float | None = None) -> dict | None:
@@ -869,7 +963,8 @@ def _dev_history(creator: str, current_mint: str,
     if not creator or not _can_charge(1, now):
         return {**empty, "dev_prior_launches": None, "dev_prior_rugs": None}
     try:
-        sigs = _signatures(creator, limit=DEV_SIG_LIMIT, now=now)
+        sigs = [s for s in _signatures(creator, limit=DEV_SIG_LIMIT, now=now)
+                if not s.get("err")]
     except Exception as e:
         log.warning("young_trail_rugrisk dev sigs: %s", safe_err(e))
         return {**empty, "dev_prior_launches": None, "dev_prior_rugs": None}
@@ -945,16 +1040,54 @@ def compute_features(mint: str, creator: str | None = None,
         holders.sort(key=lambda h: h["amount"], reverse=True)
         top = [h for h in holders if not h.get("is_pool")][:TOP_HOLDERS]
 
-        mint_sigs = _signatures(mint, limit=MINT_SIG_LIMIT, now=ts) if _can_charge(1, ts) else []
-        # Newest first. Oldest in this window is a creation proxy for young tokens.
-        oldest_first = list(reversed(mint_sigs))
-        history_truncated = len(mint_sigs) >= MINT_SIG_LIMIT
+        mint_sigs, truncated, pages = _mint_signature_history(mint, now=ts)
+        if truncated:
+            features = {
+                "status": STATUS_UNAVAILABLE,
+                "error": "history_truncated",
+                "reason": "history_truncated",
+                "history_truncated": True,
+                "sniper_share": None,
+                "sniper_wallets": None,
+                "sniper_slots": sniper_slots(),
+                "bundled": None,
+                "bundled_buys": None,
+                "dev_wallet": creator,
+                "dev_prior_launches": None,
+                "dev_prior_rugs": None,
+                "dev_initial_share": None,
+                "fresh_holder_share": None,
+                "top_holder_n": len(top),
+                "create_slot": None,
+                "supply": supply,
+                "sig_pages": pages,
+            }
+            flags = skip_flags(features)
+            features.update(flags)
+            features["features_json"] = {
+                "create_slot": None,
+                "history_truncated": True,
+                "sig_pages": pages,
+                "sig_n": len(mint_sigs),
+            }
+            return features
+
+        create_slot = _oldest_slot(mint_sigs)
+        window_end = None if create_slot is None else int(create_slot) + sniper_slots()
+        window = []
+        for row in mint_sigs:
+            if row.get("err") or row.get("slot") is None or create_slot is None:
+                continue
+            slot = int(row["slot"])
+            if int(create_slot) <= slot <= window_end:
+                window.append(row)
+        window.sort(key=lambda r: (int(r["slot"]), r["signature"]))
         txs = []
-        for sig in oldest_first[:CREATE_TX_FETCH]:
+        for row in window:
             if not _can_charge(1, ts):
                 break
             try:
-                tx = _transaction(sig["signature"], now=ts)
+                tx = _transaction(row["signature"], now=ts)
             except Exception as e:
                 log.warning("young_trail_rugrisk tx: %s", safe_err(e))
                 continue
@@ -963,15 +1096,16 @@ def compute_features(mint: str, creator: str | None = None,
         buys: list[dict] = []
         for tx in txs:
             buys.extend(_buyers_from_tx(tx, mint))
-        create_slot = None
-        slots = [b["slot"] for b in buys if b.get("slot") is not None]
-        if slots:
-            create_slot = min(int(s) for s in slots)
-        elif oldest_first and oldest_first[0].get("slot") is not None:
-            create_slot = int(oldest_first[0]["slot"])
 
-        # Dev history before freshness: it feeds a skip rule; leftover then
-        # covers fresh-wallet share and the bundled-fresh OR-clause.
+        creators = _owner_set([creator] if creator else [])
+        for tx in txs:
+            if tx.get("slot") is None or create_slot is None:
+                continue
+            if int(tx["slot"]) != int(create_slot):
+                continue
+            creators.update(_tx_signers(tx))
+
+        # Dev history before freshness: it feeds a skip rule.
         dev = {"dev_prior_launches": None, "dev_prior_rugs": None, "prior_mints": []}
         if creator:
             dev = _dev_history(creator, mint, now=ts)
@@ -981,12 +1115,12 @@ def compute_features(mint: str, creator: str | None = None,
         for b in buys:
             if create_slot is not None and b.get("slot") == create_slot:
                 o = b.get("owner")
-                if o and o not in seen:
+                if o and o not in seen and str(o) not in creators:
                     seen.add(o)
                     candidates.append(o)
         for h in top:
             o = h.get("owner")
-            if o and o not in seen:
+            if o and o not in seen and str(o) not in creators:
                 seen.add(o)
                 candidates.append(o)
         fresh_owners: set[str] = set()
@@ -995,7 +1129,8 @@ def compute_features(mint: str, creator: str | None = None,
             if checked >= FRESH_WALLET_RPC_CAP or not _can_charge(1, ts):
                 break
             try:
-                wsigs = _signatures(owner, limit=WALLET_SIG_LIMIT, now=ts)
+                wsigs = [s for s in _signatures(owner, limit=WALLET_SIG_LIMIT, now=ts)
+                         if not s.get("err")]
             except Exception as e:
                 log.warning("young_trail_rugrisk wallet sigs: %s", safe_err(e))
                 continue
@@ -1004,40 +1139,50 @@ def compute_features(mint: str, creator: str | None = None,
                 fresh_owners.add(owner)
 
         sniper = sniper_share_from_buys(
-            buys, supply or 0.0, create_slot, sniper_slots(),
+            buys, supply or 0.0, create_slot, sniper_slots(), exclude=creators,
         )
-        bundled = bundled_from_buys(buys, create_slot, fresh_owners)
+        bundled = bundled_from_buys(
+            buys, create_slot, fresh_owners, exclude=creators,
+        )
         fresh = fresh_holder_share(top, fresh_owners)
+        dev_share = dev_initial_share_from_buys(
+            buys, supply or 0.0, create_slot, creators,
+        )
 
         status = STATUS_OK
         if supply is None or create_slot is None:
-            status = STATUS_UNAVAILABLE if not buys else STATUS_OK
+            status = STATUS_UNAVAILABLE
         features = {
             "status": status,
-            "sniper_share": sniper["sniper_share"],
-            "sniper_wallets": sniper["sniper_wallets"],
+            "sniper_share": sniper["sniper_share"] if status == STATUS_OK else None,
+            "sniper_wallets": sniper["sniper_wallets"] if status == STATUS_OK else None,
             "sniper_slots": sniper_slots(),
-            "bundled": bundled["bundled"],
-            "bundled_buys": bundled["bundled_buys"],
-            "dev_wallet": creator,
+            "bundled": bundled["bundled"] if status == STATUS_OK else None,
+            "bundled_buys": bundled["bundled_buys"] if status == STATUS_OK else None,
+            "dev_wallet": creator or (next(iter(creators), None)),
             "dev_prior_launches": dev.get("dev_prior_launches"),
             "dev_prior_rugs": dev.get("dev_prior_rugs"),
+            "dev_initial_share": dev_share if status == STATUS_OK else None,
             "fresh_holder_share": fresh["fresh_holder_share"],
             "top_holder_n": fresh["top_holder_n"],
-            "create_slot": create_slot,
-            "history_truncated": history_truncated,
+            "create_slot": create_slot if status == STATUS_OK else None,
+            "history_truncated": False,
             "supply": supply,
         }
         flags = skip_flags(features)
         features.update(flags)
         features["features_json"] = {
-            "create_slot": create_slot,
-            "history_truncated": history_truncated,
+            "create_slot": features["create_slot"],
+            "history_truncated": False,
+            "sig_pages": pages,
+            "sig_n": len(mint_sigs),
             "sniper_amount": sniper.get("sniper_amount"),
             "create_slot_buyers": bundled.get("create_slot_buyers"),
             "create_slot_fresh": bundled.get("create_slot_fresh"),
+            "creators": sorted(creators),
             "fresh_checked": checked,
             "prior_mints": (dev.get("prior_mints") or [])[:8],
+            "dev_initial_share": features["dev_initial_share"],
         }
         return features
     except Exception as e:
@@ -1132,7 +1277,8 @@ def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
              dev_prior_launches = ?, dev_prior_rugs = ?,
              fresh_holder_share = ?, top_holder_n = ?,
              skip_snipers = ?, skip_bundled = ?, skip_dev_rugs = ?,
-             features_json = ?, error = ?, source = ?, computed_ts = ?
+             features_json = ?, error = ?, source = ?, computed_ts = ?,
+             dev_initial_share = ?
            WHERE tid = ?""",
         (
             feat.get("status") or STATUS_ERROR,
@@ -1145,7 +1291,8 @@ def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
             None if flags["skip_snipers"] is None else int(flags["skip_snipers"]),
             None if flags["skip_bundled"] is None else int(flags["skip_bundled"]),
             None if flags["skip_dev_rugs"] is None else int(flags["skip_dev_rugs"]),
-            extra_s, err, source, float(now), tid,
+            extra_s, err, source, float(now),
+            feat.get("dev_initial_share"), tid,
         ),
     )
     db.commit()
