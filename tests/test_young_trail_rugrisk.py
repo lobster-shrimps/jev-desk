@@ -31,6 +31,7 @@ ACC_S2 = "AccS222222222222222222222222222222222"
 ACC_S3 = "AccS333333333333333333333333333333333"
 ACC_WH = "AccWhale11111111111111111111111111111"
 PUMP = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+CURVE = "CurveRugRisk1111111111111111111111111"
 CREATE_SLOT = 100
 
 
@@ -88,11 +89,13 @@ def _parsed_token_acc(owner, program=None):
 
 def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
                   creator_txs=None, mint_history=None, extra_txs=None,
-                  signer=None, tx_list=None):
+                  signer=None, tx_list=None, sig_by_addr=None, gtfa_by_addr=None):
     """Scripted Helius RPC. Counts calls. Never hits the network.
 
     `tx_list` is oldest-first mint txs: {signature, slot, deltas, ixs, signer}.
     `buys is None` uses the default bundled create-slot buys; pass [] for none.
+    Unknown addresses return no signatures (do not invent dummy histories).
+    `gtfa_by_addr is None` means getTransactionsForAddress is unsupported.
     """
     holders = holders or [
         (ACC_S1, 200, S1),
@@ -130,6 +133,7 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
         mint_sigs = list(mint_history)
     if extra_txs:
         txs.update(extra_txs)
+    sig_by_addr = dict(sig_by_addr or {})
 
     creator_txs = creator_txs or [
         ("devcreate", CREATE_SLOT - 50, PRIOR, "initializeMint",
@@ -174,11 +178,29 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
                 return mint_sigs[start:start + limit]
             if addr == DEV:
                 return creator_sigs[:limit]
-            n = int(wallet_n.get(addr, 20))
+            if addr in sig_by_addr:
+                rows = sig_by_addr[addr]
+                start = 0
+                if before:
+                    ids = [s["signature"] for s in rows]
+                    try:
+                        start = ids.index(before) + 1
+                    except ValueError:
+                        return []
+                return rows[start:start + limit]
+            n = wallet_n.get(addr)
+            if n is None:
+                return []
+            n = int(n)
             return [
                 {"signature": f"{addr[:6]}s{i}", "slot": CREATE_SLOT + i, "err": None}
                 for i in range(n)
             ][:limit]
+        if method == "getTransactionsForAddress":
+            if gtfa_by_addr is None:
+                raise RuntimeError("Method not found")
+            addr = params[0]
+            return {"data": list(gtfa_by_addr.get(addr) or [])}
         if method == "getTransaction":
             sig = params[0]
             if sig not in txs:
@@ -696,16 +718,15 @@ def test_unmarked_pnl_excluded_from_counterfactual(ytr):
 def test_truncated_history_unavailable_no_skip_flags(ytr, monkeypatch):
     _yt, helius, rug = ytr
     monkeypatch.setattr(rug, "SIG_PAGE_SIZE", 10)
-    monkeypatch.setattr(rug, "MINT_SIG_PAGES", 3)
     history = [
         {"signature": f"rec{i:03d}", "slot": 900 - i, "err": None}
         for i in range(30)
     ]
-    rpc = _rpc_scripted(mint_history=history)
+    rpc = _rpc_scripted(mint_history=history, creator_txs=[])
     rug.set_rpc_fn(rpc)
     helius.note_creator(TID, DEV, now=T0)
     rug.begin_cycle(T0)
-    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    feat = rug.compute_features(MINT, creator=None, now=T0)
     assert feat["status"] == "unavailable"
     assert feat.get("reason") == "history_truncated" or feat.get("error") == "history_truncated"
     assert feat["history_truncated"] is True
@@ -717,38 +738,12 @@ def test_truncated_history_unavailable_no_skip_flags(ytr, monkeypatch):
     assert feat["skip_dev_rugs"] is None
     assert rug.would_skip(feat, "snipers_gt_30") is None
     assert rug.would_skip(feat, "bundled") is None
-    methods = [c[0] for c in rpc.calls]
-    assert methods.count("getSignaturesForAddress") == 3
-    assert "getTransaction" not in methods
-
-
-def test_paginated_history_uses_true_create_slot(ytr, monkeypatch):
-    _yt, _helius, rug = ytr
-    monkeypatch.setattr(rug, "SIG_PAGE_SIZE", 10)
-    monkeypatch.setattr(rug, "MINT_SIG_PAGES", 5)
-    recent = [
-        {"signature": f"rec{i:03d}", "slot": 600 - i, "err": None}
-        for i in range(20)
+    mint_sig_calls = [
+        c for c in rpc.calls
+        if c[0] == "getSignaturesForAddress" and c[1][0] == MINT
     ]
-    # rec009 is slot 591: a fake first-page "create" that must not win.
-    history = recent + [
-        {"signature": "mintsig00", "slot": CREATE_SLOT, "err": None},
-    ]
-    rpc = _rpc_scripted(
-        mint_history=history,
-        extra_txs={"rec009": _tx(591, MINT, [(WHALE, 0, 900)])},
-    )
-    rug.set_rpc_fn(rpc)
-    rug.begin_cycle(T0)
-    feat = rug.compute_features(MINT, creator=DEV, now=T0)
-    assert feat["status"] == "ok"
-    assert feat["create_slot"] == CREATE_SLOT
-    assert feat["history_truncated"] is False
-    assert feat["sniper_share"] == pytest.approx(0.50)
-    tx_sigs = [c[1][0] for c in rpc.calls if c[0] == "getTransaction"]
-    assert "mintsig00" in tx_sigs
-    assert "rec009" not in tx_sigs
-    assert feat["sniper_wallets"] == 3
+    assert len(mint_sig_calls) == 1
+    assert [c[1][0] for c in rpc.calls if c[0] == "getTransaction"] == []
 
 
 def test_creator_create_slot_buy_excluded(ytr):
@@ -931,3 +926,168 @@ def test_new_entry_prioritized_ahead_of_older_pending(ytr, monkeypatch):
     assert rows[TID]["features_json"]
     extra = _feat_json(rows[TID])
     assert extra.get("calls_used", 0) >= 1
+
+
+def test_pump_global_pda_vector():
+    import young_trail_rugrisk as r
+    pda = r.find_program_address([b"global"], r.PUMP_PROGRAM_ID)
+    assert pda == "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"
+    assert r.bonding_curve_pda("not-a-pubkey") is None
+
+
+def _hot_mint_history(n=5001):
+    return [
+        {"signature": f"hot{i:05d}", "slot": 9000 - i, "err": None}
+        for i in range(n)
+    ]
+
+
+def test_hot_mint_finds_create_via_bonding_curve(ytr, monkeypatch):
+    """>5,000 mint sigs: bonding-curve short history still finds the create slot."""
+    _yt, helius, rug = ytr
+    monkeypatch.setattr(rug, "bonding_curve_pda", lambda *a, **k: CURVE)
+    monkeypatch.setattr(rug, "bonding_curve_v2_pda", lambda *a, **k: None)
+    curve_oldest = [
+        {
+            "signature": "csigcreate", "slot": CREATE_SLOT,
+            "deltas": [(DEV, 0, 50)],
+            "ixs": [_ix("create", MINT)], "signer": DEV,
+        },
+        {
+            "signature": "csigbuy1", "slot": CREATE_SLOT,
+            "deltas": [(S1, 0, 100)], "signer": S1,
+        },
+        {
+            "signature": "csigbuy2", "slot": CREATE_SLOT,
+            "deltas": [(S2, 0, 100)], "signer": S2,
+        },
+        {
+            "signature": "csigbuy3", "slot": CREATE_SLOT,
+            "deltas": [(S3, 0, 100)], "signer": S3,
+        },
+    ]
+    extra = {}
+    curve_sigs = []
+    for spec in curve_oldest:
+        extra[spec["signature"]] = _tx(
+            spec["slot"], MINT, spec.get("deltas") or [],
+            ixs=spec.get("ixs"), signer=spec.get("signer"),
+        )
+        curve_sigs.append({
+            "signature": spec["signature"], "slot": spec["slot"], "err": None,
+        })
+    rpc = _rpc_scripted(
+        buys=[],
+        mint_history=_hot_mint_history(),
+        extra_txs=extra,
+        sig_by_addr={CURVE: list(reversed(curve_sigs))},
+        wallet_n={S1: 1, S2: 1, S3: 1, DEV: 8, WHALE: 20},
+    )
+    rug.set_rpc_fn(rpc)
+    helius.note_creator(TID, DEV, now=T0)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["create_slot"] == CREATE_SLOT
+    assert feat["history_truncated"] is False
+    assert feat["bundled"] is True
+    assert feat["bundled_buys"] == 3
+    extra_j = feat.get("features_json") or {}
+    assert extra_j.get("window_src") == "bonding_curve"
+    assert extra_j.get("calls_used", 99) <= rug.TARGET_ENTRY_CALLS
+    mint_sig_calls = [
+        c for c in rpc.calls
+        if c[0] == "getSignaturesForAddress" and c[1][0] == MINT
+    ]
+    assert mint_sig_calls == []
+
+
+def test_hot_mint_finds_create_via_creator_wallet(ytr, monkeypatch):
+    _yt, helius, rug = ytr
+    monkeypatch.setattr(rug, "bonding_curve_pda", lambda *a, **k: None)
+    monkeypatch.setattr(rug, "bonding_curve_v2_pda", lambda *a, **k: None)
+    rpc = _rpc_scripted(
+        buys=[],
+        mint_history=_hot_mint_history(),
+        creator_txs=[
+            ("asigcreate", CREATE_SLOT, MINT, "create", [(DEV, 0, 50)]),
+            ("devother", CREATE_SLOT - 20, PRIOR, "initializeMint", [(DEV, 0, 1)]),
+        ],
+        extra_txs={
+            "asigcreate": _tx(
+                CREATE_SLOT, MINT, [(DEV, 0, 50)],
+                ixs=[_ix("create", MINT)], signer=DEV,
+            ),
+        },
+    )
+    rug.set_rpc_fn(rpc)
+    helius.note_creator(TID, DEV, now=T0)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["create_slot"] == CREATE_SLOT
+    assert feat["history_truncated"] is False
+    extra_j = feat.get("features_json") or {}
+    assert extra_j.get("window_src") == "creator"
+    assert extra_j.get("calls_used", 99) <= rug.TARGET_ENTRY_CALLS
+    mint_sig_calls = [
+        c for c in rpc.calls
+        if c[0] == "getSignaturesForAddress" and c[1][0] == MINT
+    ]
+    assert mint_sig_calls == []
+
+
+def test_no_create_path_unavailable_when_mint_history_is_hot(ytr, monkeypatch):
+    _yt, _helius, rug = ytr
+    monkeypatch.setattr(rug, "bonding_curve_pda", lambda *a, **k: None)
+    monkeypatch.setattr(rug, "bonding_curve_v2_pda", lambda *a, **k: None)
+    rpc = _rpc_scripted(
+        buys=[],
+        mint_history=_hot_mint_history(),
+        creator_txs=[],
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=None, now=T0)
+    assert feat["status"] == "unavailable"
+    assert feat["history_truncated"] is True
+    assert feat["create_slot"] is None
+    assert feat["skip_snipers"] is None
+    assert feat["skip_bundled"] is None
+    assert feat["skip_dev_rugs"] is None
+    mint_sig_calls = [
+        c for c in rpc.calls
+        if c[0] == "getSignaturesForAddress" and c[1][0] == MINT
+    ]
+    assert len(mint_sig_calls) == 1
+
+
+def test_reset_truncated_rows_requeues_for_new_path(ytr):
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = 'reset_truncated_create_path'"
+    )
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error, features_json
+           ) VALUES (?, 'RRK', 'solana', ?, 1.0, 'unavailable', ?, ?)""",
+        (TID, T0, "history_truncated", json.dumps({"history_truncated": True})),
+    )
+    other = "OtherMint111111111111111111111111111:1399811149"
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error
+           ) VALUES (?, 'OTH', 'solana', ?, 1.0, 'unavailable', ?)""",
+        (other, T0, "rpc timeout"),
+    )
+    db.commit()
+    rug._reset_truncated_rows(db)
+    db.commit()
+    rows = {r["tid"]: r for r in rug.all_rows()}
+    assert rows[TID]["status"] == "pending"
+    assert rows[TID]["error"] is None
+    assert rows[TID]["features_json"] in (None, "")
+    assert rows[TID]["source"] == "requeue"
+    assert rows[other]["status"] == "unavailable"
+    assert rows[other]["error"] == "rpc timeout"

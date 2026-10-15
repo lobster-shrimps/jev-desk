@@ -532,14 +532,17 @@ Helius RPC (`SOLANA_RPC_URL`) checks for a ≥20% dev sell, ≥30% top-3 holder 
 
 **`young_trail_rugrisk`:** paper analysis on the same young_trail entries, running
 until 20 Oct 2026. New entries are scored first (ahead of overnight backfill).
-Budgeted Helius RPC (`SOLANA_RPC_URL`) pages mint signatures back to the true
-create slot (up to 5×1000; a truncated window is `unavailable` and never skips).
-Creators are the FOMO/Helius wallet plus signers of the tx that contains the
-pump.fun create instruction — not every same-slot buyer. Sniper and bundled
-measures use that create tx plus the first 15 non-create txs in
-`create_slot..+32` (`window_capped` when more exist; ~25–30 RPC/entry). A tick
-that cannot finish that capped set stores `status=pending` with progress and
-resumes later; `ok` only when complete. `calls_used` is recorded per entry.
+Budgeted Helius RPC (`SOLANA_RPC_URL`) finds the create tx without paging mint
+history (young pump mints already have >5k signatures at entry): derive the
+pump.fun bonding-curve PDA, scan the creator wallet around launch, or use the
+LP/pool account; a Helius `getTransactionsForAddress` oldest-first query is
+used only when that RPC actually supports it. Truncated (none of those paths
+work) is `unavailable` and never skips. Creators are the FOMO/Helius wallet plus
+signers of the tx that contains the pump.fun create instruction — not every
+same-slot buyer. Sniper and bundled measures use that create tx plus the first
+15 non-create txs (`window_capped` when more exist; target ≤20 RPC/entry). A
+tick that cannot finish that capped set stores `status=pending` with progress
+and resumes later; `ok` only when complete. `calls_used` is recorded per entry.
 Also: creator prior rugs, create-slot buy (`dev_initial_share`), and
 fresh-wallet share among top holders (creator excluded). Non-Solana rows store
 `n/a`. Three skip rules (snipers >30%, bundled, dev with a prior rug) are scored
