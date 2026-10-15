@@ -575,6 +575,249 @@ def test_no_secrets_in_payload(yth, monkeypatch, caplog):
     assert "NEVERPRINT" not in blob
 
 
+def _insert_fast_mark(tid, ts, price, ticker="HLS"):
+    import research
+    rdb = research._connect()
+    rdb.execute(
+        """INSERT OR REPLACE INTO fast_marks (
+             ts, ts_sec, tid, chain, ticker, price_usd, source, origin
+           ) VALUES (?, ?, ?, 'solana', ?, ?, 'dex_batch', 'live')""",
+        (float(ts), int(ts), tid, ticker, float(price)),
+    )
+    rdb.commit()
+
+
+def test_absent_token_marked_from_stored_fast_marks_or_young_trail(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.sync_entries(now=T0)
+    _insert_fast_mark(TID, T0 + 60, 0.42)
+    helius.on_marks({}, now=T0 + 120)
+    row = [r for r in helius.open_rows() if r["tid"] == TID][0]
+    assert row["last_price"] == pytest.approx(0.42)
+    assert row["last_mark_ts"] == pytest.approx(T0 + 60)
+
+    mint2 = "MintStoredYt2222222222222222222222222"
+    tid2 = f"{mint2}:1399811149"
+    yt.consider_entries([_tok(tid=tid2, ticker="YST")], now=T0)
+    helius.sync_entries(now=T0)
+    yt.mark_open({tid2: 0.33}, now=T0 + 60)
+    helius.on_marks({}, now=T0 + 120)
+    row2 = [r for r in helius.open_rows() if r["tid"] == tid2][0]
+    assert row2["last_price"] == pytest.approx(0.33)
+    assert row2["last_price"] != pytest.approx(ENTRY)
+
+
+def test_signal_with_no_fresh_mark_is_unmarked_null_pnl(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.on_sampler_tick({TID: ENTRY}, now=T0)
+    assert helius.open_rows()
+    later = _rpc_ok(largest=_largest(
+        (ACC_DEV, 700), (ACC_T1, 800), (ACC_T2, 700),
+        (ACC_T3, 600), (ACC_POOL, 5000),
+    ))
+    helius.set_rpc_fn(later)
+    helius.set_time_fn(lambda: T0 + 16 * 60)
+    helius.on_sampler_tick({}, now=T0 + 16 * 60)
+    closed = helius.closed_rows(limit=None)
+    assert len(closed) == 1
+    assert closed[0]["exit_reason"] == "unmarked"
+    assert closed[0]["pnl_usd"] is None
+    assert closed[0]["pnl_usd"] != 0
+    assert closed[0]["exit_price"] is None
+    summary = helius.ops_payload()["summary"]
+    assert summary["closed_count"] == 0
+    assert summary["realized_pnl_usd"] == pytest.approx(0.0)
+    q = helius.quality()
+    assert q["signals"] == 0
+
+
+def test_6h_time_exit_fires(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.on_sampler_tick({TID: ENTRY}, now=T0)
+    helius.set_time_fn(lambda: T0 + 60)
+    helius.on_marks({TID: 0.80}, now=T0 + 60)
+    assert helius.open_rows()
+    helius.set_time_fn(lambda: T0 + 6 * 3600)
+    stats = helius.on_marks({}, now=T0 + 6 * 3600)
+    assert stats["closed"] == 1
+    row = helius.closed_rows(limit=None)[0]
+    assert row["exit_reason"] == "time"
+    assert row["exit_price"] == pytest.approx(0.80)
+    assert row["pnl_usd"] == pytest.approx(-10.0)
+    assert row["signal_type"] is None
+
+
+def test_rug_before_signal_negative_lead_not_true_positive(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.on_sampler_tick({TID: ENTRY}, now=T0)
+    later = _rpc_ok(largest=_largest(
+        (ACC_DEV, 700), (ACC_T1, 800), (ACC_T2, 700),
+        (ACC_T3, 600), (ACC_POOL, 5000),
+    ))
+    helius.set_rpc_fn(later)
+    helius.set_time_fn(lambda: T0 + 120)
+    helius.on_sampler_tick({TID: 0.60}, now=T0 + 120)
+
+    import research
+    research.reset()
+    rdb = research._connect()
+    rdb.execute(
+        """INSERT INTO token_labels (
+             tid, ticker, chain, first_seen_ts, first_free_ts, rugged, rug_ts,
+             time_to_rug_min, runner, updated_ts, origin
+           ) VALUES (?, 'HLS', 'solana', ?, ?, 1, ?, 1.0, 0, ?, 'live')""",
+        (TID, T0, T0, T0 + 30, T0 + 700),
+    )
+    rdb.commit()
+    q = helius.quality()
+    closed = helius.closed_rows(limit=None)[0]
+    assert closed["lead_min"] == pytest.approx((30 - 120) / 60.0)
+    assert closed["lead_min"] < 0
+    assert q["true_positives"] == 0
+    assert q["rugs_watched"] == 1
+    assert q["rugs_caught"] == 0
+    assert q["lead_n"] == 0
+    assert q["lead_min_median"] is None
+    assert q["precision"] == pytest.approx(0.0)
+
+
+def test_marking_when_helius_budget_exhausted(yth, monkeypatch):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.on_sampler_tick({TID: ENTRY}, now=T0)
+    monkeypatch.setenv("YOUNG_TRAIL_HELIUS_CYCLE_CAP", "0")
+    helius.begin_cycle(T0 + 60)
+    helius.set_time_fn(lambda: T0 + 60)
+    stats = helius.on_marks({TID: 0.55}, now=T0 + 60)
+    assert stats["checked"] == 0
+    assert stats["skipped"] >= 1
+    assert stats["marked"] == 1
+    row = helius.open_rows()[0]
+    assert row["last_price"] == pytest.approx(0.55)
+    assert row["last_mark_ts"] == pytest.approx(T0 + 60)
+    assert row["exit_ts"] is None
+
+
+def test_no_stale_entry_price_when_marks_exist_elsewhere(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.sync_entries(now=T0)
+    _insert_fast_mark(TID, T0 + 60, 0.31)
+    helius.on_marks({}, now=T0 + 31 * 60)
+    row = helius.open_rows()[0]
+    assert row["last_price"] != pytest.approx(ENTRY)
+    assert row["last_price"] == pytest.approx(0.31)
+    assert (T0 + 31 * 60) - float(row["entry_ts"]) > 30 * 60
+
+
+def test_signal_after_time_exit_is_logged_only(yth):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.on_sampler_tick({TID: ENTRY}, now=T0)
+    helius.on_marks({TID: 0.80}, now=T0 + 60)
+    helius.on_marks({}, now=T0 + 6 * 3600)
+    assert helius.closed_rows(limit=None)[0]["exit_reason"] == "time"
+    later = _rpc_ok(largest=_largest(
+        (ACC_DEV, 700), (ACC_T1, 800), (ACC_T2, 700),
+        (ACC_T3, 600), (ACC_POOL, 5000),
+    ))
+    helius.set_rpc_fn(later)
+    helius.set_time_fn(lambda: T0 + 6 * 3600 + 60)
+    stats = helius.on_marks({TID: 0.20}, now=T0 + 6 * 3600 + 60)
+    closed = helius.closed_rows(limit=None)
+    assert len(closed) == 1
+    assert closed[0]["exit_reason"] == "time"
+    assert closed[0]["pnl_usd"] == pytest.approx(-10.0)
+    assert stats["signals"] >= 1
+    sigs = helius.signal_rows(limit=None)
+    assert sigs and sigs[0]["signal_type"] == "dev_sell_20"
+
+
+OVERNIGHT = [
+    # ticker, stored exit multiple of $1 entry → pnl on a $50 ticket
+    ("RFC", 0.04, -48.0),
+    ("ELON2028", 0.06, -47.0),
+    ("WAP", 0.10, -45.0),
+    ("VEILTROLL", 0.20, -40.0),
+    ("Riot Games", 0.28, -36.0),
+    ("smol", 0.50, -25.0),
+]
+
+
+def test_replay_overnight_zero_closes_repairs_to_about_minus_241(yth):
+    yt, helius = yth
+    seeded = []
+    for i, (ticker, stored, _pnl) in enumerate(OVERNIGHT):
+        mint = f"Mint{ticker.replace(' ', '')}{'x' * 20}"[:40]
+        tid = f"{mint}:1399811149"
+        entry_ts = T0 + i
+        exit_ts = T0 + 3600
+        yt.consider_entries([_tok(tid=tid, ticker=ticker)], now=entry_ts)
+        helius.sync_entries(now=entry_ts)
+        yt.mark_open({tid: stored}, now=entry_ts + 60)
+        seeded.append((tid, exit_ts))
+    db = helius._connect()
+    for tid, exit_ts in seeded:
+        db.execute(
+            """UPDATE young_trail_helius
+               SET last_price = entry_price, last_mark_ts = entry_ts,
+                   signal_type = 'dev_sell_20', signal_ts = ?, signal_price = entry_price,
+                   pnl_usd = 0.0, exit_ts = ?, exit_price = entry_price,
+                   exit_reason = 'dev_sell_20'
+               WHERE tid = ?""",
+            (exit_ts, exit_ts, tid),
+        )
+    db.commit()
+    closed = helius.closed_rows(limit=None)
+    assert len(closed) == 6
+    assert all(r["pnl_usd"] == pytest.approx(0.0) for r in closed)
+    plan = helius.plan_zero_exit_repairs()
+    assert len(plan) == 6
+    diff = helius.format_repair_diff(plan)
+    assert "RFC" in diff
+    assert "ELON2028" in diff
+    dry_pnl = sum(p["new_pnl_usd"] or 0 for p in plan)
+    assert dry_pnl == pytest.approx(-241.0)
+    # dry-run must not write
+    assert all(r["pnl_usd"] == pytest.approx(0.0) for r in helius.closed_rows(limit=None))
+    n = helius.apply_zero_exit_repairs(plan)
+    assert n == 6
+    repaired = helius.closed_rows(limit=None)
+    assert sum(r["pnl_usd"] or 0 for r in repaired) == pytest.approx(-241.0)
+    assert all(r["exit_price"] != pytest.approx(r["entry_price"]) for r in repaired)
+
+
+def test_repair_script_dry_run_cli(yth, tmp_path, monkeypatch):
+    yt, helius = yth
+    _enter_sol(yt, helius, creator=DEV)
+    helius.sync_entries(now=T0)
+    yt.mark_open({TID: 0.50}, now=T0 + 60)
+    db = helius._connect()
+    db.execute(
+        """UPDATE young_trail_helius
+           SET last_price = entry_price, pnl_usd = 0.0,
+               exit_ts = ?, exit_price = entry_price, signal_type = 'dev_sell_20'
+           WHERE tid = ?""",
+        (T0 + 120, TID),
+    )
+    db.commit()
+    db_path = os.environ["OUTCOMES_DB"]
+    import repair_helius_zero_exits as repair
+    rc = repair.main(["--db", db_path])
+    assert rc == 0
+    row = helius.closed_rows(limit=None)[0]
+    assert row["pnl_usd"] == pytest.approx(0.0)
+    rc = repair.main(["--db", db_path, "--apply"])
+    assert rc == 0
+    helius.reset()
+    row = helius.closed_rows(limit=None)[0]
+    assert row["pnl_usd"] == pytest.approx(-25.0)
+
+
 def test_protected_files_untouched():
     for name in (
         "thresholds.py", "questions.py", "pick.py", "filter.py",
