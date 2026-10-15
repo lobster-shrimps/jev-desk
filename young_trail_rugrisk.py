@@ -3,7 +3,9 @@
 Copies the same tids as the young_trail / fast / helius ledgers. For Solana
 tokens, budgeted Helius RPC (SOLANA_RPC_URL) computes entry-time rug-risk
 features: sniper share, bundled launch buys, creator prior rugs, and fresh
-wallets among top holders. Non-Solana rows are stored as status='n/a'.
+wallets among top holders. The create tx is found via the pump.fun bonding
+curve, the creator wallet, or the pool account — not by paging mint history.
+Non-Solana rows are stored as status='n/a'.
 
 Skip rules are counterfactual only: they never gate entries, picks, or the
 judge. Fail open. Exceptions through safe_err. Never logs SOLANA_RPC_URL.
@@ -14,6 +16,7 @@ the shared Helius day budget.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -45,16 +48,26 @@ BUNDLED_MIN_BUYERS = 3
 FRESH_MAX_SIGS = 2
 DEV_RUG_SKIP = 1
 TOP_HOLDERS = 10
-# Page getSignaturesForAddress newest→oldest, 1000/page, up to 5 pages.
-# Truncated windows never yield a create slot (would skip on false snipers).
+# Do not page mint history. Hot pump mints already have >5k sigs at entry.
+# Find the create tx via the bonding-curve PDA, the creator wallet, or the
+# pool account (short histories), then take the first 15 non-create window
+# txs. Truncated (none of those paths work) is unavailable, never skip.
 SIG_PAGE_SIZE = 1000
-MINT_SIG_PAGES = 5
+MINT_SIG_PAGES = 1
 WALLET_SIG_LIMIT = 8
 DEV_SIG_LIMIT = 25
 FRESH_WALLET_RPC_CAP = 6
-# Sniper/bundled are scored on the create tx plus the first 15 non-create
-# txs in [create_slot, create_slot+SNIPER_SLOTS]. ~25–30 RPC/entry.
+CREATOR_CREATE_TX_CAP = 8
+# Sniper/bundled: create tx plus the first 15 non-create txs. Target ≤20 RPC.
 WINDOW_NON_CREATE_CAP = 15
+TARGET_ENTRY_CALLS = 20
+PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+BONDING_CURVE_SEED = b"bonding-curve"
+BONDING_CURVE_V2_SEED = b"bonding-curve-v2"
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_ED25519_P = 2**255 - 19
+_ED25519_D = (_ED25519_P - 121665) * pow(121666, _ED25519_P - 2, _ED25519_P) % _ED25519_P
+_ED25519_I = pow(2, (_ED25519_P - 1) // 4, _ED25519_P)
 
 STATUS_OK = "ok"
 STATUS_NA = "n/a"
@@ -104,6 +117,7 @@ _rpc_fn = None
 _overnight_fn = None
 _cycle_calls = 0
 _last_new_tids: list[str] = []
+_gtfa_supported: bool | None = None
 
 
 def set_time_fn(fn) -> None:
@@ -148,10 +162,11 @@ def _close_local() -> None:
 
 def reset() -> None:
     """Close this thread's cached connection. Tests call this."""
-    global _cycle_calls, _last_new_tids
+    global _cycle_calls, _last_new_tids, _gtfa_supported
     _close_local()
     _cycle_calls = 0
     _last_new_tids = []
+    _gtfa_supported = None
 
 
 def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
@@ -210,6 +225,37 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
     _schema_step(conn, "ytr_dev_initial_share", lambda: conn.execute(
         "ALTER TABLE young_trail_rugrisk ADD COLUMN dev_initial_share REAL"
     ))
+    _schema_step(conn, "ytr_reset_truncated_create_path",
+                 lambda: _reset_truncated_rows(conn))
+
+
+def _reset_truncated_rows(conn: sqlite3.Connection) -> None:
+    """Requeue history_truncated rows once so overnight backfill uses the new path."""
+    row = conn.execute(
+        "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
+        ("reset_truncated_create_path",),
+    ).fetchone()
+    if row and str(row["value"]) == "1":
+        return
+    conn.execute(
+        """UPDATE young_trail_rugrisk
+           SET status = 'pending',
+               sniper_share = NULL, sniper_wallets = NULL,
+               bundled = NULL, bundled_buys = NULL,
+               skip_snipers = NULL, skip_bundled = NULL, skip_dev_rugs = NULL,
+               features_json = NULL, error = NULL, computed_ts = NULL,
+               source = 'requeue'
+           WHERE status = 'unavailable'
+             AND (
+               IFNULL(error, '') LIKE '%history_truncated%'
+               OR IFNULL(features_json, '') LIKE '%history_truncated%'
+             )"""
+    )
+    conn.execute(
+        """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        ("reset_truncated_create_path", "1"),
+    )
 
 
 def _connect() -> sqlite3.Connection:
@@ -855,6 +901,404 @@ def _oldest_slot(sigs: list[dict]) -> int | None:
     return None
 
 
+def _b58decode(s: str) -> bytes | None:
+    if not s:
+        return None
+    n = 0
+    try:
+        for ch in s:
+            n = n * 58 + _B58_ALPHABET.index(ch)
+    except ValueError:
+        return None
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    out = b"\x00" * pad + raw
+    if len(out) != 32:
+        return None
+    return out
+
+
+def _b58encode(raw: bytes) -> str:
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58_ALPHABET[r] + out
+    pad = 0
+    for b in raw:
+        if b:
+            break
+        pad += 1
+    return ("1" * pad) + (out or "1")
+
+
+def _ed25519_on_curve(pubkey: bytes) -> bool:
+    if not pubkey or len(pubkey) != 32:
+        return False
+    y = int.from_bytes(pubkey, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    y2 = pow(y, 2, _ED25519_P)
+    u = (y2 - 1) % _ED25519_P
+    v = (_ED25519_D * y2 + 1) % _ED25519_P
+    x2 = u * pow(v, _ED25519_P - 2, _ED25519_P) % _ED25519_P
+    x = pow(x2, (_ED25519_P + 3) // 8, _ED25519_P)
+    if (x * x - x2) % _ED25519_P != 0:
+        x = (x * _ED25519_I) % _ED25519_P
+    if (x * x - x2) % _ED25519_P != 0:
+        return False
+    if (x % 2) != sign:
+        x = _ED25519_P - x
+    return True
+
+
+def find_program_address(seeds: list[bytes], program_id: str) -> str | None:
+    """Solana PDA. None if seeds/program are invalid."""
+    prog = _b58decode(program_id)
+    if prog is None or len(prog) != 32:
+        return None
+    nonce = 255
+    while nonce >= 0:
+        buf = b"".join(seeds) + bytes([nonce]) + prog + b"ProgramDerivedAddress"
+        digest = hashlib.sha256(buf).digest()
+        if not _ed25519_on_curve(digest):
+            return _b58encode(digest)
+        nonce -= 1
+    return None
+
+
+def bonding_curve_pda(mint: str, seed: bytes = BONDING_CURVE_SEED) -> str | None:
+    raw = _b58decode(mint)
+    if raw is None or len(raw) != 32:
+        return None
+    return find_program_address([seed, raw], PUMP_PROGRAM_ID)
+
+
+def bonding_curve_v2_pda(mint: str) -> str | None:
+    return bonding_curve_pda(mint, BONDING_CURVE_V2_SEED)
+
+
+def _helius_pool_account(mint: str) -> str | None:
+    if not mint:
+        return None
+    tid = f"{mint}:{SOL_NET}"
+    try:
+        import young_trail_helius as helius
+        row = helius._connect().execute(
+            "SELECT pool_account FROM young_trail_helius_watch WHERE tid = ?",
+            (tid,),
+        ).fetchone()
+        if row and row["pool_account"]:
+            return str(row["pool_account"])
+    except Exception:
+        return None
+    return None
+
+
+def _candidate_history_addrs(mint: str, holders: list | None) -> list[tuple[str, str]]:
+    """Short-history accounts: pump bonding curve, then LP/pool."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(src: str, addr: str | None) -> None:
+        if addr and addr not in seen:
+            seen.add(addr)
+            out.append((src, addr))
+
+    add("bonding_curve", bonding_curve_pda(mint))
+    add("bonding_curve_v2", bonding_curve_v2_pda(mint))
+    for h in holders or []:
+        if h.get("is_pool"):
+            add("pool", h.get("owner") or h.get("account"))
+    add("pool", _helius_pool_account(mint))
+    return out
+
+
+def _set_gtfa_supported(val: bool | None) -> None:
+    global _gtfa_supported
+    _gtfa_supported = val
+
+
+def _gtfa_oldest(address: str, now: float | None = None, limit: int = 16,
+                 slot_gte: int | None = None, slot_lte: int | None = None):
+    """Helius getTransactionsForAddress, oldest first. None if unsupported.
+
+    Probe once; cache the result. Method-not-found / unexpected errors fall
+    back without failing the entry. Budget exhaustion is re-raised.
+    """
+    if not address or _gtfa_supported is False:
+        return None
+    opts: dict = {
+        "transactionDetails": "full",
+        "encoding": "jsonParsed",
+        "sortOrder": "asc",
+        "limit": max(1, min(int(limit), 1000)),
+        "maxSupportedTransactionVersion": 0,
+        "filters": {"status": "succeeded"},
+    }
+    slot_f = {}
+    if slot_gte is not None:
+        slot_f["gte"] = int(slot_gte)
+    if slot_lte is not None:
+        slot_f["lte"] = int(slot_lte)
+    if slot_f:
+        opts["filters"]["slot"] = slot_f
+    try:
+        result = _rpc("getTransactionsForAddress", [address, opts], now=now)
+    except Exception as e:
+        msg = str(e).lower()
+        if "budget" in msg:
+            raise
+        _set_gtfa_supported(False)
+        log.warning("young_trail_rugrisk gtfa unsupported: %s", safe_err(e))
+        return None
+    _set_gtfa_supported(True)
+    rows = []
+    if isinstance(result, dict):
+        rows = result.get("data") or result.get("transactions") or []
+    elif isinstance(result, list):
+        rows = result
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        parsed = _gtfa_row_to_tx(row)
+        if parsed:
+            out.append(parsed)
+    return out
+
+
+def _gtfa_row_to_tx(row: dict) -> dict | None:
+    tx_body = row.get("transaction") if isinstance(row.get("transaction"), dict) else None
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else None
+    if tx_body is None and isinstance(row.get("value"), dict):
+        tx_body = (row["value"] or {}).get("transaction")
+        meta = (row["value"] or {}).get("meta")
+    sig = row.get("signature")
+    if not sig and isinstance(tx_body, dict):
+        sigs = tx_body.get("signatures") or []
+        if sigs:
+            sig = sigs[0]
+    if not sig:
+        return None
+    tx = {
+        "slot": row.get("slot"),
+        "transaction": tx_body or {"message": {}, "signatures": [sig]},
+        "meta": meta or {},
+    }
+    return {"signature": str(sig), "slot": row.get("slot"), "tx": tx}
+
+
+def _commit_window(prog: dict, recs: dict, ordered_sigs: list[str], src: str,
+                   allow_oldest: bool = False) -> bool:
+    """True when ordered recs contain a CREATE_IX tx. Mutates prog.
+
+    Exhausted short histories may use the oldest sig as the create slot when
+    the create instruction wasn't parsed.
+    """
+    cap_n = max(0, int(WINDOW_NON_CREATE_CAP))
+    create_sig = None
+    non: list[str] = []
+    for sig in ordered_sigs:
+        rec = recs.get(sig) or {}
+        if rec.get("has_create_ix") and not create_sig:
+            create_sig = sig
+        elif sig != create_sig and len(non) < cap_n:
+            non.append(sig)
+    if not create_sig:
+        if not (allow_oldest and ordered_sigs):
+            return False
+        first = recs.get(ordered_sigs[0]) or {}
+        if first.get("slot") is None:
+            return False
+        create_sig = ordered_sigs[0]
+        non = [s for s in ordered_sigs[1:] if s != create_sig][:cap_n]
+    slot = (recs.get(create_sig) or {}).get("slot")
+    to_fetch = [create_sig] + [s for s in non if s != create_sig]
+    scored = set(to_fetch)
+    prog["tx_recs"] = recs
+    prog["create_sig"] = create_sig
+    prog["create_slot"] = slot
+    prog["non_create_sigs"] = non
+    prog["to_fetch"] = to_fetch
+    prog["window_capped"] = any(s not in scored for s in ordered_sigs)
+    prog["window_src"] = src
+    prog["window_done"] = True
+    return True
+
+
+def _fill_create_window(mint: str, creator: str | None, holders: list | None,
+                        now: float, prog: dict) -> str:
+    """Locate create + first 15 non-create txs without paging mint history.
+
+    Returns 'ok' | 'pending' | 'truncated'.
+    """
+    if prog.get("window_done") and prog.get("create_sig"):
+        return "ok"
+    cap_n = max(0, int(WINDOW_NON_CREATE_CAP))
+    recs: dict = dict(prog.get("tx_recs") or {})
+    tried = set(prog.get("tried_addrs") or [])
+    addr_sigs: dict = dict(prog.get("addr_sigs") or {})
+    addrs = _candidate_history_addrs(mint, holders)
+
+    def save():
+        prog["tx_recs"] = recs
+        prog["tried_addrs"] = sorted(tried)
+        prog["addr_sigs"] = addr_sigs
+
+    def ingest_gtfa(rows, src) -> bool:
+        if not rows:
+            return False
+        ordered = []
+        for row in rows:
+            sig = row["signature"]
+            recs[sig] = _tx_record(sig, row.get("tx"), mint)
+            ordered.append(sig)
+        if _commit_window(prog, recs, ordered, src):
+            if len(ordered) >= cap_n + 1:
+                prog["window_capped"] = True
+            return True
+        return False
+
+    def ingest_exhausted_sigs(sigs, src) -> str | None:
+        """Newest-first page. None = keep looking; pending/ok otherwise."""
+        if not sigs or len(sigs) >= max(1, min(int(SIG_PAGE_SIZE), 1000)):
+            return None
+        oldest = list(reversed([s for s in sigs if s.get("signature") and not s.get("err")]))
+        take = oldest[: cap_n + 1]
+        for row in take:
+            sig = row["signature"]
+            if sig in recs:
+                continue
+            if not _can_charge(1, now):
+                save()
+                return "pending"
+            try:
+                tx = _transaction(sig, now=now)
+            except Exception as e:
+                log.warning("young_trail_rugrisk tx: %s", safe_err(e))
+                tx = None
+            recs[sig] = _tx_record(sig, tx, mint)
+        ordered = [r["signature"] for r in take]
+        if _commit_window(prog, recs, ordered, src, allow_oldest=True):
+            prog["window_capped"] = len(oldest) > len(prog.get("to_fetch") or [])
+            return "ok"
+        return None
+
+    for src, addr in addrs:
+        if addr in tried:
+            continue
+        if addr not in addr_sigs and _gtfa_supported is not False:
+            if not _can_charge(1, now):
+                save()
+                return "pending"
+            rows = _gtfa_oldest(addr, now=now, limit=cap_n + 1)
+            if ingest_gtfa(rows, src + "+gtfa"):
+                return "ok"
+        if addr not in addr_sigs:
+            if not _can_charge(1, now):
+                save()
+                return "pending"
+            try:
+                sigs = _signatures(addr, limit=min(int(SIG_PAGE_SIZE), 1000), now=now)
+            except Exception as e:
+                log.warning("young_trail_rugrisk curve sigs: %s", safe_err(e))
+                sigs = []
+            addr_sigs[addr] = sigs
+            save()
+        hit = ingest_exhausted_sigs(addr_sigs.get(addr) or [], src)
+        if hit == "pending":
+            return "pending"
+        if hit == "ok":
+            return "ok"
+        tried.add(addr)
+        save()
+
+    # Creator wallet around launch (short; at entry the create tx is recent).
+    if creator and not prog.get("creator_scanned"):
+        if not _can_charge(1, now):
+            save()
+            return "pending"
+        try:
+            csigs = [s for s in _signatures(creator, limit=DEV_SIG_LIMIT, now=now)
+                     if not s.get("err")]
+        except Exception as e:
+            log.warning("young_trail_rugrisk creator sigs: %s", safe_err(e))
+            csigs = []
+        idx = int(prog.get("creator_scan_i") or 0)
+        cap_tx = min(len(csigs), max(0, int(CREATOR_CREATE_TX_CAP)))
+        create_sig = None
+        while idx < cap_tx:
+            if not _can_charge(1, now):
+                prog["creator_scan_i"] = idx
+                save()
+                return "pending"
+            sig = csigs[idx]["signature"]
+            idx += 1
+            if sig not in recs:
+                try:
+                    tx = _transaction(sig, now=now)
+                except Exception as e:
+                    log.warning("young_trail_rugrisk creator tx: %s", safe_err(e))
+                    tx = None
+                recs[sig] = _tx_record(sig, tx, mint)
+            if recs[sig].get("has_create_ix"):
+                create_sig = sig
+                break
+        prog["creator_scan_i"] = idx
+        prog["creator_scanned"] = True
+        save()
+        if create_sig:
+            slot = (recs.get(create_sig) or {}).get("slot")
+            if _gtfa_supported is not False and slot is not None:
+                for src, addr in addrs:
+                    if not _can_charge(1, now):
+                        save()
+                        return "pending"
+                    rows = _gtfa_oldest(
+                        addr, now=now, limit=cap_n + 1,
+                        slot_gte=int(slot),
+                        slot_lte=int(slot) + sniper_slots(),
+                    )
+                    if ingest_gtfa(rows, src + "+creator+gtfa"):
+                        return "ok"
+            # Window from the create tx alone if it already carries the buys
+            # (bundled same-tx). Still mark src=creator.
+            if _commit_window(prog, recs, [create_sig], "creator"):
+                # Only the create tx: sniper/bundled from that tx's buyers.
+                prog["window_capped"] = False
+                return "ok"
+
+    # Last resort: one newest-first mint page, trusted only when exhausted.
+    mint_sigs = prog.get("mint_sigs")
+    if mint_sigs is None and not prog.get("mint_last_resort"):
+        if not _can_charge(1, now):
+            save()
+            return "pending"
+        try:
+            mint_sigs = _signatures(mint, limit=min(int(SIG_PAGE_SIZE), 1000), now=now)
+        except Exception as e:
+            log.warning("young_trail_rugrisk mint sigs: %s", safe_err(e))
+            mint_sigs = []
+        prog["mint_last_resort"] = True
+        prog["mint_sigs"] = mint_sigs
+        prog["sig_pages"] = 1
+        save()
+    if mint_sigs is not None:
+        hit = ingest_exhausted_sigs(mint_sigs, "mint")
+        if hit == "pending":
+            return "pending"
+        if hit == "ok":
+            return "ok"
+        # Full page: true oldest unknown. Do not page further.
+        if mint_sigs and len(mint_sigs) >= max(1, min(int(SIG_PAGE_SIZE), 1000)):
+            return "truncated"
+
+    if prog.get("create_sig") and prog.get("window_done"):
+        return "ok"
+    return "truncated"
+
+
 def _tx_has_create_ix(tx: dict, mint: str | None = None) -> bool:
     """True when this tx contains a mint/create instruction for `mint`."""
     if not tx:
@@ -1160,19 +1604,11 @@ def compute_features(mint: str, creator: str | None = None,
         holders = prog.get("holders") or []
         top = prog.get("top") or []
 
-        if not prog.get("sigs_done"):
-            hist = _mint_signature_history(
-                mint, now=ts,
-                collected=prog.get("mint_sigs"),
-                pages=int(prog.get("sig_pages") or 0),
-                before=prog.get("sig_before"),
-            )
-            prog["mint_sigs"] = hist["sigs"]
-            prog["sig_pages"] = hist["pages"]
-            prog["sig_before"] = hist["before"]
-            if hist["state"] == "budget":
+        if not prog.get("window_done"):
+            found = _fill_create_window(mint, creator, holders, ts, prog)
+            if found == "pending":
                 return pending()
-            if hist["state"] == "truncated":
+            if found != "ok":
                 used = calls_used()
                 feat = _blank_features(
                     STATUS_UNAVAILABLE, creator, error="history_truncated",
@@ -1182,89 +1618,27 @@ def compute_features(mint: str, creator: str | None = None,
                 feat["features_json"] = {
                     "create_slot": None,
                     "history_truncated": True,
-                    "sig_pages": hist["pages"],
-                    "sig_n": len(hist["sigs"]),
+                    "window_src": prog.get("window_src"),
+                    "sig_pages": prog.get("sig_pages"),
+                    "sig_n": len(prog.get("mint_sigs") or []),
                     "calls_used": used,
                 }
                 return feat
-            prog["sigs_done"] = True
 
         mint_sigs = prog.get("mint_sigs") or []
         create_slot = prog.get("create_slot")
-        if create_slot is None:
-            create_slot = _oldest_slot(mint_sigs)
-            prog["create_slot"] = create_slot
-        if create_slot is None:
+        create_sig = prog.get("create_sig")
+        tx_recs: dict = dict(prog.get("tx_recs") or {})
+        to_fetch = list(prog.get("to_fetch") or [])
+        if create_slot is None or not create_sig:
             used = calls_used()
             feat = _blank_features(
-                STATUS_UNAVAILABLE, creator, error="no create slot",
+                STATUS_UNAVAILABLE, creator, error="history_truncated",
+                reason="history_truncated", history_truncated=True,
                 supply=supply, top_holder_n=len(top),
             )
-            feat["features_json"] = {"calls_used": used, "history_truncated": False}
+            feat["features_json"] = {"calls_used": used, "history_truncated": True}
             return feat
-
-        tx_recs: dict = dict(prog.get("tx_recs") or {})
-        in_window = prog.get("in_window") or _in_window_sigs(
-            mint_sigs, create_slot, sniper_slots(),
-        )
-        prog["in_window"] = in_window
-
-        # Oldest-first: CREATE_IX tx plus the first 15 non-create txs. Stop
-        # fetching once that capped set is complete (~16 getTransaction).
-        create_sig = prog.get("create_sig")
-        non_create_sigs = list(prog.get("non_create_sigs") or [])
-        window_index = int(prog.get("window_index") or 0)
-        cap_n = max(0, int(WINDOW_NON_CREATE_CAP))
-
-        def save_window():
-            prog["tx_recs"] = tx_recs
-            prog["create_sig"] = create_sig
-            prog["non_create_sigs"] = non_create_sigs
-            prog["window_index"] = window_index
-
-        while window_index < len(in_window):
-            have_create = bool(create_sig)
-            have_nc = len(non_create_sigs) >= cap_n
-            row = in_window[window_index]
-            slot = int(row["slot"])
-            # Done: create + 15 non-create collected.
-            if have_create and have_nc:
-                break
-            # Missing CREATE_IX: do not walk past the create slot after 15.
-            if have_nc and (not have_create) and slot > int(create_slot):
-                break
-            sig = row["signature"]
-            if sig not in tx_recs:
-                if not _can_charge(1, ts):
-                    save_window()
-                    return pending()
-                try:
-                    tx = _transaction(sig, now=ts)
-                except Exception as e:
-                    log.warning("young_trail_rugrisk tx: %s", safe_err(e))
-                    tx = None
-                tx_recs[sig] = _tx_record(sig, tx, mint)
-            rec = tx_recs.get(sig) or {}
-            if rec.get("has_create_ix") and not create_sig:
-                create_sig = sig
-            elif sig != create_sig and len(non_create_sigs) < cap_n:
-                if sig not in non_create_sigs:
-                    non_create_sigs.append(sig)
-            window_index += 1
-
-        save_window()
-        scored = set(non_create_sigs)
-        if create_sig:
-            scored.add(create_sig)
-        prog["window_capped"] = any(
-            r["signature"] not in scored for r in in_window
-        )
-        to_fetch = []
-        if create_sig:
-            to_fetch.append(create_sig)
-        to_fetch.extend(s for s in non_create_sigs if s != create_sig)
-        prog["to_fetch"] = to_fetch
-        prog["window_done"] = True
 
         buys: list[dict] = []
         for sig in to_fetch:
@@ -1383,6 +1757,7 @@ def compute_features(mint: str, creator: str | None = None,
             "window_capped": bool(prog.get("window_capped")),
             "calls_used": used,
             "create_sig": create_sig,
+            "window_src": prog.get("window_src"),
         }
         return features
     except Exception as e:
