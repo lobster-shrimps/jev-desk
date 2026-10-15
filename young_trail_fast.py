@@ -24,8 +24,8 @@ SL_PCT = -0.30
 TRAIL_PCT = 0.30
 WINDOW_SEC = 6 * 3600
 LOCK_TIMEOUT_SEC = 0.2
-# Same wall-clock end as the live young_trail week (2026-10-20 7:38 AM ET).
-DEFAULT_UNTIL_ISO = "2026-10-20T11:38:07Z"
+# Same wall-clock end as young_trail: 2026-10-20 23:59 ET.
+DEFAULT_UNTIL_ISO = "2026-10-21T03:59:59Z"
 
 FAST_VARIANTS: list[dict] = [
     {"id": "baseline", "sl_pct": SL_PCT, "trail_pct": TRAIL_PCT,
@@ -207,27 +207,21 @@ def deploy_ts(now: float | None = None) -> float:
 
 
 def until_ts(now: float | None = None) -> float:
-    """Same experiment end as young_trail (2026-10-20 7:38 AM ET)."""
+    """Same experiment end as young_trail (2026-10-20 23:59 ET)."""
     raw = os.environ.get("YOUNG_TRAIL_FAST_UNTIL")
     parsed = _parse_until(raw) if raw else None
     if parsed is not None:
         return parsed
-    stored = _meta_get("until_ts")
-    if stored:
-        try:
-            return float(stored)
-        except (TypeError, ValueError):
-            pass
     try:
         import young_trail
         ts = float(young_trail.until_ts(now))
-        _meta_set("until_ts", str(ts))
-        return ts
     except Exception as e:
         log.warning("young_trail_fast until from young_trail: %s", safe_err(e))
-    fallback = _parse_until(DEFAULT_UNTIL_ISO) or 0.0
-    _meta_set("until_ts", str(fallback))
-    return fallback
+        ts = _parse_until(DEFAULT_UNTIL_ISO) or 0.0
+    stored = _meta_get("until_ts")
+    if stored != str(ts):
+        _meta_set("until_ts", str(ts))
+    return ts
 
 
 def accepting_entries(now: float | None = None) -> bool:

@@ -526,6 +526,10 @@ def test_no_gating_imports_or_protected_files():
     ):
         text = (ROOT / name).read_text()
         assert "young_trail_rugrisk" not in text, name
+    for name in (
+        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "collect.py", "judge.py", "young_trail_variants.py",
+    ):
         r = subprocess.run(
             ["git", "diff", "--", name],
             cwd=str(ROOT), capture_output=True, text=True, check=True,
@@ -613,12 +617,21 @@ def test_schema_idempotent_and_safe_on_live_db(tmp_path, monkeypatch):
     young_trail_rugrisk.reset()
 
 
-def test_until_matches_young_trail_oct20(ytr, monkeypatch):
+def test_schema_alter_skips_existing_column(ytr, caplog):
+    caplog.set_level(logging.WARNING)
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    rug._add_column(db, "young_trail_rugrisk", "dev_initial_share", "REAL")
+    rug._add_column(db, "young_trail_rugrisk", "dev_initial_share", "REAL")
+    rug.init_schema()
+    assert "duplicate column" not in caplog.text.lower()
+
+
+def test_until_matches_young_trail_oct20(ytr):
     yt, _helius, rug = ytr
-    monkeypatch.setenv("YOUNG_TRAIL_UNTIL", "2026-10-20T11:38:07Z")
     assert rug.until_ts(T0) == pytest.approx(yt.until_ts(T0))
     iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(rug.until_ts(T0)))
-    assert iso.startswith("2026-10-20T")
+    assert iso == "2026-10-21T03:59:59Z"
 
 
 def test_ops_payload_and_endpoint(ytr):
@@ -1091,3 +1104,72 @@ def test_reset_truncated_rows_requeues_for_new_path(ytr):
     assert rows[TID]["source"] == "requeue"
     assert rows[other]["status"] == "unavailable"
     assert rows[other]["error"] == "rpc timeout"
+
+
+def test_get_transaction_sets_max_supported_version(ytr):
+    _yt, helius, rug = ytr
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    helius.note_creator(TID, DEV, now=T0)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    tx_calls = [c for c in rpc.calls if c[0] == "getTransaction"]
+    assert tx_calls
+    for _method, params in tx_calls:
+        assert isinstance(params[1], dict)
+        assert params[1].get("maxSupportedTransactionVersion") == 0
+    for _method, params in rpc.calls:
+        if _method in ("getTransaction", "getBlock", "getTransactionsForAddress"):
+            assert isinstance(params[1], dict)
+            assert params[1].get("maxSupportedTransactionVersion") == 0
+
+
+def test_gtfa_network_blip_retries_after_cooldown(ytr, monkeypatch):
+    _yt, _helius, rug = ytr
+    monkeypatch.setattr(rug, "GTFA_RETRY_SEC", 1800)
+    n = {"gtfa": 0}
+    inner = _rpc_scripted()
+
+    def rpc(method, params, timeout):
+        if method == "getTransactionsForAddress":
+            n["gtfa"] += 1
+            raise ConnectionError("timed out contacting rpc")
+        return inner(method, params, timeout)
+
+    rpc.calls = inner.calls
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    addr = "SomeCurve11111111111111111111111111"
+    assert rug._gtfa_oldest(addr, now=T0) is None
+    assert rug._gtfa_supported is not False
+    assert n["gtfa"] == 1
+    rug.begin_cycle(T0)
+    assert rug._gtfa_oldest(addr, now=T0 + 60) is None
+    assert n["gtfa"] == 1
+    rug.begin_cycle(T0)
+    assert rug._gtfa_oldest(addr, now=T0 + 1800) is None
+    assert n["gtfa"] == 2
+
+
+def test_gtfa_method_not_found_stays_unsupported(ytr):
+    _yt, _helius, rug = ytr
+    n = {"gtfa": 0}
+    inner = _rpc_scripted()
+
+    def rpc(method, params, timeout):
+        if method == "getTransactionsForAddress":
+            n["gtfa"] += 1
+            raise RuntimeError("Method not found")
+        return inner(method, params, timeout)
+
+    rpc.calls = inner.calls
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    addr = "SomeCurve11111111111111111111111111"
+    assert rug._gtfa_oldest(addr, now=T0) is None
+    assert rug._gtfa_supported is False
+    assert n["gtfa"] == 1
+    rug.begin_cycle(T0)
+    assert rug._gtfa_oldest(addr, now=T0 + 3600) is None
+    assert n["gtfa"] == 1

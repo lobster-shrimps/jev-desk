@@ -501,7 +501,7 @@ Paper only. A token that free-passes with `age_minutes < 60` is bought once (fir
 at a $50 ticket. Marks use DexScreener, never GeckoTerminal. Does not change
 `young_trail` live rules from the cycle's point of view, and does not change
 `thresholds.py`, `pick.py`, `filter.py`, `questions.py`, or `collect.py`. Same experiment
-end as the live week: **2026-10-20 7:38 AM ET**.
+end as the live week: **2026-10-20 11:59 PM ET**.
 
 **Baseline exits** (whichever first): hard stop −30% from entry, 30% trail from peak
 (price ≤ peak × 0.7), time exit at 6h.

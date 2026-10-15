@@ -93,7 +93,7 @@ Page: `GET /ops` (`ops.html`, no external URLs, no secrets). JSON:
 ## 7. Paper young_trail
 
 $50 ticket, first tid, free-pass and `age_minutes < 60`. Dex marks only. Ends
-2026-10-20 7:38 AM ET.
+2026-10-20 11:59 PM ET.
 
 - **Baseline:** −30% stop, 30% trail from peak, 6h.
 - **Variants (per-cycle marks):** `tp_50`, `tp_100`, `half_50_trail`, `trail_20`,

@@ -253,12 +253,11 @@ def test_schema_steps_commit_independently(tmp_path, monkeypatch):
     young_trail_fast.reset()
 
 
-def test_until_matches_young_trail_oct20(ytf, monkeypatch):
+def test_until_matches_young_trail_oct20(ytf):
     yt, fast = ytf
-    monkeypatch.setenv("YOUNG_TRAIL_UNTIL", "2026-10-20T11:38:07Z")
     assert fast.until_ts(T0) == pytest.approx(yt.until_ts(T0))
     iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(fast.until_ts(T0)))
-    assert iso.startswith("2026-10-20T")
+    assert iso == "2026-10-21T03:59:59Z"
 
 
 def test_ops_payload_and_endpoint(ytf):

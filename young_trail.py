@@ -36,7 +36,8 @@ TICKET_USD = 50.0
 SL_PCT = -0.30
 TRAIL_PCT = 0.30
 WINDOW_SEC = 6 * 3600
-EXPERIMENT_SEC = 7 * 86400
+# Rob's chosen end: 2026-10-20 23:59 ET (EDT). Override with YOUNG_TRAIL_UNTIL.
+DEFAULT_UNTIL_ISO = "2026-10-21T03:59:59Z"
 HTTP_TIMEOUT = 5
 DEX_CYCLE_BUDGET_SEC = 20.0
 LOCK_TIMEOUT_SEC = 0.2
@@ -172,6 +173,9 @@ def _parse_until(raw: str) -> float | None:
     for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
             t = time.strptime(s, fmt)
+            if fmt == "%Y-%m-%dT%H:%M:%SZ":
+                import calendar
+                return float(calendar.timegm(t))
             ts = time.mktime(t)
             if fmt == "%Y-%m-%d":
                 ts += 86400 - 1
@@ -206,20 +210,17 @@ def _meta_set(key: str, value: str) -> None:
 
 
 def until_ts(now: float | None = None) -> float:
-    """Experiment end. YOUNG_TRAIL_UNTIL env wins; else persist now+7d on first use."""
+    """Experiment end. YOUNG_TRAIL_UNTIL env wins; else 2026-10-20 23:59 ET."""
     raw = os.environ.get("YOUNG_TRAIL_UNTIL")
     parsed = _parse_until(raw) if raw else None
     if parsed is not None:
         return parsed
+    ts = _parse_until(DEFAULT_UNTIL_ISO) or 0.0
     stored = _meta_get("until_ts")
-    if stored:
-        try:
-            return float(stored)
-        except (TypeError, ValueError):
-            pass
-    ts = (current_time() if now is None else float(now)) + EXPERIMENT_SEC
-    _meta_set("until_ts", str(ts))
-    _meta_set("deploy_ts", str(current_time() if now is None else float(now)))
+    if stored != str(ts):
+        _meta_set("until_ts", str(ts))
+    if not _meta_get("deploy_ts"):
+        _meta_set("deploy_ts", str(current_time() if now is None else float(now)))
     return ts
 
 

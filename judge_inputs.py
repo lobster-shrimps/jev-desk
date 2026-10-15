@@ -191,6 +191,14 @@ def _balance_for(entries, mint: str, owner: str) -> int | None:
 
 
 def _rpc(method: str, params, timeout: float):
+    if method in ("getTransaction", "getBlock"):
+        params = list(params or [])
+        if len(params) == 1:
+            params.append({"maxSupportedTransactionVersion": 0})
+        elif len(params) >= 2 and isinstance(params[1], dict):
+            cfg = dict(params[1])
+            cfg["maxSupportedTransactionVersion"] = 0
+            params[1] = cfg
     if _rpc_fn is not None:
         return _rpc_fn(method, params, timeout)
     rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
