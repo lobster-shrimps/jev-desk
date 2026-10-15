@@ -20,9 +20,12 @@ Beside that loop sit a few side experiments, all still on paper. The young-token
 test follows very new coins and tries exit variants — different rules for when to
 sell. A faster version of the same entries checks prices every sixty seconds.
 Helius wallet-watch looks for rug signals: sudden insider dumps that collapse the
-price. And research.db is a local file that records every sighting and outcome so
-a rule can be backtested, meaning replayed against past data, before anyone treats
-it as real.
+price. A rug-avoidance entry test scores the same young_trail names at entry
+(sniper share, bundled launch buys, the creator's prior rugs, fresh wallets among
+top holders) and records what P&L would have been if those names had been skipped;
+it never blocks a pick or the judge. And research.db is a local file that records
+every sighting and outcome so a rule can be backtested, meaning replayed against
+past data, before anyone treats it as real.
 
 ```mermaid
 flowchart LR
@@ -35,10 +38,12 @@ flowchart LR
     F -. young tokens .-> Y[Young-token test<br/>exit variants]
     Y --> FC[60s fast checks]
     Y --> HW[Helius wallet watch<br/>rug signals]
+    Y --> RR[Rug-risk skip test]
     E --> R[(research.db)]
     Y --> R
     FC --> R
     HW --> R
+    RR --> R
     R --> B[Backtests]
 ```
 
@@ -133,6 +138,7 @@ Still true: every number in `thresholds.py` is the guide author's rather than yo
 | `young_trail_variants.py` | paper | Exit-rule replay on the same per-cycle marks. |
 | `young_trail_fast.py` | paper | Same entries, baseline + `tp_50`, evaluated on 60s Dex marks. |
 | `young_trail_helius.py` | paper | Solana rug-signal paper exits from budgeted Helius RPC. |
+| `young_trail_rugrisk.py` | paper | Entry-time rug-risk features + skip-rule counterfactuals. No gating. |
 | `judge_client.py` | bots | Six lines. The only place a bot touches the network for a judgement. |
 | `mock_judge.py` | — | Keyless stand-in for Jev so the funnel can be tested. Never trade against it. |
 | `prompts/` | bots | Paste-ready prompts: HANDOFF, SOCIAL, CHIEF, SIZE, FILLS, RISK. |
@@ -477,6 +483,7 @@ FOMO activate control. `GET /ops/summary` is cached 30s; every section fails ope
 | `GET /ops/young_trail_variants` | Exit-variant ranking on the same per-cycle marks |
 | `GET /ops/young_trail_fast` | 60s-mark ledger vs per-cycle, same entries |
 | `GET /ops/young_trail_helius` | Helius rug-signal paper ledger vs fast vs per-cycle |
+| `GET /ops/young_trail_rugrisk` | Paper rug-risk skip-rule counterfactuals (does not gate entries) |
 | `GET /ops/research/query?sql=` | Read-only `SELECT` on `research.db` (limit 500) |
 | `GET /ops/research/report?kind=` | Canned `rugs` / `runners` / `features` |
 | `GET /ops/backtest` | Latest weekly signal-backtest JSON |
@@ -523,6 +530,25 @@ Helius RPC (`SOLANA_RPC_URL`) checks for a ≥20% dev sell, ≥30% top-3 holder 
 
 `/ops` compares helius vs fast vs per-cycle P&L on the same entries.
 
+**`young_trail_rugrisk`:** paper analysis on the same young_trail entries, running
+until 20 Oct 2026. New entries are scored first (ahead of overnight backfill).
+Budgeted Helius RPC (`SOLANA_RPC_URL`) pages mint signatures back to the true
+create slot (up to 5×1000; a truncated window is `unavailable` and never skips).
+Creators are the FOMO/Helius wallet plus signers of the tx that contains the
+pump.fun create instruction — not every same-slot buyer. Sniper and bundled
+measures use that create tx plus the first 15 non-create txs in
+`create_slot..+32` (`window_capped` when more exist; ~25–30 RPC/entry). A tick
+that cannot finish that capped set stores `status=pending` with progress and
+resumes later; `ok` only when complete. `calls_used` is recorded per entry.
+Also: creator prior rugs, create-slot buy (`dev_initial_share`), and
+fresh-wallet share among top holders (creator excluded). Non-Solana rows store
+`n/a`. Three skip rules (snipers >30%, bundled, dev with a prior rug) are scored
+only as a counterfactual: P&L of young_trail, fast baseline, and fast `tp_50` on
+the entries that rule would have SKIPPED vs KEPT. Caps sit beside the helius
+ledger (12/tick, 800/day; overnight backfill 24/tick) and yield when helius is
+low on its day cap. Does not gate entries, picks, or the judge. CLI:
+`python young_trail_rugrisk.py backfill`.
+
 ## research.db
 
 Queryable store at `outbox/research.db` (WAL). Log and analysis only — never called from
@@ -550,8 +576,8 @@ python research.py vacuum                # weekly is automatic
 **Backfill** (idempotent) reads cycle_history, rotated `run.log`s, cycle JSON, shadow
 jsonl / shadow_kills, young_trail + variants, outcomes candles, X cache, and Coinalyze.
 Tokens still missing post-sighting prices are queued for the off-peak outcomes fetcher
-(capped). The 60s sampler also drives the paper `young_trail_fast` and
-`young_trail_helius` ledgers on prices it already fetched.
+(capped). The 60s sampler also drives the paper `young_trail_fast`,
+`young_trail_helius`, and `young_trail_rugrisk` ledgers on prices it already fetched.
 
 ## Outcomes drain
 

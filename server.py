@@ -25,6 +25,7 @@ from stalling when outcomes.db is busy. Optional split if you want a hard wall:
   GET  /ops/young_trail_variants paper exit-variant ranking (same marks)
   GET  /ops/young_trail_fast paper 60s-mark ledger vs per-cycle young_trail
   GET  /ops/young_trail_helius paper Helius rug-signal ledger vs fast/cycle
+  GET  /ops/young_trail_rugrisk paper rug-risk skip-rule counterfactuals (no gating)
   GET  /ops/research/query?sql=  read-only SELECT on research.db (limit 500)
   GET  /ops/research/report?kind= rugs|runners|features
   GET  /api/state      outbox/state.json for ops panel
@@ -236,6 +237,30 @@ def ops_young_trail_helius():
             "signals": [],
             "open_positions": [],
             "closed_trades": [],
+        })
+
+
+@app.get("/ops/young_trail_rugrisk")
+def ops_young_trail_rugrisk():
+    """Paper rug-risk features + skip-rule counterfactuals. No gating, no live orders."""
+    try:
+        import young_trail_rugrisk
+        return JSONResponse(young_trail_rugrisk.ops_payload())
+    except Exception as e:
+        log.warning("ops young_trail_rugrisk: %s", safe_err(e))
+        return JSONResponse({
+            "paper": True,
+            "simulated": True,
+            "live_orders": False,
+            "gates_entries": False,
+            "error": "young_trail_rugrisk unavailable",
+            "summary": {
+                "n": 0, "ok": 0, "n_a": 0, "pending": 0, "error": 0,
+                "would_skip_snipers": 0, "would_skip_bundled": 0,
+                "would_skip_dev_rugs": 0,
+            },
+            "counterfactuals": [],
+            "entries": [],
         })
 
 

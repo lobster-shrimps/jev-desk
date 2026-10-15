@@ -63,7 +63,7 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
   <span class="stat" style="margin-left:auto">updated <b id="h-upd">…</b></span>
 </header>
 <nav class="jump" aria-label="Sections">
-  <a href="#desk">Desk</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
+  <a href="#desk">Desk</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#yt-helius">Helius</a><a href="#yt-rugrisk">Rug-risk</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
 </nav>
 <main>
 <section id="desk" class="s6" aria-labelledby="desk-h">
@@ -99,6 +99,12 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
   <div class="kv" id="yth-kv"></div>
   <div class="note" id="yth-note"></div>
   <div class="scroll"><table id="yth-t"><thead><tr><th>Ticker</th><th>Signal</th><th class="n">Helius P&amp;L</th><th class="n">Fast P&amp;L</th><th class="n">Cycle P&amp;L</th><th>Rug</th><th class="n">Lead min</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="yt-rugrisk" aria-labelledby="ytr-h">
+  <h2 id="ytr-h">young_trail_rugrisk <small>paper skip rules · same entries · no gating</small></h2>
+  <div class="kv" id="ytr-kv"></div>
+  <div class="note" id="ytr-note"></div>
+  <div class="scroll"><table id="ytr-t"><thead><tr><th>Rule</th><th class="n">Skip n</th><th class="n">Skip YT</th><th class="n">Skip fast</th><th class="n">Skip tp_50</th><th class="n">Keep n</th><th class="n">Keep YT</th><th class="n">Keep fast</th><th class="n">Keep tp_50</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="variants" aria-labelledby="var-h">
   <h2 id="var-h">Exit variants <small id="var-cav"></small></h2>
@@ -186,7 +192,7 @@ async function load(){
   if(loadInflight)return;
   loadInflight=true;
   try{
-  const [S,YT,V,SL,B,YF,YH]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius')]);
+  const [S,YT,V,SL,B,YF,YH,YR]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius'),J('/ops/young_trail_rugrisk')]);
   const now=Date.now()/1000;
   if(S){const h=S.health||{};
     $('h-mode').textContent=(h.mode||'shadow')+' · judge '+(h.judge_mode||'?');
@@ -233,6 +239,10 @@ async function load(){
     kv('yth-kv',[['Helius P&L',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Signals',s.signals||0],['Precision',q.precision==null?'—':pct(q.precision)],['Recall',q.recall==null?'—':pct(q.recall)],['Lead min',q.lead_min_median==null?'—':(+q.lead_min_median).toFixed(1)]]);
     $('yth-note').textContent=YH.caveat||'Paper only · Helius rug signals · no live orders';
     rows('yth-t',(YH.comparison||[]).slice(0,20).map(r=>`<tr><td>${esc(r.ticker||'')}</td><td>${esc(r.helius_signal||'open')}</td><td class="n ${cls(r.helius_pnl_usd)}">${fmtUsd(r.helius_pnl_usd)}</td><td class="n ${cls(r.fast_baseline_pnl_usd)}">${fmtUsd(r.fast_baseline_pnl_usd)}</td><td class="n ${cls(r.cycle_pnl_usd)}">${fmtUsd(r.cycle_pnl_usd)}</td><td>${r.helius_rugged==1?'rug':r.helius_rugged==0?'no':'—'}</td><td class="n">${r.helius_lead_min==null?'—':(+r.helius_lead_min).toFixed(1)}</td></tr>`).join(''));}
+  if(YR){const s=YR.summary||{};
+    kv('ytr-kv',[['Entries',s.n||0],['Solana ok',s.ok||0],['n/a',s.n_a||0],['Pending',s.pending||0],['Would skip snipers',s.would_skip_snipers||0],['Would skip bundled',s.would_skip_bundled||0],['Would skip dev rugs',s.would_skip_dev_rugs||0]]);
+    $('ytr-note').textContent=YR.caveat||'Paper only · skip rules do not gate entries, picks, or the judge';
+    rows('ytr-t',(YR.counterfactuals||[]).map(r=>{const sk=r.skipped||{},kp=r.kept||{};return `<tr><td>${esc(r.label||r.id||'')}</td><td class="n">${sk.n??0}</td><td class="n ${cls(sk.young_trail_pnl)}">${fmtUsd(sk.young_trail_pnl)}</td><td class="n ${cls(sk.fast_baseline_pnl)}">${fmtUsd(sk.fast_baseline_pnl)}</td><td class="n ${cls(sk.fast_tp50_pnl)}">${fmtUsd(sk.fast_tp50_pnl)}</td><td class="n">${kp.n??0}</td><td class="n ${cls(kp.young_trail_pnl)}">${fmtUsd(kp.young_trail_pnl)}</td><td class="n ${cls(kp.fast_baseline_pnl)}">${fmtUsd(kp.fast_baseline_pnl)}</td><td class="n ${cls(kp.fast_tp50_pnl)}">${fmtUsd(kp.fast_tp50_pnl)}</td></tr>`}).join(''));}
   if(V){const rk=[...(V.ranking||[])].sort((a,b)=>b.realized_pnl_usd-a.realized_pnl_usd);const base=rk.find(r=>r.variant==='baseline')?.realized_pnl_usd??0;
     const span=Math.max(1,...rk.map(r=>Math.abs(r.realized_pnl_usd-base)));
     $('var-cav').textContent=V.caveat||'';
