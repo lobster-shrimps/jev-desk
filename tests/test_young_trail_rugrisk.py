@@ -88,12 +88,12 @@ def _parsed_token_acc(owner, program=None):
 
 def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
                   creator_txs=None, mint_history=None, extra_txs=None,
-                  signer=None):
-    """Scripted Helius RPC. Counts calls. Never hits the network."""
-    buys = buys or [
-        (CREATE_SLOT, [(S1, 0, 200), (S2, 0, 200), (S3, 0, 100)]),
-        (CREATE_SLOT + 80, [(WHALE, 0, 50)]),
-    ]
+                  signer=None, tx_list=None):
+    """Scripted Helius RPC. Counts calls. Never hits the network.
+
+    `tx_list` is oldest-first mint txs: {signature, slot, deltas, ixs, signer}.
+    `buys is None` uses the default bundled create-slot buys; pass [] for none.
+    """
     holders = holders or [
         (ACC_S1, 200, S1),
         (ACC_S2, 200, S2),
@@ -103,12 +103,29 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
     wallet_n = wallet_n or {S1: 1, S2: 1, S3: 2, WHALE: 20, DEV: 8}
     mint_sigs = []
     txs = {}
-    for i, (slot, deltas) in enumerate(buys):
-        sig = f"mintsig{i:02d}"
-        mint_sigs.append({"signature": sig, "slot": slot, "err": None})
-        txs[sig] = _tx(slot, MINT, deltas, signer=signer)
-    # Newest first, like Helius.
-    mint_sigs = list(reversed(mint_sigs))
+    if tx_list is not None:
+        for spec in tx_list:
+            sig = spec["signature"]
+            slot = spec["slot"]
+            mint_sigs.append({
+                "signature": sig, "slot": slot, "err": spec.get("err"),
+            })
+            txs[sig] = _tx(
+                slot, spec.get("mint") or MINT, spec.get("deltas") or [],
+                ixs=spec.get("ixs"), signer=spec.get("signer"),
+            )
+        mint_sigs = list(reversed(mint_sigs))
+    else:
+        if buys is None:
+            buys = [
+                (CREATE_SLOT, [(S1, 0, 200), (S2, 0, 200), (S3, 0, 100)]),
+                (CREATE_SLOT + 80, [(WHALE, 0, 50)]),
+            ]
+        for i, (slot, deltas) in enumerate(buys):
+            sig = f"mintsig{i:02d}"
+            mint_sigs.append({"signature": sig, "slot": slot, "err": None})
+            txs[sig] = _tx(slot, MINT, deltas, signer=signer)
+        mint_sigs = list(reversed(mint_sigs))
     if mint_history is not None:
         mint_sigs = list(mint_history)
     if extra_txs:
@@ -323,6 +340,7 @@ def test_compute_features_mocked_rpc(ytr):
     assert feat["skip_dev_rugs"] is True
     assert feat["fresh_holder_share"] is not None
     assert feat["fresh_holder_share"] > 0
+    assert (feat.get("features_json") or {}).get("calls_used", 0) >= 4
 
 
 def test_non_solana_is_na_no_rpc(ytr):
@@ -776,3 +794,140 @@ def test_two_non_dev_create_slot_buyers_not_bundled(ytr):
     assert feat["bundled_buys"] == 2
     assert feat["sniper_wallets"] == 2
     assert feat["dev_initial_share"] == pytest.approx(0.20)
+
+
+def _feat_json(row):
+    raw = row.get("features_json") if isinstance(row, dict) else None
+    if raw is None:
+        return {}
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+
+def test_create_ix_only_creators_same_slot_buys_are_bundled(ytr):
+    """1 create tx + 3 other wallets' buy txs in the same slot.
+
+    Bundled buyers must not be treated as creators just because they signed
+    a create-slot transaction.
+    """
+    _yt, helius, rug = ytr
+    rpc = _rpc_scripted(
+        tx_list=[
+            {
+                "signature": "asigcreate", "slot": CREATE_SLOT,
+                "deltas": [(DEV, 0, 50)],
+                "ixs": [_ix("create", MINT)], "signer": DEV,
+            },
+            {
+                "signature": "bsigbuy1", "slot": CREATE_SLOT,
+                "deltas": [(S1, 0, 100)], "signer": S1,
+            },
+            {
+                "signature": "bsigbuy2", "slot": CREATE_SLOT,
+                "deltas": [(S2, 0, 100)], "signer": S2,
+            },
+            {
+                "signature": "bsigbuy3", "slot": CREATE_SLOT,
+                "deltas": [(S3, 0, 100)], "signer": S3,
+            },
+        ],
+        supply=1000.0,
+        wallet_n={S1: 1, S2: 1, S3: 1, DEV: 8, WHALE: 20},
+    )
+    rug.set_rpc_fn(rpc)
+    helius.note_creator(TID, DEV, now=T0)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["bundled"] is True
+    assert feat["bundled_buys"] == 3
+    assert feat["skip_bundled"] is True
+    creators = set((feat.get("features_json") or {}).get("creators") or [])
+    assert creators == {DEV}
+    assert S1 not in creators and S2 not in creators and S3 not in creators
+    assert feat["dev_initial_share"] == pytest.approx(0.05)
+    assert feat["sniper_wallets"] == 3
+    extra = feat.get("features_json") or {}
+    assert extra.get("calls_used", 0) >= 4
+    assert extra.get("create_sig") == "asigcreate"
+
+
+def test_partial_window_resumes_never_ok_while_partial(ytr, monkeypatch):
+    """Capped window that needs more than one tick stays pending until complete."""
+    yt, helius, rug = ytr
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_CYCLE_CAP", "6")
+    tx_list = [{
+        "signature": "asigcreate", "slot": CREATE_SLOT,
+        "deltas": [(DEV, 0, 50)],
+        "ixs": [_ix("create", MINT)], "signer": DEV,
+    }]
+    buyers = (S1, S2, S3)
+    for i in range(20):
+        owner = buyers[i % 3]
+        tx_list.append({
+            "signature": f"bsig{i:04d}", "slot": CREATE_SLOT + 1,
+            "deltas": [(owner, 0, 10)], "signer": owner,
+        })
+    rpc = _rpc_scripted(
+        tx_list=tx_list, supply=1000.0,
+        wallet_n={S1: 1, S2: 1, S3: 1, DEV: 8, WHALE: 20},
+    )
+    rug.set_rpc_fn(rpc)
+    _enter(yt, helius, creator=DEV)
+    rug.sync_entries(now=T0)
+    statuses = []
+    for _ in range(16):
+        rug.begin_cycle(T0)
+        rug.compute_pending(now=T0, limit=1, source="live")
+        row = rug.all_rows()[0]
+        statuses.append(row["status"])
+        extra = _feat_json(row)
+        if row["status"] == "ok":
+            assert extra.get("progress") is None
+            break
+        assert row["status"] == "pending"
+        assert extra.get("progress")
+        assert extra.get("calls_used", 0) >= 1
+        assert row["skip_snipers"] is None
+        assert row["bundled"] is None
+    assert statuses[-1] == "ok"
+    assert "ok" not in statuses[:-1]
+    assert len(statuses) > 1
+    extra = _feat_json(rug.all_rows()[0])
+    assert extra.get("window_capped") is True
+    assert extra.get("calls_used", 0) > 6
+    window_tx = [
+        c[1][0] for c in rpc.calls
+        if c[0] == "getTransaction" and (
+            c[1][0] == "asigcreate" or str(c[1][0]).startswith("bsig")
+        )
+    ]
+    assert window_tx.count("asigcreate") == 1
+    buy_fetched = {s for s in window_tx if str(s).startswith("bsig")}
+    assert len(buy_fetched) == 15
+    assert "bsig0015" not in buy_fetched
+
+
+def test_new_entry_prioritized_ahead_of_older_pending(ytr, monkeypatch):
+    yt, helius, rug = ytr
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_CYCLE_CAP", "6")
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    old_tid = "OldMintRugRisk11111111111111111111:1399811149"
+    db = rug._connect()
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, source
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (old_tid, "OLD", "solana", T0 - 3600, 1.0, "pending", "sync"),
+    )
+    db.commit()
+    _enter(yt, helius, creator=DEV)
+    rug.on_sampler_tick({}, now=T0)
+    rows = {r["tid"]: r for r in rug.all_rows()}
+    assert old_tid in rows and TID in rows
+    assert rows[old_tid]["status"] == "pending"
+    assert rows[old_tid]["features_json"] in (None, "")
+    assert rows[TID]["status"] in ("pending", "ok")
+    assert rows[TID]["features_json"]
+    extra = _feat_json(rows[TID])
+    assert extra.get("calls_used", 0) >= 1

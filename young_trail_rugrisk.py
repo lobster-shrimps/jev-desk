@@ -52,6 +52,9 @@ MINT_SIG_PAGES = 5
 WALLET_SIG_LIMIT = 8
 DEV_SIG_LIMIT = 25
 FRESH_WALLET_RPC_CAP = 6
+# Sniper/bundled are scored on the create tx plus the first 15 non-create
+# txs in [create_slot, create_slot+SNIPER_SLOTS]. ~25–30 RPC/entry.
+WINDOW_NON_CREATE_CAP = 15
 
 STATUS_OK = "ok"
 STATUS_NA = "n/a"
@@ -100,6 +103,7 @@ _time_fn = time.time
 _rpc_fn = None
 _overnight_fn = None
 _cycle_calls = 0
+_last_new_tids: list[str] = []
 
 
 def set_time_fn(fn) -> None:
@@ -144,9 +148,10 @@ def _close_local() -> None:
 
 def reset() -> None:
     """Close this thread's cached connection. Tests call this."""
-    global _cycle_calls
+    global _cycle_calls, _last_new_tids
     _close_local()
     _cycle_calls = 0
+    _last_new_tids = []
 
 
 def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
@@ -650,16 +655,11 @@ def fresh_holder_share(holders: list[dict], fresh_owners: set) -> dict:
 def skip_flags(features: dict) -> dict:
     """Pure skip-rule evaluation. None = unknown (fail open: do not skip)."""
     status = features.get("status")
-    if status == STATUS_NA:
+    if status in (STATUS_NA, STATUS_PENDING, STATUS_ERROR, STATUS_UNAVAILABLE,
+                  STATUS_BUDGET):
         return {
             "skip_snipers": None, "skip_bundled": None, "skip_dev_rugs": None,
         }
-    if status not in (STATUS_OK, None) and status != STATUS_PENDING:
-        # error/unavailable/budget: unknown, never skip
-        if status in (STATUS_ERROR, STATUS_UNAVAILABLE, STATUS_BUDGET):
-            return {
-                "skip_snipers": None, "skip_bundled": None, "skip_dev_rugs": None,
-            }
     sniper = _num(features.get("sniper_share"))
     skip_s = None if sniper is None else bool(sniper > sniper_skip_pct())
     bundled = features.get("bundled")
@@ -675,7 +675,9 @@ def skip_flags(features: dict) -> dict:
 
 def would_skip(row: dict, rule_id: str) -> bool | None:
     """True if this rule would have skipped the entry. None = unknown/n/a."""
-    if not row or row.get("status") in (STATUS_NA, STATUS_UNAVAILABLE, STATUS_ERROR, STATUS_BUDGET):
+    if not row or row.get("status") in (
+        STATUS_NA, STATUS_UNAVAILABLE, STATUS_ERROR, STATUS_BUDGET, STATUS_PENDING,
+    ):
         return None
     flags = skip_flags(row)
     by_id = {
@@ -806,33 +808,44 @@ def _signatures(address: str, limit: int = 20, before: str | None = None,
     return out
 
 
-def _mint_signature_history(mint: str, now: float | None = None) -> tuple[list[dict], bool, int]:
-    """Page mint signatures newest→oldest until exhausted or the page cap.
+def _mint_signature_history(mint: str, now: float | None = None,
+                            collected: list | None = None, pages: int = 0,
+                            before: str | None = None) -> dict:
+    """Page mint signatures newest→oldest until exhausted, the page cap, or budget.
 
-    Returns (sigs newest-first, truncated, pages). truncated means the cap
-    (or budget) ran out before a short page, so the true create slot is unknown.
+    state: exhausted | truncated (cap hit) | budget (resume later).
     """
     page_size = max(1, min(int(SIG_PAGE_SIZE), 1000))
     max_pages = max(1, int(MINT_SIG_PAGES))
-    collected: list[dict] = []
-    before = None
-    pages = 0
+    collected = list(collected or [])
+    pages = int(pages or 0)
     exhausted = False
+    budget_stop = False
     while pages < max_pages:
         if not _can_charge(1, now):
+            budget_stop = True
             break
         raw = _signatures(mint, limit=page_size, before=before, now=now)
         pages += 1
         if not raw:
             exhausted = True
+            before = None
             break
         collected.extend(raw)
         if len(raw) < page_size:
             exhausted = True
+            before = None
             break
         before = raw[-1]["signature"]
-    truncated = not exhausted
-    return collected, truncated, pages
+    if budget_stop:
+        state = "budget"
+    elif exhausted:
+        state = "exhausted"
+    else:
+        state = "truncated"
+    return {
+        "sigs": collected, "pages": pages, "before": before, "state": state,
+    }
 
 
 def _oldest_slot(sigs: list[dict]) -> int | None:
@@ -840,6 +853,53 @@ def _oldest_slot(sigs: list[dict]) -> int | None:
         if row.get("slot") is not None:
             return int(row["slot"])
     return None
+
+
+def _tx_has_create_ix(tx: dict, mint: str | None = None) -> bool:
+    """True when this tx contains a mint/create instruction for `mint`."""
+    if not tx:
+        return False
+    for ix in _iter_parsed_ix(tx):
+        if _ix_type(ix) not in CREATE_IX:
+            continue
+        ix_mint = _ix_mint(ix)
+        if mint is None or not ix_mint or ix_mint == mint:
+            return True
+    return False
+
+
+def _tx_record(sig: str, tx: dict | None, mint: str) -> dict:
+    """Compact resume record: buyers, signers, create-ix flag. No raw RPC blob."""
+    if not tx:
+        return {
+            "signature": sig, "slot": None, "buyers": [], "signers": [],
+            "has_create_ix": False,
+        }
+    return {
+        "signature": sig,
+        "slot": tx.get("slot"),
+        "buyers": _buyers_from_tx(tx, mint),
+        "signers": _tx_signers(tx),
+        "has_create_ix": _tx_has_create_ix(tx, mint),
+    }
+
+
+def _in_window_sigs(mint_sigs: list[dict], create_slot: int | None,
+                    n_slots: int) -> list[dict]:
+    if create_slot is None:
+        return []
+    end = int(create_slot) + max(0, int(n_slots))
+    out = []
+    for row in mint_sigs or []:
+        if row.get("err") or row.get("slot") is None:
+            continue
+        slot = int(row["slot"])
+        if int(create_slot) <= slot <= end:
+            out.append({
+                "signature": row["signature"], "slot": slot,
+            })
+    out.sort(key=lambda r: (int(r["slot"]), r["signature"]))
+    return out
 
 
 def _tx_signers(tx: dict) -> list[str]:
@@ -1011,104 +1071,230 @@ def _dev_history(creator: str, current_mint: str,
     }
 
 
+def _blank_features(status: str, creator: str | None = None, **extra) -> dict:
+    feat = {
+        "status": status,
+        "sniper_share": None,
+        "sniper_wallets": None,
+        "sniper_slots": sniper_slots(),
+        "bundled": None,
+        "bundled_buys": None,
+        "dev_wallet": creator,
+        "dev_prior_launches": extra.get("dev_prior_launches"),
+        "dev_prior_rugs": extra.get("dev_prior_rugs"),
+        "dev_initial_share": None,
+        "fresh_holder_share": extra.get("fresh_holder_share"),
+        "top_holder_n": extra.get("top_holder_n"),
+        "create_slot": extra.get("create_slot"),
+        "history_truncated": extra.get("history_truncated", False),
+        "supply": extra.get("supply"),
+        "window_capped": extra.get("window_capped"),
+        "error": extra.get("error"),
+        "reason": extra.get("reason"),
+    }
+    feat.update(skip_flags(feat))
+    return feat
+
+
 def compute_features(mint: str, creator: str | None = None,
-                     now: float | None = None) -> dict:
-    """Entry-time rug-risk features via budgeted RPC. Mock-friendly."""
+                     now: float | None = None, progress: dict | None = None) -> dict:
+    """Entry-time rug-risk features via budgeted RPC. Resumable. Mock-friendly.
+
+    Creators are the known FOMO/Helius wallet plus signers of the tx that
+    contains the mint create instruction — not every create-slot buyer.
+    """
     ts = current_time() if now is None else float(now)
     if not mint:
-        return {"status": STATUS_UNAVAILABLE, "error": "no mint"}
-    # Core path: supply + largest + owners + mint sigs ≈ 4 calls.
-    if not _can_charge(4, ts):
-        return {"status": STATUS_BUDGET, "error": "budget"}
+        return _blank_features(STATUS_UNAVAILABLE, creator, error="no mint")
+    prog = dict(progress or {})
+    start_calls = _cycle_calls
+    fresh_start = not prog
+
+    def calls_used() -> int:
+        return int(prog.get("calls_used") or 0) + max(0, _cycle_calls - start_calls)
+
+    def pending():
+        blob = dict(prog)
+        blob["calls_used"] = calls_used()
+        feat = _blank_features(STATUS_PENDING, creator, supply=blob.get("supply"),
+                               top_holder_n=len(blob.get("top") or []),
+                               create_slot=blob.get("create_slot"),
+                               window_capped=blob.get("window_capped"))
+        feat["features_json"] = {
+            "progress": blob,
+            "calls_used": blob["calls_used"],
+            "window_capped": blob.get("window_capped"),
+            "history_truncated": False,
+        }
+        return feat
+
     try:
-        supply = _supply(mint, now=ts)
-        largest = _largest_accounts(mint, now=ts)
-        addrs = [a["address"] for a in largest]
-        owners = _owners_for(addrs, now=ts) if addrs and _can_charge(1, ts) else {}
-        holders = []
-        for acc in largest:
-            meta = owners.get(acc["address"]) or {}
-            owner = meta.get("owner")
-            program = meta.get("program")
-            is_pool = bool(program and _is_amm(program))
-            holders.append({
-                "account": acc["address"],
-                "owner": owner,
-                "amount": acc["amount"],
-                "is_pool": is_pool,
-            })
-        holders.sort(key=lambda h: h["amount"], reverse=True)
-        top = [h for h in holders if not h.get("is_pool")][:TOP_HOLDERS]
+        if fresh_start and not _can_charge(4, ts):
+            return _blank_features(STATUS_BUDGET, creator, error="budget")
+        if (not fresh_start) and not _can_charge(1, ts):
+            return pending()
 
-        mint_sigs, truncated, pages = _mint_signature_history(mint, now=ts)
-        if truncated:
-            features = {
-                "status": STATUS_UNAVAILABLE,
-                "error": "history_truncated",
-                "reason": "history_truncated",
-                "history_truncated": True,
-                "sniper_share": None,
-                "sniper_wallets": None,
-                "sniper_slots": sniper_slots(),
-                "bundled": None,
-                "bundled_buys": None,
-                "dev_wallet": creator,
-                "dev_prior_launches": None,
-                "dev_prior_rugs": None,
-                "dev_initial_share": None,
-                "fresh_holder_share": None,
-                "top_holder_n": len(top),
-                "create_slot": None,
-                "supply": supply,
-                "sig_pages": pages,
-            }
-            flags = skip_flags(features)
-            features.update(flags)
-            features["features_json"] = {
-                "create_slot": None,
-                "history_truncated": True,
-                "sig_pages": pages,
-                "sig_n": len(mint_sigs),
-            }
-            return features
+        if "supply" not in prog:
+            supply = _supply(mint, now=ts)
+            largest = _largest_accounts(mint, now=ts)
+            addrs = [a["address"] for a in largest]
+            owners = _owners_for(addrs, now=ts) if addrs and _can_charge(1, ts) else {}
+            holders = []
+            for acc in largest:
+                meta = owners.get(acc["address"]) or {}
+                owner = meta.get("owner")
+                program = meta.get("program")
+                is_pool = bool(program and _is_amm(program))
+                holders.append({
+                    "account": acc["address"],
+                    "owner": owner,
+                    "amount": acc["amount"],
+                    "is_pool": is_pool,
+                })
+            holders.sort(key=lambda h: h["amount"], reverse=True)
+            prog["supply"] = supply
+            prog["holders"] = holders
+            prog["top"] = [h for h in holders if not h.get("is_pool")][:TOP_HOLDERS]
 
-        create_slot = _oldest_slot(mint_sigs)
-        window_end = None if create_slot is None else int(create_slot) + sniper_slots()
-        window = []
-        for row in mint_sigs:
-            if row.get("err") or row.get("slot") is None or create_slot is None:
-                continue
+        supply = prog.get("supply")
+        holders = prog.get("holders") or []
+        top = prog.get("top") or []
+
+        if not prog.get("sigs_done"):
+            hist = _mint_signature_history(
+                mint, now=ts,
+                collected=prog.get("mint_sigs"),
+                pages=int(prog.get("sig_pages") or 0),
+                before=prog.get("sig_before"),
+            )
+            prog["mint_sigs"] = hist["sigs"]
+            prog["sig_pages"] = hist["pages"]
+            prog["sig_before"] = hist["before"]
+            if hist["state"] == "budget":
+                return pending()
+            if hist["state"] == "truncated":
+                used = calls_used()
+                feat = _blank_features(
+                    STATUS_UNAVAILABLE, creator, error="history_truncated",
+                    reason="history_truncated", history_truncated=True,
+                    supply=supply, top_holder_n=len(top),
+                )
+                feat["features_json"] = {
+                    "create_slot": None,
+                    "history_truncated": True,
+                    "sig_pages": hist["pages"],
+                    "sig_n": len(hist["sigs"]),
+                    "calls_used": used,
+                }
+                return feat
+            prog["sigs_done"] = True
+
+        mint_sigs = prog.get("mint_sigs") or []
+        create_slot = prog.get("create_slot")
+        if create_slot is None:
+            create_slot = _oldest_slot(mint_sigs)
+            prog["create_slot"] = create_slot
+        if create_slot is None:
+            used = calls_used()
+            feat = _blank_features(
+                STATUS_UNAVAILABLE, creator, error="no create slot",
+                supply=supply, top_holder_n=len(top),
+            )
+            feat["features_json"] = {"calls_used": used, "history_truncated": False}
+            return feat
+
+        tx_recs: dict = dict(prog.get("tx_recs") or {})
+        in_window = prog.get("in_window") or _in_window_sigs(
+            mint_sigs, create_slot, sniper_slots(),
+        )
+        prog["in_window"] = in_window
+
+        # Oldest-first: CREATE_IX tx plus the first 15 non-create txs. Stop
+        # fetching once that capped set is complete (~16 getTransaction).
+        create_sig = prog.get("create_sig")
+        non_create_sigs = list(prog.get("non_create_sigs") or [])
+        window_index = int(prog.get("window_index") or 0)
+        cap_n = max(0, int(WINDOW_NON_CREATE_CAP))
+
+        def save_window():
+            prog["tx_recs"] = tx_recs
+            prog["create_sig"] = create_sig
+            prog["non_create_sigs"] = non_create_sigs
+            prog["window_index"] = window_index
+
+        while window_index < len(in_window):
+            have_create = bool(create_sig)
+            have_nc = len(non_create_sigs) >= cap_n
+            row = in_window[window_index]
             slot = int(row["slot"])
-            if int(create_slot) <= slot <= window_end:
-                window.append(row)
-        window.sort(key=lambda r: (int(r["slot"]), r["signature"]))
-        txs = []
-        for row in window:
-            if not _can_charge(1, ts):
+            # Done: create + 15 non-create collected.
+            if have_create and have_nc:
                 break
-            try:
-                tx = _transaction(row["signature"], now=ts)
-            except Exception as e:
-                log.warning("young_trail_rugrisk tx: %s", safe_err(e))
-                continue
-            if tx:
-                txs.append(tx)
+            # Missing CREATE_IX: do not walk past the create slot after 15.
+            if have_nc and (not have_create) and slot > int(create_slot):
+                break
+            sig = row["signature"]
+            if sig not in tx_recs:
+                if not _can_charge(1, ts):
+                    save_window()
+                    return pending()
+                try:
+                    tx = _transaction(sig, now=ts)
+                except Exception as e:
+                    log.warning("young_trail_rugrisk tx: %s", safe_err(e))
+                    tx = None
+                tx_recs[sig] = _tx_record(sig, tx, mint)
+            rec = tx_recs.get(sig) or {}
+            if rec.get("has_create_ix") and not create_sig:
+                create_sig = sig
+            elif sig != create_sig and len(non_create_sigs) < cap_n:
+                if sig not in non_create_sigs:
+                    non_create_sigs.append(sig)
+            window_index += 1
+
+        save_window()
+        scored = set(non_create_sigs)
+        if create_sig:
+            scored.add(create_sig)
+        prog["window_capped"] = any(
+            r["signature"] not in scored for r in in_window
+        )
+        to_fetch = []
+        if create_sig:
+            to_fetch.append(create_sig)
+        to_fetch.extend(s for s in non_create_sigs if s != create_sig)
+        prog["to_fetch"] = to_fetch
+        prog["window_done"] = True
+
         buys: list[dict] = []
-        for tx in txs:
-            buys.extend(_buyers_from_tx(tx, mint))
-
+        for sig in to_fetch:
+            buys.extend((tx_recs.get(sig) or {}).get("buyers") or [])
+        # Known FOMO/Helius creator + signers of the CREATE_IX tx only.
+        # Bundled same-slot buyers are not creators.
         creators = _owner_set([creator] if creator else [])
-        for tx in txs:
-            if tx.get("slot") is None or create_slot is None:
-                continue
-            if int(tx["slot"]) != int(create_slot):
-                continue
-            creators.update(_tx_signers(tx))
+        if create_sig:
+            rec = tx_recs.get(create_sig) or {}
+            if rec.get("has_create_ix"):
+                creators.update(rec.get("signers") or [])
+        prog["buys"] = buys
+        prog["creators"] = sorted(creators)
 
-        # Dev history before freshness: it feeds a skip rule.
-        dev = {"dev_prior_launches": None, "dev_prior_rugs": None, "prior_mints": []}
-        if creator:
+        dev = prog.get("dev") or {
+            "dev_prior_launches": None, "dev_prior_rugs": None, "prior_mints": [],
+        }
+        if creator and not prog.get("dev_done"):
+            if not _can_charge(1, ts):
+                return pending()
             dev = _dev_history(creator, mint, now=ts)
+            prog["dev"] = {
+                "dev_prior_launches": dev.get("dev_prior_launches"),
+                "dev_prior_rugs": dev.get("dev_prior_rugs"),
+                "prior_mints": (dev.get("prior_mints") or [])[:8],
+            }
+            prog["dev_done"] = True
+        elif not creator:
+            prog["dev_done"] = True
+        dev = prog.get("dev") or dev
 
         candidates = []
         seen = set()
@@ -1123,20 +1309,33 @@ def compute_features(mint: str, creator: str | None = None,
             if o and o not in seen and str(o) not in creators:
                 seen.add(o)
                 candidates.append(o)
-        fresh_owners: set[str] = set()
-        checked = 0
+        fresh_owners = set(prog.get("fresh_owners") or [])
+        checked_owners = list(prog.get("fresh_checked_owners") or [])
+        checked_set = set(checked_owners)
         for owner in candidates:
-            if checked >= FRESH_WALLET_RPC_CAP or not _can_charge(1, ts):
+            if owner in checked_set:
+                continue
+            if len(checked_owners) >= FRESH_WALLET_RPC_CAP:
                 break
+            if not _can_charge(1, ts):
+                prog["fresh_owners"] = sorted(fresh_owners)
+                prog["fresh_checked_owners"] = checked_owners
+                return pending()
             try:
                 wsigs = [s for s in _signatures(owner, limit=WALLET_SIG_LIMIT, now=ts)
                          if not s.get("err")]
             except Exception as e:
                 log.warning("young_trail_rugrisk wallet sigs: %s", safe_err(e))
+                checked_owners.append(owner)
+                checked_set.add(owner)
                 continue
-            checked += 1
+            checked_owners.append(owner)
+            checked_set.add(owner)
             if len(wsigs) <= FRESH_MAX_SIGS:
                 fresh_owners.add(owner)
+        prog["fresh_owners"] = sorted(fresh_owners)
+        prog["fresh_checked_owners"] = checked_owners
+        prog["enrich_done"] = True
 
         sniper = sniper_share_from_buys(
             buys, supply or 0.0, create_slot, sniper_slots(), exclude=creators,
@@ -1148,46 +1347,52 @@ def compute_features(mint: str, creator: str | None = None,
         dev_share = dev_initial_share_from_buys(
             buys, supply or 0.0, create_slot, creators,
         )
-
-        status = STATUS_OK
-        if supply is None or create_slot is None:
-            status = STATUS_UNAVAILABLE
+        used = calls_used()
         features = {
-            "status": status,
-            "sniper_share": sniper["sniper_share"] if status == STATUS_OK else None,
-            "sniper_wallets": sniper["sniper_wallets"] if status == STATUS_OK else None,
+            "status": STATUS_OK,
+            "sniper_share": sniper["sniper_share"],
+            "sniper_wallets": sniper["sniper_wallets"],
             "sniper_slots": sniper_slots(),
-            "bundled": bundled["bundled"] if status == STATUS_OK else None,
-            "bundled_buys": bundled["bundled_buys"] if status == STATUS_OK else None,
+            "bundled": bundled["bundled"],
+            "bundled_buys": bundled["bundled_buys"],
             "dev_wallet": creator or (next(iter(creators), None)),
             "dev_prior_launches": dev.get("dev_prior_launches"),
             "dev_prior_rugs": dev.get("dev_prior_rugs"),
-            "dev_initial_share": dev_share if status == STATUS_OK else None,
+            "dev_initial_share": dev_share,
             "fresh_holder_share": fresh["fresh_holder_share"],
             "top_holder_n": fresh["top_holder_n"],
-            "create_slot": create_slot if status == STATUS_OK else None,
+            "create_slot": create_slot,
             "history_truncated": False,
+            "window_capped": bool(prog.get("window_capped")),
             "supply": supply,
         }
         flags = skip_flags(features)
         features.update(flags)
         features["features_json"] = {
-            "create_slot": features["create_slot"],
+            "create_slot": create_slot,
             "history_truncated": False,
-            "sig_pages": pages,
+            "sig_pages": prog.get("sig_pages"),
             "sig_n": len(mint_sigs),
             "sniper_amount": sniper.get("sniper_amount"),
             "create_slot_buyers": bundled.get("create_slot_buyers"),
             "create_slot_fresh": bundled.get("create_slot_fresh"),
             "creators": sorted(creators),
-            "fresh_checked": checked,
+            "fresh_checked": len(checked_owners),
             "prior_mints": (dev.get("prior_mints") or [])[:8],
-            "dev_initial_share": features["dev_initial_share"],
+            "dev_initial_share": dev_share,
+            "window_capped": bool(prog.get("window_capped")),
+            "calls_used": used,
+            "create_sig": create_sig,
         }
         return features
     except Exception as e:
+        msg = safe_err(e)
+        if "budget" in str(e).lower() or "budget" in msg.lower():
+            return pending()
         log.warning("young_trail_rugrisk features %s: %s", mint, safe_err(e))
-        return {"status": STATUS_ERROR, "error": safe_err(e)}
+        feat = _blank_features(STATUS_ERROR, creator, error=msg)
+        feat["features_json"] = {"calls_used": calls_used()}
+        return feat
 
 
 def _is_amm(program: str | None) -> bool:
@@ -1232,7 +1437,9 @@ def sync_entries(now: float | None = None) -> int:
     ts = current_time() if now is None else float(now)
     if ts >= until_ts(ts):
         return 0
+    global _last_new_tids
     n = 0
+    new_tids: list[str] = []
     try:
         db = _connect()
         for src in _source_entries():
@@ -1254,11 +1461,14 @@ def sync_entries(now: float | None = None) -> int:
             )
             if cur.rowcount:
                 n += 1
+                new_tids.append(src["tid"])
         db.commit()
+        _last_new_tids = new_tids
         if n:
             log.info("young_trail_rugrisk sync entries=%d paper=1", n)
     except Exception as e:
         log.warning("young_trail_rugrisk sync: %s", safe_err(e))
+        _last_new_tids = new_tids
     return n
 
 
@@ -1298,29 +1508,63 @@ def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
     db.commit()
 
 
+def _progress_from_row(row) -> dict | None:
+    raw = None
+    try:
+        raw = row["features_json"]
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        blob = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(blob, dict):
+        return None
+    prog = blob.get("progress")
+    return dict(prog) if isinstance(prog, dict) else None
+
+
 def compute_pending(now: float | None = None, limit: int | None = None,
-                    source: str = "live") -> int:
-    """Compute features for pending Solana rows. Budget-aware. Fail open."""
+                    source: str = "live",
+                    priority_tids: list[str] | None = None) -> int:
+    """Compute features for pending Solana rows. Newest and new-this-tick first."""
     ts = current_time() if now is None else float(now)
     n = 0
     try:
         if not helius_allows(ts):
             return 0
         db = _connect()
-        sql = """SELECT tid, chain FROM young_trail_rugrisk
-                 WHERE status = 'pending' ORDER BY entry_ts ASC"""
-        if source != "backfill":
-            sql = """SELECT tid, chain FROM young_trail_rugrisk
-                     WHERE status = 'pending' ORDER BY entry_ts DESC"""
-        rows = db.execute(sql).fetchall()
+        rows = db.execute(
+            """SELECT * FROM young_trail_rugrisk
+               WHERE status = 'pending'
+               ORDER BY entry_ts DESC""",
+        ).fetchall()
+        ordered = []
+        seen: set[str] = set()
+        for tid in priority_tids or []:
+            for row in rows:
+                if row["tid"] == tid and tid not in seen:
+                    ordered.append(row)
+                    seen.add(tid)
+                    break
+        for row in rows:
+            if row["tid"] not in seen:
+                ordered.append(row)
+                seen.add(row["tid"])
         cap = limit if limit is not None else (8 if is_overnight(ts) else 2)
-        for row in rows[: max(0, cap)]:
-            if not _can_charge(4, ts):
+        for row in ordered[: max(0, cap)]:
+            need = 1 if _progress_from_row(row) else 4
+            if not _can_charge(need, ts):
                 break
             tid = row["tid"]
             mint, _net = parse_tid(tid)
             creator = _lookup_creator(tid)
-            feat = compute_features(mint or "", creator=creator, now=ts)
+            feat = compute_features(
+                mint or "", creator=creator, now=ts,
+                progress=_progress_from_row(row),
+            )
             if feat.get("status") == STATUS_BUDGET:
                 break
             _store_features(tid, feat, ts, source)
@@ -1362,13 +1606,16 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
         until_ts(ts)
         deploy_ts()
         n = sync_entries(ts)
+        new_tids = list(_last_new_tids)
         overnight = is_overnight(ts)
         cap = 8 if overnight else 2
-        src = "backfill" if overnight else "live"
-        computed = compute_pending(now=ts, limit=cap, source=src)
+        src = "live"
+        computed = compute_pending(
+            now=ts, limit=cap, source=src, priority_tids=new_tids,
+        )
         return {
             "entries": n, "computed": computed,
-            "backfill": computed if overnight else 0,
+            "backfill": 0 if not overnight else max(0, computed - len(new_tids)),
             "overnight": overnight,
         }
     except Exception as e:

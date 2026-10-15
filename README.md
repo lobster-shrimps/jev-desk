@@ -531,18 +531,22 @@ Helius RPC (`SOLANA_RPC_URL`) checks for a ≥20% dev sell, ≥30% top-3 holder 
 `/ops` compares helius vs fast vs per-cycle P&L on the same entries.
 
 **`young_trail_rugrisk`:** paper analysis on the same young_trail entries, running
-until 20 Oct 2026. At each Solana entry, budgeted Helius RPC (`SOLANA_RPC_URL`)
-pages mint signatures back to the true create slot (up to 5×1000; a truncated
-window is `unavailable` and never skips) and computes sniper share (non-creator
-supply bought in the first N slots), bundled launch buys (3+ non-creator wallets
-in the creation slot), the creator's prior rugs and create-slot buy
-(`dev_initial_share`), and the fresh-wallet share among top holders (creator
-excluded). Non-Solana rows store `n/a`. Three
-skip rules (snipers >30%, bundled, dev with a prior rug) are scored only as a
-counterfactual: P&L of young_trail, fast baseline, and fast `tp_50` on the entries
-that rule would have SKIPPED vs KEPT. Caps sit beside the helius ledger (12/tick,
-800/day; overnight backfill 24/tick) and yield when helius is low on its day
-budget. Does not gate entries, picks, or the judge. CLI:
+until 20 Oct 2026. New entries are scored first (ahead of overnight backfill).
+Budgeted Helius RPC (`SOLANA_RPC_URL`) pages mint signatures back to the true
+create slot (up to 5×1000; a truncated window is `unavailable` and never skips).
+Creators are the FOMO/Helius wallet plus signers of the tx that contains the
+pump.fun create instruction — not every same-slot buyer. Sniper and bundled
+measures use that create tx plus the first 15 non-create txs in
+`create_slot..+32` (`window_capped` when more exist; ~25–30 RPC/entry). A tick
+that cannot finish that capped set stores `status=pending` with progress and
+resumes later; `ok` only when complete. `calls_used` is recorded per entry.
+Also: creator prior rugs, create-slot buy (`dev_initial_share`), and
+fresh-wallet share among top holders (creator excluded). Non-Solana rows store
+`n/a`. Three skip rules (snipers >30%, bundled, dev with a prior rug) are scored
+only as a counterfactual: P&L of young_trail, fast baseline, and fast `tp_50` on
+the entries that rule would have SKIPPED vs KEPT. Caps sit beside the helius
+ledger (12/tick, 800/day; overnight backfill 24/tick) and yield when helius is
+low on its day cap. Does not gate entries, picks, or the judge. CLI:
 `python young_trail_rugrisk.py backfill`.
 
 ## research.db
