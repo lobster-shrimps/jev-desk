@@ -29,6 +29,7 @@ DEV_SELL_PCT = 0.20
 TOP3_SELL_PCT = 0.30
 POOL_SOL_DROP_PCT = 0.25
 WINDOW_SEC = 6 * 3600
+FRESH_MARK_SEC = 15 * 60
 LOCK_TIMEOUT_SEC = 0.2
 RPC_TIMEOUT_SEC = 8.0
 DEFAULT_UNTIL_ISO = "2026-10-20T11:38:07Z"
@@ -191,6 +192,9 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
       key TEXT PRIMARY KEY,
       value TEXT
     )"""))
+    _schema_step(conn, "yth_exit_reason", lambda: conn.execute(
+        "ALTER TABLE young_trail_helius ADD COLUMN exit_reason TEXT"
+    ))
 
 
 def _connect() -> sqlite3.Connection:
@@ -959,48 +963,258 @@ def refresh_outcomes(tids: list[str] | None = None) -> int:
     return n
 
 
-def _close(db: sqlite3.Connection, tid: str, exit_ts: float, exit_price: float,
-           signal_type: str) -> None:
+def _table_exists(db: sqlite3.Connection, name: str) -> bool:
+    try:
+        row = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _is_real_mark(row) -> bool:
+    """True when last_mark_ts is after entry (not the entry seed)."""
+    entry_ts = _num(row["entry_ts"] if not isinstance(row, dict) else row.get("entry_ts"))
+    last_mark_ts = _num(
+        row["last_mark_ts"] if not isinstance(row, dict) else row.get("last_mark_ts"),
+    )
+    if entry_ts is None or last_mark_ts is None:
+        return False
+    return last_mark_ts > entry_ts + 1e-9
+
+
+def _mint_like(tid: str) -> tuple[str, str]:
+    mint, _net = parse_tid(tid)
+    mint = mint or str(tid)
+    return str(tid), mint + ":%"
+
+
+def _latest_stored_mark(
+    tid: str,
+    *,
+    after_ts: float | None = None,
+    before_ts: float | None = None,
+    db: sqlite3.Connection | None = None,
+) -> tuple[float | None, float | None]:
+    """Freshest stored guarded price for this tid/mint. No network. Fail open.
+
+    Sources: young_trail, young_trail_fast, young_trail_marks, research.fast_marks.
+    Entry-seed stamps (ts <= after_ts) are ignored.
+    """
+    candidates: list[tuple[float, float]] = []
+
+    def add(px, ts) -> None:
+        if px is None or ts is None:
+            return
+        try:
+            price = float(px)
+            stamp = float(ts)
+        except (TypeError, ValueError):
+            return
+        if price < 0:
+            return
+        if after_ts is not None and stamp <= float(after_ts) + 1e-9:
+            return
+        if before_ts is not None and stamp > float(before_ts) + 1e-9:
+            return
+        candidates.append((stamp, price))
+
+    exact, like = _mint_like(tid)
+    try:
+        conn = db if db is not None else _connect()
+        if _table_exists(conn, "young_trail"):
+            for r in conn.execute(
+                """SELECT last_price, last_mark_ts, entry_ts FROM young_trail
+                   WHERE tid = ? OR tid LIKE ?""",
+                (exact, like),
+            ).fetchall():
+                if (
+                    r["last_mark_ts"] is not None
+                    and r["entry_ts"] is not None
+                    and float(r["last_mark_ts"]) > float(r["entry_ts"]) + 1e-9
+                ):
+                    add(r["last_price"], r["last_mark_ts"])
+        if _table_exists(conn, "young_trail_fast"):
+            for r in conn.execute(
+                """SELECT last_price, last_mark_ts, entry_ts FROM young_trail_fast
+                   WHERE tid = ? OR tid LIKE ?""",
+                (exact, like),
+            ).fetchall():
+                if (
+                    r["last_mark_ts"] is not None
+                    and r["entry_ts"] is not None
+                    and float(r["last_mark_ts"]) > float(r["entry_ts"]) + 1e-9
+                ):
+                    add(r["last_price"], r["last_mark_ts"])
+        if _table_exists(conn, "young_trail_marks"):
+            for r in conn.execute(
+                """SELECT ts, price FROM young_trail_marks
+                   WHERE tid = ? OR tid LIKE ?""",
+                (exact, like),
+            ).fetchall():
+                add(r["price"], r["ts"])
+    except Exception as e:
+        log.warning("young_trail_helius stored mark outcomes %s: %s", tid, safe_err(e))
+    try:
+        import research
+        path = research.db_path()
+        if path.exists():
+            rdb = sqlite3.connect(str(path), timeout=LOCK_TIMEOUT_SEC)
+            rdb.row_factory = sqlite3.Row
+            try:
+                if _table_exists(rdb, "fast_marks"):
+                    for r in rdb.execute(
+                        """SELECT ts, price_usd FROM fast_marks
+                           WHERE (tid = ? OR tid LIKE ?) AND price_usd IS NOT NULL""",
+                        (exact, like),
+                    ).fetchall():
+                        add(r["price_usd"], r["ts"])
+            finally:
+                rdb.close()
+    except Exception as e:
+        log.warning("young_trail_helius stored mark research %s: %s", tid, safe_err(e))
+    if not candidates:
+        return None, None
+    candidates.sort()
+    stamp, price = candidates[-1]
+    return price, stamp
+
+
+def _close_price_for(
+    row,
+    now: float | None = None,
+    *,
+    trust_self: bool = True,
+) -> tuple[float | None, float | None]:
+    """Freshest real mark on this row or from other ledgers. Never the entry seed."""
+    entry_ts = _num(row["entry_ts"] if not isinstance(row, dict) else row.get("entry_ts"))
+    if trust_self and _is_real_mark(row):
+        last_px = _num(row["last_price"] if not isinstance(row, dict) else row.get("last_price"))
+        last_ts = _num(
+            row["last_mark_ts"] if not isinstance(row, dict) else row.get("last_mark_ts"),
+        )
+        if last_px is not None:
+            return last_px, last_ts
+    tid = row["tid"] if not isinstance(row, dict) else row.get("tid")
+    before = float(now) if now is not None else None
+    return _latest_stored_mark(tid, after_ts=entry_ts, before_ts=before)
+
+
+def _mark_is_fresh(mark_ts: float | None, now: float) -> bool:
+    if mark_ts is None:
+        return False
+    return float(now) - float(mark_ts) <= FRESH_MARK_SEC + 1e-9
+
+
+def _apply_tick_prices(db: sqlite3.Connection, rows, prices: dict, ts: float) -> int:
+    """Update last_price on every open row from this tick or stored marks. No RPC."""
+    import price_guard
+    marked = 0
+    for row in rows:
+        tid = row["tid"]
+        entry_px = float(row["entry_price"])
+        last_px = _num(row["last_price"]) or entry_px
+        px = price_guard.accept_price(
+            _price_of(prices.get(tid)),
+            entry=entry_px, prev=last_px, tid=tid, now=ts,
+        )
+        mark_ts = ts
+        if px is None:
+            stored, stored_ts = _latest_stored_mark(
+                tid, after_ts=float(row["entry_ts"]), before_ts=ts,
+            )
+            if stored is None or stored_ts is None:
+                continue
+            cur_ts = _num(row["last_mark_ts"]) or 0.0
+            if _is_real_mark(row) and stored_ts <= cur_ts + 1e-9:
+                continue
+            px = stored
+            mark_ts = stored_ts
+        db.execute(
+            """UPDATE young_trail_helius
+               SET last_price = ?, last_mark_ts = ?
+               WHERE tid = ? AND exit_ts IS NULL""",
+            (float(px), float(mark_ts), tid),
+        )
+        marked += 1
+    return marked
+
+
+def _close(db: sqlite3.Connection, tid: str, exit_ts: float, exit_price: float | None,
+           signal_type: str | None, *, exit_reason: str,
+           unmarked: bool = False) -> None:
     entry = db.execute(
-        "SELECT entry_price FROM young_trail_helius WHERE tid = ?", (tid,),
+        "SELECT * FROM young_trail_helius WHERE tid = ?", (tid,),
     ).fetchone()
-    if entry is None:
+    if entry is None or entry["exit_ts"] is not None:
         return
-    pnl = pnl_usd(exit_price, float(entry["entry_price"]))
+    if unmarked or exit_price is None:
+        reason = "unmarked"
+        db.execute(
+            """UPDATE young_trail_helius
+               SET signal_type = ?, signal_ts = ?, signal_price = ?,
+                   pnl_usd = NULL, exit_ts = ?, exit_price = NULL, exit_reason = ?
+               WHERE tid = ? AND exit_ts IS NULL""",
+            (
+                signal_type, float(exit_ts) if signal_type else None, None,
+                float(exit_ts), reason, tid,
+            ),
+        )
+        if signal_type:
+            db.execute(
+                """INSERT OR IGNORE INTO young_trail_helius_signals (
+                     tid, signal_type, ts, mark_price, pnl_usd
+                   ) VALUES (?, ?, ?, NULL, NULL)""",
+                (tid, signal_type, float(exit_ts)),
+            )
+        log.info(
+            "young_trail_helius exit tid=%s reason=%s signal=%s pnl_usd=null paper=1",
+            tid, reason, signal_type,
+        )
+        return
+    pnl = pnl_usd(float(exit_price), float(entry["entry_price"]))
     db.execute(
         """UPDATE young_trail_helius
            SET last_price = ?, last_mark_ts = ?,
                signal_type = ?, signal_ts = ?, signal_price = ?,
-               pnl_usd = ?, exit_ts = ?, exit_price = ?
+               pnl_usd = ?, exit_ts = ?, exit_price = ?, exit_reason = ?
            WHERE tid = ? AND exit_ts IS NULL""",
-        (float(exit_price), float(exit_ts), signal_type, float(exit_ts),
-         float(exit_price), pnl, float(exit_ts), float(exit_price), tid),
+        (
+            float(exit_price), float(exit_ts),
+            signal_type, float(exit_ts) if signal_type else None,
+            float(exit_price) if signal_type else None,
+            pnl, float(exit_ts), float(exit_price), exit_reason, tid,
+        ),
     )
-    db.execute(
-        """INSERT OR IGNORE INTO young_trail_helius_signals (
-             tid, signal_type, ts, mark_price, pnl_usd
-           ) VALUES (?, ?, ?, ?, ?)""",
-        (tid, signal_type, float(exit_ts), float(exit_price), pnl),
-    )
+    if signal_type:
+        db.execute(
+            """INSERT OR IGNORE INTO young_trail_helius_signals (
+                 tid, signal_type, ts, mark_price, pnl_usd
+               ) VALUES (?, ?, ?, ?, ?)""",
+            (tid, signal_type, float(exit_ts), float(exit_price), pnl),
+        )
     log.info(
-        "young_trail_helius exit tid=%s signal=%s pnl_usd=%.2f paper=1",
-        tid, signal_type, pnl,
+        "young_trail_helius exit tid=%s reason=%s signal=%s pnl_usd=%.2f paper=1",
+        tid, exit_reason, signal_type, pnl,
     )
 
 
 def _record_extra_signal(db: sqlite3.Connection, tid: str, signal_type: str,
-                         ts: float, price: float) -> None:
+                         ts: float, price: float | None) -> None:
     entry = db.execute(
         "SELECT entry_price FROM young_trail_helius WHERE tid = ?", (tid,),
     ).fetchone()
     if entry is None:
         return
-    pnl = pnl_usd(price, float(entry["entry_price"]))
+    px = _num(price)
+    pnl = None if px is None else pnl_usd(px, float(entry["entry_price"]))
     db.execute(
         """INSERT OR IGNORE INTO young_trail_helius_signals (
              tid, signal_type, ts, mark_price, pnl_usd
            ) VALUES (?, ?, ?, ?, ?)""",
-        (tid, signal_type, float(ts), float(price), pnl),
+        (tid, signal_type, float(ts), px, pnl),
     )
 
 
@@ -1019,26 +1233,51 @@ def _rr_tids(open_tids: list[str]) -> list[str]:
 
 
 def on_marks(prices: dict | None, now: float | None = None) -> dict:
-    """Budgeted Helius checks on still-open Solana paper rows. Fail open."""
+    """Mark every open row from this tick, time-exit at 6h, then budgeted RPC.
+
+    last_price updates even when the Helius budget is gone. Fail open.
+    """
     prices = prices or {}
     ts = current_time() if now is None else float(now)
     checked = 0
     closed = 0
     signals = 0
     skipped = 0
+    marked = 0
     try:
         db = _connect()
-        rows = db.execute(
+        open_now = db.execute(
+            "SELECT * FROM young_trail_helius WHERE exit_ts IS NULL ORDER BY entry_ts",
+        ).fetchall()
+        marked = _apply_tick_prices(db, open_now, prices, ts)
+
+        still_open = db.execute(
+            "SELECT * FROM young_trail_helius WHERE exit_ts IS NULL ORDER BY entry_ts",
+        ).fetchall()
+        for row in still_open:
+            if ts < float(row["entry_ts"]) + WINDOW_SEC:
+                continue
+            px, _mark_ts = _close_price_for(row, ts, trust_self=True)
+            if px is None:
+                _close(db, row["tid"], ts, None, None, exit_reason="unmarked",
+                       unmarked=True)
+            else:
+                _close(db, row["tid"], ts, px, None, exit_reason="time")
+            closed += 1
+
+        check_rows = db.execute(
             """SELECT h.*, w.mint, w.dev_wallet, w.holders_json, w.top3_json,
                       w.pool_account, w.pool_sol_lamports, w.dev_amount,
                       w.snapshot_ok
                FROM young_trail_helius h
                JOIN young_trail_helius_watch w ON w.tid = h.tid
-               WHERE h.exit_ts IS NULL AND w.snapshot_ok = 1
+               WHERE w.snapshot_ok = 1
+                 AND (h.exit_ts IS NULL OR h.exit_reason = 'time')
+                 AND h.signal_type IS NULL
                ORDER BY h.entry_ts"""
         ).fetchall()
-        tids = _rr_tids([r["tid"] for r in rows])
-        by_tid = {r["tid"]: r for r in rows}
+        tids = _rr_tids([r["tid"] for r in check_rows])
+        by_tid = {r["tid"]: r for r in check_rows}
         for tid in tids:
             if not _can_charge(1, ts):
                 skipped += 1
@@ -1066,51 +1305,59 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
                 "pool_sol_lamports": row["pool_sol_lamports"],
             }
             fired = detect_signals(watch, largest, pool_sol)
-            import price_guard
-            entry_px = _num(row["entry_price"]) or 0.0
-            last_px = _num(row["last_price"], row["entry_price"])
-            px = price_guard.accept_price(
-                _price_of(prices.get(tid)),
-                entry=entry_px, prev=last_px, tid=tid, now=ts,
-            )
-            mark_px = px if px is not None else last_px
-            mark_px = float(mark_px or row["entry_price"])
             checked += 1
-            if fired:
-                still_open = db.execute(
-                    "SELECT exit_ts FROM young_trail_helius WHERE tid = ?", (tid,),
-                ).fetchone()
-                if still_open and still_open["exit_ts"] is None:
-                    _close(db, tid, ts, mark_px, fired[0])
-                    closed += 1
+            if not fired:
+                continue
+            live = db.execute(
+                "SELECT * FROM young_trail_helius WHERE tid = ?", (tid,),
+            ).fetchone()
+            already_closed = live is not None and live["exit_ts"] is not None
+            rugged = int((live["rugged"] if live is not None else 0) or 0)
+            if already_closed or rugged:
+                log.info(
+                    "young_trail_helius signal after %s tid=%s types=%s paper=1",
+                    "rug" if rugged and not already_closed else (live["exit_reason"] if live else "exit"),
+                    tid, ",".join(fired),
+                )
+                px_log = None
+                if live is not None and _is_real_mark(live):
+                    px_log = _num(live["last_price"])
                 for sig in fired:
-                    _record_extra_signal(db, tid, sig, ts, mark_px)
+                    _record_extra_signal(db, tid, sig, ts, px_log)
                 signals += len(fired)
                 continue
-            if px is None:
-                continue
-            db.execute(
-                """UPDATE young_trail_helius
-                   SET last_price = ?, last_mark_ts = ?
-                   WHERE tid = ? AND exit_ts IS NULL""",
-                (float(px), ts, tid),
-            )
+            px, mark_ts = _close_price_for(live, ts, trust_self=True)
+            if px is None or not _mark_is_fresh(mark_ts, ts):
+                _close(db, tid, ts, None, fired[0], exit_reason="unmarked",
+                       unmarked=True)
+                closed += 1
+            else:
+                _close(db, tid, ts, px, fired[0], exit_reason=fired[0])
+                closed += 1
+            for sig in fired:
+                _record_extra_signal(db, tid, sig, ts, px)
+            signals += len(fired)
         db.commit()
-        if rows:
+        if open_now or check_rows:
             log.info(
-                "young_trail_helius mark: %d checked, %d closed, %d signals paper=1",
-                checked, closed, signals,
+                "young_trail_helius mark: %d marked, %d checked, %d closed, "
+                "%d signals paper=1",
+                marked, checked, closed, signals,
             )
     except Exception as e:
         log.warning("young_trail_helius marks: %s", safe_err(e))
     return {
-        "checked": checked, "closed": closed, "signals": signals, "skipped": skipped,
+        "checked": checked, "closed": closed, "signals": signals,
+        "skipped": skipped, "marked": marked,
     }
 
 
 def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dict:
     """Sampler hook: copy Solana entries, snapshot, then check. Fail open."""
-    empty = {"entries": 0, "snapshots": 0, "checked": 0, "closed": 0, "signals": 0}
+    empty = {
+        "entries": 0, "snapshots": 0, "checked": 0, "closed": 0,
+        "signals": 0, "marked": 0, "skipped": 0,
+    }
     try:
         if not enabled():
             return empty
@@ -1202,7 +1449,15 @@ def quality() -> dict:
     try:
         refresh_outcomes()
         db = _connect()
-        sigs = db.execute("SELECT * FROM young_trail_helius_signals").fetchall()
+        unmarked = {
+            r["tid"] for r in db.execute(
+                "SELECT tid FROM young_trail_helius WHERE exit_reason = 'unmarked'",
+            ).fetchall()
+        }
+        sigs = [
+            r for r in db.execute("SELECT * FROM young_trail_helius_signals").fetchall()
+            if r["tid"] not in unmarked
+        ]
         watched = db.execute("SELECT tid FROM young_trail_helius").fetchall()
         tids = [r["tid"] for r in watched]
         rug_tids = set()
@@ -1210,24 +1465,37 @@ def quality() -> dict:
             oc = _outcome_for(tid)
             if oc.get("rugged"):
                 rug_tids.add(tid)
-        caught = {r["tid"] for r in sigs if r["tid"] in rug_tids}
-        tp = sum(1 for r in sigs if r["tid"] in rug_tids)
+
+        def _lead_ok(r) -> bool:
+            lead = _num(r["lead_min"])
+            if lead is None:
+                return True
+            return lead >= 0.0
+
+        caught = {r["tid"] for r in sigs if r["tid"] in rug_tids and _lead_ok(r)}
+        tp = sum(1 for r in sigs if r["tid"] in rug_tids and _lead_ok(r))
         fp = sum(1 for r in sigs if r["tid"] not in rug_tids and r["rugged"] == 0)
         # Signals on unlabeled tids do not count as FP until an outcome exists.
+        # A negative lead (rug before the signal) is a miss, not a true positive.
         labeled = {r["tid"] for r in sigs if r["rugged"] is not None}
-        labeled_pos = sum(1 for r in sigs if r["tid"] in labeled and r["tid"] in rug_tids)
+        labeled_pos = sum(
+            1 for r in sigs
+            if r["tid"] in labeled and r["tid"] in rug_tids and _lead_ok(r)
+        )
         labeled_n = sum(1 for r in sigs if r["tid"] in labeled)
         leads = [
             _num(r["lead_min"]) for r in sigs
             if r["tid"] in rug_tids and r["lead_min"] is not None
         ]
-        leads = [x for x in leads if x is not None]
+        leads = [x for x in leads if x is not None and x >= 0.0]
         by_type: dict[str, dict] = {}
         for name in (SIGNAL_DEV, SIGNAL_TOP3, SIGNAL_POOL):
             rows = [r for r in sigs if r["signal_type"] == name]
             by_type[name] = {
                 "n": len(rows),
-                "true_positives": sum(1 for r in rows if r["tid"] in rug_tids),
+                "true_positives": sum(
+                    1 for r in rows if r["tid"] in rug_tids and _lead_ok(r)
+                ),
             }
         precision = (labeled_pos / labeled_n) if labeled_n else None
         recall = (len(caught) / len(rug_tids)) if rug_tids else None
@@ -1253,15 +1521,19 @@ def _summary() -> dict:
     try:
         opens = open_rows()
         closes = closed_rows(limit=None)
-        wins = sum(1 for c in closes if (c.get("pnl_usd") or 0) > 0)
-        n = len(closes)
+        counted = [
+            c for c in closes
+            if c.get("exit_reason") != "unmarked" and c.get("pnl_usd") is not None
+        ]
+        wins = sum(1 for c in counted if (c.get("pnl_usd") or 0) > 0)
+        n = len(counted)
         return {
             "open_count": len(opens),
             "closed_count": n,
             "winning_trades": wins,
             "losing_trades": n - wins,
             "win_rate": (wins / n) if n else 0.0,
-            "realized_pnl_usd": sum(c.get("pnl_usd") or 0 for c in closes),
+            "realized_pnl_usd": sum(c.get("pnl_usd") or 0 for c in counted),
             "signals": len(signal_rows(limit=None)),
             "snapshotted": sum(1 for w in watch_rows() if w.get("snapshot_ok")),
         }
@@ -1333,6 +1605,150 @@ def comparison(limit: int = 80) -> list[dict]:
         return []
 
 
+def _open_repair_db(path) -> sqlite3.Connection:
+    """Open an explicit copy. Enforces the live-DB / location gate first."""
+    import repair_helius_zero_exits as repair
+    resolved = repair.assert_repair_db_allowed(path)
+    if not resolved.exists():
+        raise repair.RepairDbRefused(f"db not found: {resolved}")
+    conn = sqlite3.connect(str(resolved), timeout=LOCK_TIMEOUT_SEC)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def plan_zero_exit_repairs(path) -> list[dict]:
+    """Closed rows with exit ≈ entry, recomputed from stored marks.
+
+    `path` is required. Refuses the live outcomes.db.
+    """
+    conn = _open_repair_db(path)
+    try:
+        rows = conn.execute(
+            """SELECT * FROM young_trail_helius
+               WHERE exit_ts IS NOT NULL
+                 AND exit_price IS NOT NULL
+                 AND entry_price IS NOT NULL
+                 AND abs(exit_price - entry_price)
+                     <= 1e-9 * max(abs(entry_price), 1e-18)
+               ORDER BY exit_ts"""
+        ).fetchall()
+        plan = []
+        for row in rows:
+            px, mark_ts = _latest_stored_mark(
+                row["tid"],
+                after_ts=float(row["entry_ts"]),
+                before_ts=float(row["exit_ts"]),
+                db=conn,
+            )
+            old_pnl = _num(row["pnl_usd"])
+            if px is None:
+                plan.append({
+                    "tid": row["tid"],
+                    "ticker": row["ticker"],
+                    "entry_price": float(row["entry_price"]),
+                    "old_exit_price": float(row["exit_price"]),
+                    "old_pnl_usd": old_pnl,
+                    "new_exit_price": None,
+                    "new_pnl_usd": None,
+                    "new_exit_reason": "unmarked",
+                    "mark_ts": None,
+                })
+                continue
+            plan.append({
+                "tid": row["tid"],
+                "ticker": row["ticker"],
+                "entry_price": float(row["entry_price"]),
+                "old_exit_price": float(row["exit_price"]),
+                "old_pnl_usd": old_pnl,
+                "new_exit_price": px,
+                "new_pnl_usd": pnl_usd(px, float(row["entry_price"])),
+                "new_exit_reason": row["exit_reason"] or row["signal_type"] or "signal",
+                "mark_ts": mark_ts,
+            })
+        return plan
+    finally:
+        conn.close()
+
+
+def apply_zero_exit_repairs(path, plan: list[dict]) -> int:
+    """Write a repair plan to `path`. Returns rows updated. Paper ledger only."""
+    conn = _open_repair_db(path)
+    try:
+        if not plan:
+            return 0
+        n = 0
+        for item in plan:
+            tid = item["tid"]
+            if item.get("new_exit_price") is None:
+                conn.execute(
+                    """UPDATE young_trail_helius
+                       SET pnl_usd = NULL, exit_price = NULL, exit_reason = 'unmarked',
+                           signal_price = NULL
+                       WHERE tid = ?""",
+                    (tid,),
+                )
+                conn.execute(
+                    """UPDATE young_trail_helius_signals
+                       SET mark_price = NULL, pnl_usd = NULL
+                       WHERE tid = ?""",
+                    (tid,),
+                )
+            else:
+                px = float(item["new_exit_price"])
+                pnl = item.get("new_pnl_usd")
+                reason = item.get("new_exit_reason") or "signal"
+                conn.execute(
+                    """UPDATE young_trail_helius
+                       SET last_price = ?, exit_price = ?, pnl_usd = ?,
+                           signal_price = ?, exit_reason = ?
+                       WHERE tid = ?""",
+                    (px, px, pnl, px, reason, tid),
+                )
+                conn.execute(
+                    """UPDATE young_trail_helius_signals
+                       SET mark_price = ?, pnl_usd = ?
+                       WHERE tid = ?""",
+                    (px, pnl, tid),
+                )
+            n += 1
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def format_repair_diff(plan: list[dict]) -> str:
+    """Plain-text diff for a dry-run. No secrets."""
+    lines = ["tid ticker old_exit old_pnl -> new_exit new_pnl reason"]
+    old_sum = 0.0
+    new_sum = 0.0
+    new_counted = 0
+    for item in plan:
+        old_pnl = item.get("old_pnl_usd")
+        new_pnl = item.get("new_pnl_usd")
+        if old_pnl is not None:
+            old_sum += float(old_pnl)
+        if new_pnl is not None:
+            new_sum += float(new_pnl)
+            new_counted += 1
+        lines.append(
+            "{tid} {ticker} {old_ex} {old_pnl} -> {new_ex} {new_pnl} {reason}".format(
+                tid=item.get("tid"),
+                ticker=item.get("ticker") or "",
+                old_ex=item.get("old_exit_price"),
+                old_pnl=old_pnl,
+                new_ex=item.get("new_exit_price"),
+                new_pnl=new_pnl,
+                reason=item.get("new_exit_reason"),
+            )
+        )
+    lines.append(
+        "rows=%d old_pnl_sum=%.2f new_pnl_sum=%.2f (counted=%d)"
+        % (len(plan), old_sum, new_sum, new_counted)
+    )
+    return "\n".join(lines)
+
+
 def ops_payload() -> dict:
     """JSON for GET /ops/young_trail_helius. Paper/simulated; no live orders."""
     try:
@@ -1357,6 +1773,8 @@ def ops_payload() -> dict:
                 "dev_sell_pct": DEV_SELL_PCT,
                 "top3_sell_pct": TOP3_SELL_PCT,
                 "pool_sol_drop_pct": POOL_SOL_DROP_PCT,
+                "window_sec": WINDOW_SEC,
+                "fresh_mark_sec": FRESH_MARK_SEC,
             },
             "budget": budget_remaining(now),
             "summary": _summary(),
