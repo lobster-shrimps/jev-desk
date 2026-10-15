@@ -996,6 +996,7 @@ def _latest_stored_mark(
     *,
     after_ts: float | None = None,
     before_ts: float | None = None,
+    db: sqlite3.Connection | None = None,
 ) -> tuple[float | None, float | None]:
     """Freshest stored guarded price for this tid/mint. No network. Fail open.
 
@@ -1022,9 +1023,9 @@ def _latest_stored_mark(
 
     exact, like = _mint_like(tid)
     try:
-        db = _connect()
-        if _table_exists(db, "young_trail"):
-            for r in db.execute(
+        conn = db if db is not None else _connect()
+        if _table_exists(conn, "young_trail"):
+            for r in conn.execute(
                 """SELECT last_price, last_mark_ts, entry_ts FROM young_trail
                    WHERE tid = ? OR tid LIKE ?""",
                 (exact, like),
@@ -1035,8 +1036,8 @@ def _latest_stored_mark(
                     and float(r["last_mark_ts"]) > float(r["entry_ts"]) + 1e-9
                 ):
                     add(r["last_price"], r["last_mark_ts"])
-        if _table_exists(db, "young_trail_fast"):
-            for r in db.execute(
+        if _table_exists(conn, "young_trail_fast"):
+            for r in conn.execute(
                 """SELECT last_price, last_mark_ts, entry_ts FROM young_trail_fast
                    WHERE tid = ? OR tid LIKE ?""",
                 (exact, like),
@@ -1047,8 +1048,8 @@ def _latest_stored_mark(
                     and float(r["last_mark_ts"]) > float(r["entry_ts"]) + 1e-9
                 ):
                     add(r["last_price"], r["last_mark_ts"])
-        if _table_exists(db, "young_trail_marks"):
-            for r in db.execute(
+        if _table_exists(conn, "young_trail_marks"):
+            for r in conn.execute(
                 """SELECT ts, price FROM young_trail_marks
                    WHERE tid = ? OR tid LIKE ?""",
                 (exact, like),
@@ -1604,94 +1605,116 @@ def comparison(limit: int = 80) -> list[dict]:
         return []
 
 
-def plan_zero_exit_repairs(db: sqlite3.Connection | None = None) -> list[dict]:
-    """Closed rows with exit_price == entry_price, recomputed from stored marks."""
-    conn = db if db is not None else _connect()
-    rows = conn.execute(
-        """SELECT * FROM young_trail_helius
-           WHERE exit_ts IS NOT NULL
-             AND exit_price IS NOT NULL
-             AND entry_price IS NOT NULL
-             AND abs(exit_price - entry_price) < 1e-12
-           ORDER BY exit_ts"""
-    ).fetchall()
-    plan = []
-    for row in rows:
-        px, mark_ts = _latest_stored_mark(
-            row["tid"],
-            after_ts=float(row["entry_ts"]),
-            before_ts=float(row["exit_ts"]),
-        )
-        old_pnl = _num(row["pnl_usd"])
-        if px is None:
+def _open_repair_db(path) -> sqlite3.Connection:
+    """Open an explicit copy. Enforces the live-DB / location gate first."""
+    import repair_helius_zero_exits as repair
+    resolved = repair.assert_repair_db_allowed(path)
+    if not resolved.exists():
+        raise repair.RepairDbRefused(f"db not found: {resolved}")
+    conn = sqlite3.connect(str(resolved), timeout=LOCK_TIMEOUT_SEC)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def plan_zero_exit_repairs(path) -> list[dict]:
+    """Closed rows with exit ≈ entry, recomputed from stored marks.
+
+    `path` is required. Refuses the live outcomes.db.
+    """
+    conn = _open_repair_db(path)
+    try:
+        rows = conn.execute(
+            """SELECT * FROM young_trail_helius
+               WHERE exit_ts IS NOT NULL
+                 AND exit_price IS NOT NULL
+                 AND entry_price IS NOT NULL
+                 AND abs(exit_price - entry_price)
+                     <= 1e-9 * max(abs(entry_price), 1e-18)
+               ORDER BY exit_ts"""
+        ).fetchall()
+        plan = []
+        for row in rows:
+            px, mark_ts = _latest_stored_mark(
+                row["tid"],
+                after_ts=float(row["entry_ts"]),
+                before_ts=float(row["exit_ts"]),
+                db=conn,
+            )
+            old_pnl = _num(row["pnl_usd"])
+            if px is None:
+                plan.append({
+                    "tid": row["tid"],
+                    "ticker": row["ticker"],
+                    "entry_price": float(row["entry_price"]),
+                    "old_exit_price": float(row["exit_price"]),
+                    "old_pnl_usd": old_pnl,
+                    "new_exit_price": None,
+                    "new_pnl_usd": None,
+                    "new_exit_reason": "unmarked",
+                    "mark_ts": None,
+                })
+                continue
             plan.append({
                 "tid": row["tid"],
                 "ticker": row["ticker"],
                 "entry_price": float(row["entry_price"]),
                 "old_exit_price": float(row["exit_price"]),
                 "old_pnl_usd": old_pnl,
-                "new_exit_price": None,
-                "new_pnl_usd": None,
-                "new_exit_reason": "unmarked",
-                "mark_ts": None,
+                "new_exit_price": px,
+                "new_pnl_usd": pnl_usd(px, float(row["entry_price"])),
+                "new_exit_reason": row["exit_reason"] or row["signal_type"] or "signal",
+                "mark_ts": mark_ts,
             })
-            continue
-        plan.append({
-            "tid": row["tid"],
-            "ticker": row["ticker"],
-            "entry_price": float(row["entry_price"]),
-            "old_exit_price": float(row["exit_price"]),
-            "old_pnl_usd": old_pnl,
-            "new_exit_price": px,
-            "new_pnl_usd": pnl_usd(px, float(row["entry_price"])),
-            "new_exit_reason": row["exit_reason"] or row["signal_type"] or "signal",
-            "mark_ts": mark_ts,
-        })
-    return plan
+        return plan
+    finally:
+        conn.close()
 
 
-def apply_zero_exit_repairs(plan: list[dict], db: sqlite3.Connection | None = None) -> int:
-    """Write a repair plan. Returns rows updated. Paper ledger only."""
-    if not plan:
-        return 0
-    conn = db if db is not None else _connect()
-    n = 0
-    for item in plan:
-        tid = item["tid"]
-        if item.get("new_exit_price") is None:
-            conn.execute(
-                """UPDATE young_trail_helius
-                   SET pnl_usd = NULL, exit_price = NULL, exit_reason = 'unmarked',
-                       signal_price = NULL
-                   WHERE tid = ?""",
-                (tid,),
-            )
-            conn.execute(
-                """UPDATE young_trail_helius_signals
-                   SET mark_price = NULL, pnl_usd = NULL
-                   WHERE tid = ?""",
-                (tid,),
-            )
-        else:
-            px = float(item["new_exit_price"])
-            pnl = item.get("new_pnl_usd")
-            reason = item.get("new_exit_reason") or "signal"
-            conn.execute(
-                """UPDATE young_trail_helius
-                   SET last_price = ?, exit_price = ?, pnl_usd = ?,
-                       signal_price = ?, exit_reason = ?
-                   WHERE tid = ?""",
-                (px, px, pnl, px, reason, tid),
-            )
-            conn.execute(
-                """UPDATE young_trail_helius_signals
-                   SET mark_price = ?, pnl_usd = ?
-                   WHERE tid = ?""",
-                (px, pnl, tid),
-            )
-        n += 1
-    conn.commit()
-    return n
+def apply_zero_exit_repairs(path, plan: list[dict]) -> int:
+    """Write a repair plan to `path`. Returns rows updated. Paper ledger only."""
+    conn = _open_repair_db(path)
+    try:
+        if not plan:
+            return 0
+        n = 0
+        for item in plan:
+            tid = item["tid"]
+            if item.get("new_exit_price") is None:
+                conn.execute(
+                    """UPDATE young_trail_helius
+                       SET pnl_usd = NULL, exit_price = NULL, exit_reason = 'unmarked',
+                           signal_price = NULL
+                       WHERE tid = ?""",
+                    (tid,),
+                )
+                conn.execute(
+                    """UPDATE young_trail_helius_signals
+                       SET mark_price = NULL, pnl_usd = NULL
+                       WHERE tid = ?""",
+                    (tid,),
+                )
+            else:
+                px = float(item["new_exit_price"])
+                pnl = item.get("new_pnl_usd")
+                reason = item.get("new_exit_reason") or "signal"
+                conn.execute(
+                    """UPDATE young_trail_helius
+                       SET last_price = ?, exit_price = ?, pnl_usd = ?,
+                           signal_price = ?, exit_reason = ?
+                       WHERE tid = ?""",
+                    (px, px, pnl, px, reason, tid),
+                )
+                conn.execute(
+                    """UPDATE young_trail_helius_signals
+                       SET mark_price = ?, pnl_usd = ?
+                       WHERE tid = ?""",
+                    (px, pnl, tid),
+                )
+            n += 1
+        conn.commit()
+        return n
+    finally:
+        conn.close()
 
 
 def format_repair_diff(plan: list[dict]) -> str:

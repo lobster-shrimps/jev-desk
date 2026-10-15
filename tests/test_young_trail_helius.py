@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -775,7 +776,8 @@ def test_replay_overnight_zero_closes_repairs_to_about_minus_241(yth):
     closed = helius.closed_rows(limit=None)
     assert len(closed) == 6
     assert all(r["pnl_usd"] == pytest.approx(0.0) for r in closed)
-    plan = helius.plan_zero_exit_repairs()
+    db_path = os.environ["OUTCOMES_DB"]
+    plan = helius.plan_zero_exit_repairs(db_path)
     assert len(plan) == 6
     diff = helius.format_repair_diff(plan)
     assert "RFC" in diff
@@ -784,15 +786,22 @@ def test_replay_overnight_zero_closes_repairs_to_about_minus_241(yth):
     assert dry_pnl == pytest.approx(-241.0)
     # dry-run must not write
     assert all(r["pnl_usd"] == pytest.approx(0.0) for r in helius.closed_rows(limit=None))
-    n = helius.apply_zero_exit_repairs(plan)
+    n = helius.apply_zero_exit_repairs(db_path, plan)
     assert n == 6
     repaired = helius.closed_rows(limit=None)
     assert sum(r["pnl_usd"] or 0 for r in repaired) == pytest.approx(-241.0)
     assert all(r["exit_price"] != pytest.approx(r["entry_price"]) for r in repaired)
 
 
-def test_repair_script_dry_run_cli(yth, tmp_path, monkeypatch):
-    yt, helius = yth
+def _fingerprint(path: pathlib.Path):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return None
+    st = p.stat()
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def _seed_zero_close(yt, helius):
     _enter_sol(yt, helius, creator=DEV)
     helius.sync_entries(now=T0)
     yt.mark_open({TID: 0.50}, now=T0 + 60)
@@ -805,7 +814,12 @@ def test_repair_script_dry_run_cli(yth, tmp_path, monkeypatch):
         (T0 + 120, TID),
     )
     db.commit()
-    db_path = os.environ["OUTCOMES_DB"]
+    return os.environ["OUTCOMES_DB"]
+
+
+def test_repair_script_dry_run_cli(yth, tmp_path, monkeypatch):
+    yt, helius = yth
+    db_path = _seed_zero_close(yt, helius)
     import repair_helius_zero_exits as repair
     rc = repair.main(["--db", db_path])
     assert rc == 0
@@ -816,6 +830,60 @@ def test_repair_script_dry_run_cli(yth, tmp_path, monkeypatch):
     helius.reset()
     row = helius.closed_rows(limit=None)[0]
     assert row["pnl_usd"] == pytest.approx(-25.0)
+
+
+def test_repair_refuses_live_symlink_and_relative(yth, tmp_path, monkeypatch):
+    yt, helius = yth
+    monkeypatch.chdir(ROOT)
+    src = _seed_zero_close(yt, helius)
+    import repair_helius_zero_exits as repair
+    live = ROOT / "outbox" / "outcomes.db"
+    before = _fingerprint(live)
+    src_before = _fingerprint(pathlib.Path(src))
+
+    rc = repair.main(["--db", str(live)])
+    assert rc != 0
+    rc = repair.main(["--db", "outbox/outcomes.db"])
+    assert rc != 0
+    link = tmp_path / "link-to-live.db"
+    link.symlink_to(live)
+    rc = repair.main(["--db", str(link)])
+    assert rc != 0
+    with pytest.raises(repair.RepairDbRefused):
+        helius.plan_zero_exit_repairs(live)
+    with pytest.raises(repair.RepairDbRefused):
+        helius.apply_zero_exit_repairs(live, [])
+
+    assert _fingerprint(live) == before
+    assert _fingerprint(pathlib.Path(src)) == src_before
+    row = helius.closed_rows(limit=None)[0]
+    assert row["pnl_usd"] == pytest.approx(0.0)
+
+
+def test_repair_works_on_outbox_backups_copy(yth, tmp_path):
+    yt, helius = yth
+    src = _seed_zero_close(yt, helius)
+    backup_dir = tmp_path / "outbox" / "backups"
+    backup_dir.mkdir(parents=True)
+    copy = backup_dir / "outcomes.db"
+    shutil.copy2(src, copy)
+    import repair_helius_zero_exits as repair
+    rc = repair.main(["--db", str(copy)])
+    assert rc == 0
+    src_row = sqlite3.connect(src).execute(
+        "SELECT pnl_usd FROM young_trail_helius WHERE tid = ?", (TID,),
+    ).fetchone()
+    assert src_row[0] == pytest.approx(0.0)
+    rc = repair.main(["--db", str(copy), "--apply"])
+    assert rc == 0
+    repaired = sqlite3.connect(copy).execute(
+        "SELECT pnl_usd, exit_price FROM young_trail_helius WHERE tid = ?", (TID,),
+    ).fetchone()
+    assert repaired[0] == pytest.approx(-25.0)
+    still = sqlite3.connect(src).execute(
+        "SELECT pnl_usd FROM young_trail_helius WHERE tid = ?", (TID,),
+    ).fetchone()
+    assert still[0] == pytest.approx(0.0)
 
 
 def test_protected_files_untouched():
