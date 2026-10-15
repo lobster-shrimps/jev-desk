@@ -229,11 +229,23 @@ def test_until_stops_new_entries_but_mtm_closes(yt, monkeypatch):
     assert yt.closed_rows()[0]["exit_reason"] == "sl"
 
 
-def test_default_until_is_seven_days(yt):
+def test_default_until_is_oct20_et(yt):
+    import calendar
+    expected = calendar.timegm(
+        time.strptime("2026-10-21T03:59:59Z", "%Y-%m-%dT%H:%M:%SZ")
+    )
     until = yt.until_ts(T0)
-    assert until == pytest.approx(T0 + 7 * 86400)
-    again = yt.until_ts(T0 + 100)
-    assert again == pytest.approx(until)
+    assert until == pytest.approx(expected)
+    assert yt.until_ts(T0 + 100) == pytest.approx(until)
+
+
+def test_until_overwrites_rolling_stored(yt):
+    import calendar
+    yt._meta_set("until_ts", str(T0 + 7 * 86400))
+    expected = calendar.timegm(
+        time.strptime("2026-10-21T03:59:59Z", "%Y-%m-%dT%H:%M:%SZ")
+    )
+    assert yt.until_ts(T0) == pytest.approx(expected)
 
 
 def test_on_cycle_uses_young_free_and_cycle_prices(yt):

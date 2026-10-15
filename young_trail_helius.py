@@ -32,7 +32,8 @@ WINDOW_SEC = 6 * 3600
 FRESH_MARK_SEC = 15 * 60
 LOCK_TIMEOUT_SEC = 0.2
 RPC_TIMEOUT_SEC = 8.0
-DEFAULT_UNTIL_ISO = "2026-10-20T11:38:07Z"
+DEFAULT_UNTIL_ISO = "2026-10-21T03:59:59Z"
+MAX_TX_VERSION = 0
 SOL_NET = 1399811149
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 # Helius free ~1M credits/month. Standard JSON-RPC is typically 1 credit.
@@ -122,6 +123,16 @@ def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
             pass
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_column(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+    if name in _table_columns(conn, table):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_schema(db: sqlite3.Connection | None = None) -> None:
     """Idempotent. Each step commits on its own (live-DB safe, lesson from #60)."""
     conn = db if db is not None else _connect()
@@ -192,8 +203,8 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
       key TEXT PRIMARY KEY,
       value TEXT
     )"""))
-    _schema_step(conn, "yth_exit_reason", lambda: conn.execute(
-        "ALTER TABLE young_trail_helius ADD COLUMN exit_reason TEXT"
+    _schema_step(conn, "yth_exit_reason", lambda: _add_column(
+        conn, "young_trail_helius", "exit_reason", "TEXT"
     ))
     _schema_step(conn, "yth_reset_stale_last_mark_ts", lambda: conn.execute(
         """UPDATE young_trail_helius
@@ -294,22 +305,16 @@ def until_ts(now: float | None = None) -> float:
     parsed = _parse_until(raw) if raw else None
     if parsed is not None:
         return parsed
-    stored = _meta_get("until_ts")
-    if stored:
-        try:
-            return float(stored)
-        except (TypeError, ValueError):
-            pass
     try:
         import young_trail
         ts = float(young_trail.until_ts(now))
-        _meta_set("until_ts", str(ts))
-        return ts
     except Exception as e:
         log.warning("young_trail_helius until from young_trail: %s", safe_err(e))
-    fallback = _parse_until(DEFAULT_UNTIL_ISO) or 0.0
-    _meta_set("until_ts", str(fallback))
-    return fallback
+        ts = _parse_until(DEFAULT_UNTIL_ISO) or 0.0
+    stored = _meta_get("until_ts")
+    if stored != str(ts):
+        _meta_set("until_ts", str(ts))
+    return ts
 
 
 def accepting_entries(now: float | None = None) -> bool:
@@ -531,8 +536,25 @@ def lookup_creator(tid: str) -> str | None:
     return None
 
 
+def _with_max_tx_version(method: str, params):
+    if method not in ("getTransaction", "getBlock", "getTransactionsForAddress"):
+        return params
+    params = list(params or [])
+    if not params:
+        return params
+    if len(params) < 2 or not isinstance(params[1], dict):
+        if len(params) == 1:
+            params.append({"maxSupportedTransactionVersion": MAX_TX_VERSION})
+        return params
+    cfg = dict(params[1])
+    cfg["maxSupportedTransactionVersion"] = MAX_TX_VERSION
+    params[1] = cfg
+    return params
+
+
 def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | None = None):
     """One Helius JSON-RPC call. Charges the budget first. Never logs the URL."""
+    params = _with_max_tx_version(method, params)
     if not _charge(1, now):
         raise RuntimeError("helius budget exhausted")
     if _rpc_fn is not None:

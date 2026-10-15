@@ -32,7 +32,11 @@ log = logging.getLogger("young_trail_rugrisk")
 TICKET_USD = 50.0
 LOCK_TIMEOUT_SEC = 0.2
 RPC_TIMEOUT_SEC = 8.0
-DEFAULT_UNTIL_ISO = "2026-10-20T11:38:07Z"
+# 2026-10-20 23:59 America/New_York (EDT). Override with YOUNG_TRAIL_UNTIL /
+# YOUNG_TRAIL_RUGRISK_UNTIL.
+DEFAULT_UNTIL_ISO = "2026-10-21T03:59:59Z"
+MAX_TX_VERSION = 0
+GTFA_RETRY_SEC = 30 * 60
 SOL_NET = 1399811149
 
 # Own caps (same per-tick shape as helius, smaller day cap). Sit out when
@@ -118,6 +122,7 @@ _overnight_fn = None
 _cycle_calls = 0
 _last_new_tids: list[str] = []
 _gtfa_supported: bool | None = None
+_gtfa_retry_after: float = 0.0
 
 
 def set_time_fn(fn) -> None:
@@ -162,11 +167,12 @@ def _close_local() -> None:
 
 def reset() -> None:
     """Close this thread's cached connection. Tests call this."""
-    global _cycle_calls, _last_new_tids, _gtfa_supported
+    global _cycle_calls, _last_new_tids, _gtfa_supported, _gtfa_retry_after
     _close_local()
     _cycle_calls = 0
     _last_new_tids = []
     _gtfa_supported = None
+    _gtfa_retry_after = 0.0
 
 
 def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
@@ -222,11 +228,21 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
       key TEXT PRIMARY KEY,
       value TEXT
     )"""))
-    _schema_step(conn, "ytr_dev_initial_share", lambda: conn.execute(
-        "ALTER TABLE young_trail_rugrisk ADD COLUMN dev_initial_share REAL"
+    _schema_step(conn, "ytr_dev_initial_share", lambda: _add_column(
+        conn, "young_trail_rugrisk", "dev_initial_share", "REAL"
     ))
     _schema_step(conn, "ytr_reset_truncated_create_path",
                  lambda: _reset_truncated_rows(conn))
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _add_column(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+    if name in _table_columns(conn, table):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _reset_truncated_rows(conn: sqlite3.Connection) -> None:
@@ -346,22 +362,16 @@ def until_ts(now: float | None = None) -> float:
     parsed = _parse_until(raw) if raw else None
     if parsed is not None:
         return parsed
-    stored = _meta_get("until_ts")
-    if stored:
-        try:
-            return float(stored)
-        except (TypeError, ValueError):
-            pass
     try:
         import young_trail
         ts = float(young_trail.until_ts(now))
-        _meta_set("until_ts", str(ts))
-        return ts
     except Exception as e:
         log.warning("young_trail_rugrisk until from young_trail: %s", safe_err(e))
-    fallback = _parse_until(DEFAULT_UNTIL_ISO) or 0.0
-    _meta_set("until_ts", str(fallback))
-    return fallback
+        ts = _parse_until(DEFAULT_UNTIL_ISO) or 0.0
+    stored = _meta_get("until_ts")
+    if stored != str(ts):
+        _meta_set("until_ts", str(ts))
+    return ts
 
 
 def accepting(now: float | None = None) -> bool:
@@ -553,8 +563,26 @@ def is_solana(tid: str | None = None, chain=None, net=None) -> bool:
     return False
 
 
+def _with_max_tx_version(method: str, params):
+    """Ensure getTransaction / getBlock / GTFA request v0+ txs."""
+    if method not in ("getTransaction", "getBlock", "getTransactionsForAddress"):
+        return params
+    params = list(params or [])
+    if not params:
+        return params
+    if len(params) < 2 or not isinstance(params[1], dict):
+        if len(params) == 1:
+            params.append({"maxSupportedTransactionVersion": MAX_TX_VERSION})
+        return params
+    cfg = dict(params[1])
+    cfg["maxSupportedTransactionVersion"] = MAX_TX_VERSION
+    params[1] = cfg
+    return params
+
+
 def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | None = None):
     """One Helius JSON-RPC call. Charges rugrisk budget first. Never logs the URL."""
+    params = _with_max_tx_version(method, params)
     if not _charge(1, now):
         raise RuntimeError("rugrisk budget exhausted")
     if _rpc_fn is not None:
@@ -1019,21 +1047,42 @@ def _set_gtfa_supported(val: bool | None) -> None:
     _gtfa_supported = val
 
 
+def _is_rpc_method_missing(err) -> bool:
+    msg = str(err).lower()
+    return (
+        "method not found" in msg
+        or "methodnotfound" in msg
+        or "-32601" in msg
+        or "unknown method" in msg
+        or "does not exist" in msg
+    )
+
+
+def _gtfa_usable(now: float | None = None) -> bool:
+    """False when the RPC lacks GTFA, or a transient miss is still in cooldown."""
+    if _gtfa_supported is False:
+        return False
+    if _gtfa_supported is True:
+        return True
+    ts = current_time() if now is None else float(now)
+    return ts >= float(_gtfa_retry_after)
+
+
 def _gtfa_oldest(address: str, now: float | None = None, limit: int = 16,
                  slot_gte: int | None = None, slot_lte: int | None = None):
     """Helius getTransactionsForAddress, oldest first. None if unsupported.
 
-    Probe once; cache the result. Method-not-found / unexpected errors fall
-    back without failing the entry. Budget exhaustion is re-raised.
+    Cache 'unsupported' only on method-not-found. Network blips sit out the
+    cooldown then retry. Budget exhaustion is re-raised.
     """
-    if not address or _gtfa_supported is False:
+    if not address or not _gtfa_usable(now):
         return None
     opts: dict = {
         "transactionDetails": "full",
         "encoding": "jsonParsed",
         "sortOrder": "asc",
         "limit": max(1, min(int(limit), 1000)),
-        "maxSupportedTransactionVersion": 0,
+        "maxSupportedTransactionVersion": MAX_TX_VERSION,
         "filters": {"status": "succeeded"},
     }
     slot_f = {}
@@ -1049,8 +1098,15 @@ def _gtfa_oldest(address: str, now: float | None = None, limit: int = 16,
         msg = str(e).lower()
         if "budget" in msg:
             raise
-        _set_gtfa_supported(False)
-        log.warning("young_trail_rugrisk gtfa unsupported: %s", safe_err(e))
+        global _gtfa_retry_after
+        if _is_rpc_method_missing(e):
+            _set_gtfa_supported(False)
+            log.warning("young_trail_rugrisk gtfa unsupported: %s", safe_err(e))
+        else:
+            _set_gtfa_supported(None)
+            ts = current_time() if now is None else float(now)
+            _gtfa_retry_after = ts + max(0.0, float(GTFA_RETRY_SEC))
+            log.warning("young_trail_rugrisk gtfa probe: %s", safe_err(e))
         return None
     _set_gtfa_supported(True)
     rows = []
@@ -1188,7 +1244,7 @@ def _fill_create_window(mint: str, creator: str | None, holders: list | None,
     for src, addr in addrs:
         if addr in tried:
             continue
-        if addr not in addr_sigs and _gtfa_supported is not False:
+        if addr not in addr_sigs and _gtfa_usable(now):
             if not _can_charge(1, now):
                 save()
                 return "pending"
@@ -1250,7 +1306,7 @@ def _fill_create_window(mint: str, creator: str | None, holders: list | None,
         save()
         if create_sig:
             slot = (recs.get(create_sig) or {}).get("slot")
-            if _gtfa_supported is not False and slot is not None:
+            if _gtfa_usable(now) and slot is not None:
                 for src, addr in addrs:
                     if not _can_charge(1, now):
                         save()
@@ -1372,7 +1428,8 @@ def _tx_signers(tx: dict) -> list[str]:
 def _transaction(sig: str, now: float | None = None) -> dict | None:
     result = _rpc(
         "getTransaction",
-        [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+        [sig, {"encoding": "jsonParsed",
+               "maxSupportedTransactionVersion": MAX_TX_VERSION}],
         now=now,
     )
     return result if isinstance(result, dict) else None

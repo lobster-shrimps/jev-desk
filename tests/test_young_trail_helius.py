@@ -443,6 +443,28 @@ def test_schema_idempotent_and_safe_on_live_db(tmp_path, monkeypatch):
     young_trail_helius.reset()
 
 
+def test_schema_alter_skips_existing_column(yth, caplog):
+    caplog.set_level(logging.WARNING)
+    _yt, helius = yth
+    db = helius._connect()
+    helius._add_column(db, "young_trail_helius", "exit_reason", "TEXT")
+    helius._add_column(db, "young_trail_helius", "exit_reason", "TEXT")
+    helius.init_schema()
+    assert "duplicate column" not in caplog.text.lower()
+
+
+def test_rpc_injects_max_supported_tx_version():
+    import young_trail_helius as h
+    tx = h._with_max_tx_version("getTransaction", ["sig", {"encoding": "jsonParsed"}])
+    assert tx[1]["maxSupportedTransactionVersion"] == 0
+    bare = h._with_max_tx_version("getTransaction", ["sig"])
+    assert bare[1]["maxSupportedTransactionVersion"] == 0
+    block = h._with_max_tx_version("getBlock", [1, {"encoding": "jsonParsed"}])
+    assert block[1]["maxSupportedTransactionVersion"] == 0
+    other = h._with_max_tx_version("getTokenSupply", ["mint"])
+    assert other == ["mint"]
+
+
 def test_schema_steps_commit_independently(tmp_path, monkeypatch):
     path = tmp_path / "partial.db"
     monkeypatch.setenv("OUTCOMES_DB", str(path))
@@ -470,12 +492,11 @@ def test_schema_steps_commit_independently(tmp_path, monkeypatch):
     young_trail_helius.reset()
 
 
-def test_until_matches_young_trail_oct20(yth, monkeypatch):
+def test_until_matches_young_trail_oct20(yth):
     yt, helius = yth
-    monkeypatch.setenv("YOUNG_TRAIL_UNTIL", "2026-10-20T11:38:07Z")
     assert helius.until_ts(T0) == pytest.approx(yt.until_ts(T0))
     iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(helius.until_ts(T0)))
-    assert iso.startswith("2026-10-20T")
+    assert iso == "2026-10-21T03:59:59Z"
 
 
 def test_ops_payload_and_endpoint(yth):
