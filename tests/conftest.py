@@ -72,11 +72,16 @@ def isolate_young_trail(tmp_path, monkeypatch):
     young_trail.set_get_fn(_no_network)
     import young_trail_fast
     import young_trail_helius
+    import young_trail_rugrisk
     young_trail_fast.reset()
     young_trail_fast.set_time_fn(None)
     young_trail_helius.reset()
     young_trail_helius.set_time_fn(None)
     young_trail_helius.set_rpc_fn(None)
+    young_trail_rugrisk.reset()
+    young_trail_rugrisk.set_time_fn(None)
+    young_trail_rugrisk.set_rpc_fn(None)
+    young_trail_rugrisk.set_overnight_fn(None)
     yield
     price_guard.reset()
     young_trail.reset()
@@ -88,6 +93,10 @@ def isolate_young_trail(tmp_path, monkeypatch):
     young_trail_helius.reset()
     young_trail_helius.set_time_fn(None)
     young_trail_helius.set_rpc_fn(None)
+    young_trail_rugrisk.reset()
+    young_trail_rugrisk.set_time_fn(None)
+    young_trail_rugrisk.set_rpc_fn(None)
+    young_trail_rugrisk.set_overnight_fn(None)
 
 
 @pytest.fixture(autouse=True)
