@@ -24,7 +24,9 @@ DEV = "DevRugRisk111111111111111111111111111"
 S1 = "SniperOne11111111111111111111111111111"
 S2 = "SniperTwo22222222222222222222222222222"
 S3 = "SniperThree333333333333333333333333333"
+S4 = "SniperFour4444444444444444444444444444"
 WHALE = "WhaleHolder11111111111111111111111111"
+CURVE_OWNER = "CurveOwner111111111111111111111111111"
 PRIOR = "PriorMintRug1111111111111111111111111"
 ACC_S1 = "AccS111111111111111111111111111111111"
 ACC_S2 = "AccS222222222222222222222222222222222"
@@ -121,7 +123,7 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
     else:
         if buys is None:
             buys = [
-                (CREATE_SLOT, [(S1, 0, 200), (S2, 0, 200), (S3, 0, 100)]),
+                (CREATE_SLOT, [(S1, 0, 200), (S2, 0, 200), (S3, 0, 100), (S4, 0, 50)]),
                 (CREATE_SLOT + 80, [(WHALE, 0, 50)]),
             ]
         for i, (slot, deltas) in enumerate(buys):
@@ -267,6 +269,8 @@ def test_pure_sniper_share_and_bundled():
     sn = r.sniper_share_from_buys(buys, 1000.0, 10, 32)
     assert sn["sniper_share"] == pytest.approx(0.60)
     assert sn["sniper_wallets"] == 3
+    assert sn["sniper_denominator"] == pytest.approx(1000.0)
+    assert sn["sniper_slots"] == 32
     bun = r.bundled_from_buys(buys, 10, {S1, S2})
     assert bun["bundled"] is True
     assert bun["bundled_buys"] == 3
@@ -307,23 +311,29 @@ def test_skip_flags_unknown_on_na_and_error():
     err = r.skip_flags({"status": "error"})
     assert err["skip_snipers"] is None
     ok = r.skip_flags({
-        "status": "ok", "sniper_share": 0.31, "bundled": False, "dev_prior_rugs": 0,
+        "status": "ok", "sniper_share": 0.31, "sniper_wallets": 4,
+        "bundled": False, "dev_prior_rugs": 0,
     })
     assert ok["skip_snipers"] is True
     assert ok["skip_bundled"] is False
     assert ok["skip_dev_rugs"] is False
+    few = r.skip_flags({
+        "status": "ok", "sniper_share": 0.50, "sniper_wallets": 2,
+        "bundled": False, "dev_prior_rugs": 0,
+    })
+    assert few["skip_snipers"] is False
 
 
 def test_counterfactual_math_skipped_vs_kept():
     import young_trail_rugrisk as r
     rows = [
-        {"tid": "A:1", "status": "ok", "sniper_share": 0.5, "bundled": False,
-         "dev_prior_rugs": 0},
-        {"tid": "B:1", "status": "ok", "sniper_share": 0.1, "bundled": False,
-         "dev_prior_rugs": 0},
+        {"tid": "A:1", "status": "ok", "sniper_share": 0.5, "sniper_wallets": 4,
+         "bundled": False, "dev_prior_rugs": 0},
+        {"tid": "B:1", "status": "ok", "sniper_share": 0.1, "sniper_wallets": 4,
+         "bundled": False, "dev_prior_rugs": 0},
         {"tid": "C:1", "status": "n/a"},
-        {"tid": "D:1", "status": "ok", "sniper_share": 0.4, "bundled": True,
-         "dev_prior_rugs": 2},
+        {"tid": "D:1", "status": "ok", "sniper_share": 0.4, "sniper_wallets": 5,
+         "bundled": True, "dev_prior_rugs": 2},
     ]
     pnls = {
         "young_trail": {"A:1": -20.0, "B:1": 15.0, "D:1": -10.0},
@@ -351,18 +361,20 @@ def test_compute_features_mocked_rpc(ytr):
     rug.begin_cycle(T0)
     feat = rug.compute_features(MINT, creator=DEV, now=T0)
     assert feat["status"] == "ok"
-    # 200+200+100 = 500 of 1000 in the create slot
-    assert feat["sniper_share"] == pytest.approx(0.50)
-    assert feat["sniper_wallets"] == 3
+    # 200+200+100+50 = 550 of 1000 in the create slot (denominator = supply)
+    assert feat["sniper_share"] == pytest.approx(0.55)
+    assert feat["sniper_wallets"] == 4
+    assert feat["sniper_denominator"] == pytest.approx(1000.0)
+    assert feat["sniper_min_wallets"] == rug.SNIPER_MIN_WALLETS
     assert feat["bundled"] is True
     assert feat["skip_snipers"] is True
     assert feat["skip_bundled"] is True
     assert feat["dev_prior_launches"] == 1
     assert feat["dev_prior_rugs"] == 1
     assert feat["skip_dev_rugs"] is True
-    assert feat["fresh_holder_share"] is not None
-    assert feat["fresh_holder_share"] > 0
-    assert (feat.get("features_json") or {}).get("calls_used", 0) >= 4
+    used = (feat.get("features_json") or {}).get("calls_used", 0)
+    assert used >= 4
+    assert used <= rug.TARGET_ENTRY_CALLS
 
 
 def test_non_solana_is_na_no_rpc(ytr):
@@ -623,7 +635,14 @@ def test_schema_alter_skips_existing_column(ytr, caplog):
     db = rug._connect()
     rug._add_column(db, "young_trail_rugrisk", "dev_initial_share", "REAL")
     rug._add_column(db, "young_trail_rugrisk", "dev_initial_share", "REAL")
+    rug._add_column(db, "young_trail_rugrisk", "sniper_denominator", "REAL")
+    rug._add_column(db, "young_trail_rugrisk", "sniper_denominator", "REAL")
+    rug._add_column(db, "young_trail_rugrisk", "sniper_min_wallets", "INTEGER")
+    rug._add_column(db, "young_trail_rugrisk", "sniper_min_wallets", "INTEGER")
     rug.init_schema()
+    cols = rug._table_columns(db, "young_trail_rugrisk")
+    assert "sniper_denominator" in cols
+    assert "sniper_min_wallets" in cols
     assert "duplicate column" not in caplog.text.lower()
 
 
@@ -862,7 +881,7 @@ def test_create_ix_only_creators_same_slot_buys_are_bundled(ytr):
 def test_partial_window_resumes_never_ok_while_partial(ytr, monkeypatch):
     """Capped window that needs more than one tick stays pending until complete."""
     yt, helius, rug = ytr
-    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_CYCLE_CAP", "6")
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_CYCLE_CAP", "4")
     tx_list = [{
         "signature": "asigcreate", "slot": CREATE_SLOT,
         "deltas": [(DEV, 0, 50)],
@@ -902,7 +921,8 @@ def test_partial_window_resumes_never_ok_while_partial(ytr, monkeypatch):
     assert len(statuses) > 1
     extra = _feat_json(rug.all_rows()[0])
     assert extra.get("window_capped") is True
-    assert extra.get("calls_used", 0) > 6
+    assert extra.get("calls_used", 0) >= 4
+    assert extra.get("calls_used", 0) <= rug.TARGET_ENTRY_CALLS + 4
     window_tx = [
         c[1][0] for c in rpc.calls
         if c[0] == "getTransaction" and (
@@ -911,8 +931,8 @@ def test_partial_window_resumes_never_ok_while_partial(ytr, monkeypatch):
     ]
     assert window_tx.count("asigcreate") == 1
     buy_fetched = {s for s in window_tx if str(s).startswith("bsig")}
-    assert len(buy_fetched) == 15
-    assert "bsig0015" not in buy_fetched
+    assert len(buy_fetched) == rug.WINDOW_NON_CREATE_CAP
+    assert "bsig0008" not in buy_fetched
 
 
 def test_new_entry_prioritized_ahead_of_older_pending(ytr, monkeypatch):
@@ -1173,3 +1193,193 @@ def test_gtfa_method_not_found_stays_unsupported(ytr):
     rug.begin_cycle(T0)
     assert rug._gtfa_oldest(addr, now=T0 + 3600) is None
     assert n["gtfa"] == 1
+
+
+def test_sniper_share_not_dominated_by_one_or_two_early_buys(ytr, monkeypatch):
+    """Curve/pool buy in the first txs must not dominate sniper share."""
+    _yt, _helius, rug = ytr
+    monkeypatch.setattr(rug, "bonding_curve_pda", lambda *a, **k: CURVE_OWNER)
+    monkeypatch.setattr(rug, "bonding_curve_v2_pda", lambda *a, **k: None)
+    rpc = _rpc_scripted(
+        buys=[(CREATE_SLOT, [
+            (CURVE_OWNER, 0, 400), (S1, 0, 50), (S2, 0, 50),
+        ])],
+        supply=1000.0,
+        signer=DEV,
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    # Denominator is total supply, not 500 window buys. Curve excluded.
+    assert feat["sniper_share"] == pytest.approx(0.10)
+    assert feat["sniper_wallets"] == 2
+    assert feat["sniper_denominator"] == pytest.approx(1000.0)
+    assert feat["skip_snipers"] is False
+    extra = feat.get("features_json") or {}
+    assert extra.get("buys")
+    assert extra.get("sniper_denominator") == pytest.approx(1000.0)
+    assert extra.get("calls_used", 99) <= rug.TARGET_ENTRY_CALLS
+
+
+def test_sniper_min_wallets_guard():
+    import young_trail_rugrisk as r
+    few = r.skip_flags({
+        "status": "ok", "sniper_share": 0.45, "sniper_wallets": 2,
+        "bundled": False, "dev_prior_rugs": 0,
+    })
+    assert few["skip_snipers"] is False
+    enough = r.skip_flags({
+        "status": "ok", "sniper_share": 0.45, "sniper_wallets": 4,
+        "bundled": False, "dev_prior_rugs": 0,
+    })
+    assert enough["skip_snipers"] is True
+    none = r.skip_flags({
+        "status": "ok", "sniper_share": 0.45,
+        "bundled": False, "dev_prior_rugs": 0,
+    })
+    assert none["skip_snipers"] is False
+
+
+def test_dev_history_fetched_under_normal_budget(ytr, caplog):
+    caplog.set_level(logging.INFO)
+    _yt, _helius, rug = ytr
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["dev_prior_launches"] == 1
+    assert feat["dev_prior_rugs"] == 1
+    assert feat["skip_dev_rugs"] is True
+    assert "skipped budget" not in caplog.text
+
+
+def test_per_entry_calls_under_target(ytr):
+    _yt, helius, rug = ytr
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    helius.note_creator(TID, DEV, now=T0)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    used = (feat.get("features_json") or {}).get("calls_used", 99)
+    assert feat["status"] == "ok"
+    assert used <= rug.TARGET_ENTRY_CALLS
+    assert rug.TARGET_ENTRY_CALLS <= 8
+
+
+def test_dev_and_creator_cache_reuse(ytr, monkeypatch):
+    _yt, helius, rug = ytr
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    n = {"n": 0}
+    orig = helius.lookup_creator
+
+    def spy(tid):
+        n["n"] += 1
+        return orig(tid)
+
+    monkeypatch.setattr(helius, "lookup_creator", spy)
+    helius.note_creator(TID, DEV, now=T0)
+    assert rug._lookup_creator(TID) == DEV
+    assert rug._lookup_creator(TID) == DEV
+    assert n["n"] == 1
+    a = rug._dev_history(DEV, MINT, now=T0)
+    after = len(rpc.calls)
+    b = rug._dev_history(DEV, MINT, now=T0)
+    assert a["dev_prior_rugs"] == 1
+    assert b["dev_prior_rugs"] == 1
+    assert len(rpc.calls) == after
+
+
+def test_recompute_sniper_from_cached_no_rpc():
+    import young_trail_rugrisk as r
+    row = {
+        "tid": TID, "status": "ok",
+        "sniper_share": 0.416, "sniper_wallets": 2, "sniper_slots": 32,
+        "features_json": {
+            "buys": [
+                {"owner": S1, "delta": 400, "slot": CREATE_SLOT},
+                {"owner": S2, "delta": 16, "slot": CREATE_SLOT},
+            ],
+            "supply": 1000.0, "create_slot": CREATE_SLOT, "creators": [DEV],
+        },
+    }
+    out = r.recompute_sniper_from_cached(row)
+    assert out is not None
+    assert out["sniper_share"] == pytest.approx(0.416)
+    assert out["sniper_wallets"] == 2
+    assert out["sniper_denominator"] == pytest.approx(1000.0)
+    assert out["skip_snipers"] is False
+    cheap = r.recompute_sniper_from_cached({
+        "tid": TID, "status": "ok",
+        "sniper_share": 0.50, "sniper_wallets": 2,
+    })
+    assert cheap["skip_snipers"] is False
+    assert cheap["sniper_min_wallets"] == r.SNIPER_MIN_WALLETS
+
+
+def test_add_column_pragma_before_alter():
+    src = (ROOT / "young_trail_rugrisk.py").read_text()
+    cols = src.split("def _table_columns")[1].split("\ndef ")[0]
+    add = src.split("def _add_column")[1].split("\ndef ")[0]
+    assert "PRAGMA table_info" in cols
+    assert "_table_columns" in add
+    assert "ALTER TABLE" in add
+    assert add.find("_table_columns") < add.find("ALTER TABLE")
+
+
+def test_summary_unavailable_not_labeled_error(ytr):
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, source
+           ) VALUES (?, 'OK', 'solana', ?, 1.0, 'ok', 't')""",
+        (TID, T0),
+    )
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error, source
+           ) VALUES (?, 'U', 'solana', ?, 1.0, 'unavailable', 'history_truncated', 't')""",
+        ("UnavailMint1111111111111111111111111:1399811149", T0),
+    )
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error, source
+           ) VALUES (?, 'E', 'solana', ?, 1.0, 'error', 'rpc timeout', 't')""",
+        ("ErrorMint111111111111111111111111111:1399811149", T0),
+    )
+    db.commit()
+    s = rug._summary()
+    assert s["ok"] == 1
+    assert s["unavailable"] == 1
+    assert s["error"] == 1
+    html = (ROOT / "ops.html").read_text()
+    assert "Unavailable" in html
+    assert "s.unavailable" in html
+
+
+def test_fair_share_newest_new_and_backlog():
+    import young_trail_rugrisk as r
+    rows = [{"tid": "new:1"}, {"tid": "old:1"}, {"tid": "old:2"}]
+    ordered = r._fair_share_pending(rows, ["new:1"], 2)
+    assert [x["tid"] for x in ordered] == ["new:1", "old:1"]
+    only_old = r._fair_share_pending(rows[1:], [], 2)
+    assert [x["tid"] for x in only_old] == ["old:1", "old:2"]
+
+
+def test_dev_history_logs_budget_skip(ytr, caplog):
+    caplog.set_level(logging.WARNING)
+    _yt, _helius, rug = ytr
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    while rug._can_charge(1, T0):
+        assert rug._charge(1, T0)
+    out = rug._dev_history(DEV, MINT, now=T0)
+    assert out["dev_prior_rugs"] is None
+    assert out["dev_prior_launches"] is None
+    assert "skipped budget" in caplog.text
+    assert "SUPERSECRET" not in caplog.text
