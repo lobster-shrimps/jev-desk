@@ -16,8 +16,8 @@ Holder count, 30m/1h buy/sell/volume/unique wallets, price change. Cap per
 cycle; back off on 429.
 
 Does NOT change young_trail, fast, variants, helius, rugrisk, judging, or live
-orders. Runs after young_trail_rugrisk on the sampler. Chain-check records
-candidates into the mint cache only (ledger rows are young_trail tids).
+orders. Runs after young_trail_rugrisk on the sampler. Chain-check only queues (tid, chain, mint) in memory; the research sampler
+thread does the fetches. Ledger rows are young_trail tids.
 """
 from __future__ import annotations
 
@@ -117,6 +117,8 @@ _boosts_ts = 0.0
 _boosts_ok = False
 _cycle_started = 0.0
 _sleeps: list[float] = []
+_pending_lock = threading.Lock()
+_pending_candidates: dict[str, dict] = {}
 
 
 def set_time_fn(fn) -> None:
@@ -162,6 +164,7 @@ def reset() -> None:
     """Close this thread's cached connection. Tests call this."""
     global _cycle_used, _last_call, _backoff_until, _backoff_exp
     global _boosts, _boosts_ts, _boosts_ok, _cycle_started, _sleeps
+    global _pending_candidates
     _close_local()
     _cycle_used = {"rugcheck": 0, "orders": 0, "birdeye": 0, "boosts": 0}
     _last_call = {"rugcheck": 0.0, "orders": 0.0, "birdeye": 0.0, "boosts": 0.0}
@@ -172,6 +175,8 @@ def reset() -> None:
     _boosts_ok = False
     _cycle_started = 0.0
     _sleeps = []
+    with _pending_lock:
+        _pending_candidates = {}
 
 
 def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
@@ -265,6 +270,9 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
     ))
     _schema_step(conn, "yts_birdeye_skipped", lambda: _add_column(
         conn, "young_trail_signals", "birdeye_skipped", "INTEGER"
+    ))
+    _schema_step(conn, "yts_top_holder_flag", lambda: _add_column(
+        conn, "young_trail_signals", "top_holder_flag", "INTEGER"
     ))
 
 
@@ -577,6 +585,16 @@ def _risk_items(raw) -> list[dict]:
     return out
 
 
+def _risk_name_hit(risks: list[dict], *needles: str) -> bool:
+    """True if any risk name contains one of the needles (case-insensitive)."""
+    wanted = tuple(n.lower() for n in needles)
+    for r in risks or []:
+        nm = (r.get("name") or "").lower()
+        if any(n in nm for n in wanted):
+            return True
+    return False
+
+
 def _lp_locked_pct(data: dict) -> tuple[float | None, float | None]:
     locked = _num(data.get("lpLockedPct") if "lpLockedPct" in data else data.get("lp_locked_pct"))
     burned = _num(data.get("lpBurnedPct") if "lpBurnedPct" in data else data.get("lp_burned_pct"))
@@ -609,20 +627,28 @@ def _top_holder_pct(data: dict) -> float | None:
 
 
 def parse_rugcheck(data) -> dict:
-    """Accept summary or full report. Missing fields stay None (fail open)."""
+    """Accept summary or full report. Missing fields stay None (fail open).
+
+    The free summary endpoint has no mintAuthority/freezeAuthority/topHolders.
+    Live shape: {tokenProgram, tokenType, risks[{name,value,description,score,level}],
+    score, score_normalised, lpLockedPct}. Mint/freeze and top-holder flags are
+    derived from risk names when the risks key is present.
+    """
     empty = {
         "rugcheck_score": None, "rugcheck_score_norm": None,
         "lp_locked_pct": None, "lp_burned_pct": None,
         "mint_authority": None, "freeze_authority": None,
-        "top_holder_pct": None, "insider_flag": None, "creator_flag": None,
+        "top_holder_pct": None, "top_holder_flag": None,
+        "insider_flag": None, "creator_flag": None,
         "danger_risk": None, "risks": [],
     }
     if not isinstance(data, dict) or not data:
         return empty
     meta = data.get("tokenMeta") if isinstance(data.get("tokenMeta"), dict) else {}
-    risks = _risk_items(data.get("risks") or data.get("risk"))
+    has_risks_key = "risks" in data or "risk" in data
+    risks = _risk_items(data.get("risks") if "risks" in data else data.get("risk"))
     danger = None
-    if risks or "risks" in data or "risk" in data:
+    if has_risks_key:
         danger = any(r.get("level") in DANGER_LEVELS for r in risks)
     mint_present = "mintAuthority" in data or "mintAuthority" in meta
     freeze_present = "freezeAuthority" in data or "freezeAuthority" in meta
@@ -632,8 +658,18 @@ def parse_rugcheck(data) -> dict:
     freeze_auth = data.get("freezeAuthority")
     if freeze_auth is None:
         freeze_auth = meta.get("freezeAuthority")
-    mint_p = _authority_present(mint_auth, present=mint_present)
-    freeze_p = _authority_present(freeze_auth, present=freeze_present)
+    if mint_present:
+        mint_p = _authority_present(mint_auth, present=True)
+    elif has_risks_key:
+        mint_p = _risk_name_hit(risks, "mint authority")
+    else:
+        mint_p = None
+    if freeze_present:
+        freeze_p = _authority_present(freeze_auth, present=True)
+    elif has_risks_key:
+        freeze_p = _risk_name_hit(risks, "freeze authority")
+    else:
+        freeze_p = None
     locked, burned = _lp_locked_pct(data)
     insiders = data.get("insiderNetworks") or data.get("graphInsidersDetected")
     insider = None
@@ -653,6 +689,12 @@ def parse_rugcheck(data) -> dict:
         if "creator" in nm or "dev holding" in nm:
             creator = True
             break
+    if has_risks_key:
+        top_flag = _risk_name_hit(
+            risks, "top 10 holders high ownership", "single holder ownership",
+        )
+    else:
+        top_flag = None
     return {
         "rugcheck_score": _num(data.get("score")),
         "rugcheck_score_norm": _num(
@@ -664,6 +706,7 @@ def parse_rugcheck(data) -> dict:
         "mint_authority": None if mint_p is None else int(bool(mint_p)),
         "freeze_authority": None if freeze_p is None else int(bool(freeze_p)),
         "top_holder_pct": _top_holder_pct(data),
+        "top_holder_flag": None if top_flag is None else int(bool(top_flag)),
         "insider_flag": None if insider is None else int(bool(insider)),
         "creator_flag": None if creator is None else int(bool(creator)),
         "danger_risk": None if danger is None else int(bool(danger)),
@@ -1215,7 +1258,8 @@ def compute_features(mint: str, chain: str | None = None,
         "rugcheck_score": None, "rugcheck_score_norm": None,
         "lp_locked_pct": None, "lp_burned_pct": None,
         "mint_authority": None, "freeze_authority": None,
-        "top_holder_pct": None, "insider_flag": None, "creator_flag": None,
+        "top_holder_pct": None, "top_holder_flag": None,
+        "insider_flag": None, "creator_flag": None,
         "danger_risk": None,
         "boost_amount": None, "boost_total": None, "paid_promo": None,
         "holder_count": None,
@@ -1238,7 +1282,8 @@ def compute_features(mint: str, chain: str | None = None,
                 for k in (
                     "rugcheck_score", "rugcheck_score_norm", "lp_locked_pct",
                     "lp_burned_pct", "mint_authority", "freeze_authority",
-                    "top_holder_pct", "insider_flag", "creator_flag", "danger_risk",
+                    "top_holder_pct", "top_holder_flag",
+                    "insider_flag", "creator_flag", "danger_risk",
                 ):
                     feat[k] = rug.get(k)
                 extra["risks"] = rug.get("risks") or []
@@ -1337,7 +1382,8 @@ def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
              status = ?, rugcheck_score = ?, rugcheck_score_norm = ?,
              lp_locked_pct = ?, lp_burned_pct = ?,
              mint_authority = ?, freeze_authority = ?,
-             top_holder_pct = ?, insider_flag = ?, creator_flag = ?,
+             top_holder_pct = ?, top_holder_flag = ?,
+             insider_flag = ?, creator_flag = ?,
              danger_risk = ?, boost_amount = ?, boost_total = ?, paid_promo = ?,
              holder_count = ?, buy_30m = ?, sell_30m = ?,
              vol_buy_30m = ?, vol_sell_30m = ?, unique_wallets_30m = ?,
@@ -1353,7 +1399,8 @@ def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
             feat.get("rugcheck_score"), feat.get("rugcheck_score_norm"),
             feat.get("lp_locked_pct"), feat.get("lp_burned_pct"),
             feat.get("mint_authority"), feat.get("freeze_authority"),
-            feat.get("top_holder_pct"), feat.get("insider_flag"),
+            feat.get("top_holder_pct"), feat.get("top_holder_flag"),
+            feat.get("insider_flag"),
             feat.get("creator_flag"), feat.get("danger_risk"),
             feat.get("boost_amount"), feat.get("boost_total"),
             None if feat.get("paid_promo") is None else int(bool(feat.get("paid_promo"))),
@@ -1403,7 +1450,7 @@ def compute_pending(now: float | None = None, limit: int | None = None,
 
 
 def note_candidate(d: dict, now: float | None = None) -> dict | None:
-    """Chain-check hook. Cache+log only. Never gates. Ledger row only if yt tid."""
+    """Queue (tid, chain, mint) for the sampler. No HTTP, no sleep. Never gates."""
     empty = None
     try:
         if not d or not enabled():
@@ -1411,65 +1458,90 @@ def note_candidate(d: dict, now: float | None = None) -> dict | None:
         ts = current_time() if now is None else float(now)
         if ts >= until_ts(ts):
             return empty
-        begin_cycle(ts)
         tid = d.get("tid")
         mint, net = parse_tid(tid)
         if not mint:
             mint = d.get("address") or d.get("mint")
-        chain = dex_chain_id(d.get("chain"), net or d.get("net"), tid)
-        feat = compute_features(mint or "", chain=chain or "solana", now=ts)
-        flags = skip_flags(feat)
-        log.info(
-            "young_trail_signals candidate ticker=%s paper=1 skip_danger=%s "
-            "skip_lp=%s skip_authority=%s skip_score=%s skip_promo=%s "
-            "skip_momentum=%s",
-            d.get("ticker") or "?",
-            flags.get("skip_danger"), flags.get("skip_lp"),
-            flags.get("skip_authority"), flags.get("skip_score"),
-            flags.get("skip_promo"), flags.get("skip_momentum"),
-        )
-        if not tid:
-            return feat
-        db = _connect()
-        row = db.execute(
-            "SELECT tid FROM young_trail_signals WHERE tid = ?", (tid,),
-        ).fetchone()
-        yt_row = None
-        if row is None:
-            try:
-                import young_trail
-                yt_row = young_trail._connect().execute(
-                    "SELECT tid, ticker, chain, entry_ts, entry_price "
-                    "FROM young_trail WHERE tid = ?",
-                    (tid,),
-                ).fetchone()
-            except Exception:
-                yt_row = None
-            if yt_row is not None:
-                db.execute(
-                    """INSERT OR IGNORE INTO young_trail_signals (
-                         tid, ticker, chain, entry_ts, entry_price, status, source
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        tid, yt_row["ticker"] if "ticker" in yt_row.keys() else d.get("ticker"),
-                        (yt_row["chain"] if "chain" in yt_row.keys() else None) or chain,
-                        float(yt_row["entry_ts"]), float(yt_row["entry_price"]),
-                        STATUS_PENDING, "chain_check",
-                    ),
-                )
-                db.commit()
-                row = True
-        if row is not None:
-            _store_features(tid, feat, ts, "chain_check")
-        return feat
+        chain = dex_chain_id(d.get("chain"), net or d.get("net"), tid) or "solana"
+        if not tid and not mint:
+            return empty
+        rec = {
+            "tid": tid,
+            "chain": chain,
+            "mint": mint,
+            "ticker": d.get("ticker"),
+            "queued_ts": ts,
+        }
+        key = str(tid or mint)
+        with _pending_lock:
+            _pending_candidates[key] = rec
+        return rec
     except Exception as e:
         log.warning("young_trail_signals candidate: %s", safe_err(e))
         return empty
 
 
+def pending_candidates() -> list[dict]:
+    with _pending_lock:
+        return list(_pending_candidates.values())
+
+
+def drain_candidates(now: float | None = None, source: str = "chain_check") -> int:
+    """Fetch queued desk candidates on the sampler thread. Ledger row if yt tid."""
+    ts = current_time() if now is None else float(now)
+    with _pending_lock:
+        items = list(_pending_candidates.values())
+        _pending_candidates.clear()
+    n = 0
+    for rec in items:
+        try:
+            mint = rec.get("mint") or ""
+            chain = rec.get("chain") or "solana"
+            feat = compute_features(mint, chain=chain, now=ts)
+            tid = rec.get("tid")
+            if not tid:
+                n += 1
+                continue
+            db = _connect()
+            row = db.execute(
+                "SELECT tid FROM young_trail_signals WHERE tid = ?", (tid,),
+            ).fetchone()
+            if row is None:
+                try:
+                    import young_trail
+                    yt_row = young_trail._connect().execute(
+                        "SELECT tid, ticker, chain, entry_ts, entry_price "
+                        "FROM young_trail WHERE tid = ?",
+                        (tid,),
+                    ).fetchone()
+                except Exception:
+                    yt_row = None
+                if yt_row is not None:
+                    db.execute(
+                        """INSERT OR IGNORE INTO young_trail_signals (
+                             tid, ticker, chain, entry_ts, entry_price, status, source
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            tid,
+                            yt_row["ticker"] if "ticker" in yt_row.keys() else rec.get("ticker"),
+                            (yt_row["chain"] if "chain" in yt_row.keys() else None) or chain,
+                            float(yt_row["entry_ts"]), float(yt_row["entry_price"]),
+                            STATUS_PENDING, source,
+                        ),
+                    )
+                    db.commit()
+                    row = True
+            if row is not None:
+                _store_features(tid, feat, ts, source)
+            n += 1
+        except Exception as e:
+            log.warning("young_trail_signals drain: %s", safe_err(e))
+    return n
+
+
 def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dict:
-    """Sampler hook AFTER rugrisk. Copies entries, computes features. Never gates."""
-    empty = {"entries": 0, "computed": 0}
+    """Sampler hook AFTER rugrisk. Copies entries, fetches queued candidates. Never gates."""
+    empty = {"entries": 0, "computed": 0, "drained": 0}
     try:
         if not enabled():
             return empty
@@ -1477,8 +1549,9 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
         begin_cycle(ts)
         until_ts(ts)
         n = sync_entries(ts)
+        drained = drain_candidates(now=ts, source="chain_check")
         computed = compute_pending(now=ts, source="live")
-        return {"entries": n, "computed": computed}
+        return {"entries": n, "computed": computed, "drained": drained}
     except Exception as e:
         log.warning("young_trail_signals sampler: %s", safe_err(e))
         return empty

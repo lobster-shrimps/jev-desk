@@ -560,8 +560,11 @@ the judge. CLI: `python young_trail_rugrisk.py backfill`.
 until 20 Oct 2026. At sampler (after rugrisk) and at desk chain-check
 (candidates, cache-only unless the tid is already on the ledger): RugCheck.xyz
 summary (`/v1/tokens/{mint}/report/summary`, optional `RUGCHECK_API_KEY`, 3
-req/s, ~30 min cache) records score, risks, LP locked/burned %, mint/freeze
-authority, top-holder %, insider/creator flags. DexScreener boosts
+req/s, ~30 min cache) records score, risks, LP locked %. Mint/freeze authority
+and a top-holder flag are derived from risk names on the live summary (the
+endpoint has no mintAuthority/freezeAuthority/topHolders fields). Insider/creator
+flags come from the full report when present. Desk chain-check only queues
+`(tid, chain, mint)`; fetches run on the 60s sampler thread. DexScreener boosts
 (`/token-boosts/latest/v1`, `/token-boosts/top/v1`) are fetched once per cycle
 and looked up locally; paid orders (`/orders/v1/{chainId}/{tokenAddress}`) are
 per-entry within ~60 req/min. Birdeye (`token_overview`) runs only when

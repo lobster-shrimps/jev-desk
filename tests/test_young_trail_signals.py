@@ -64,6 +64,61 @@ RUGCHECK_SUMMARY_ONLY = {
     "tokenMeta": {"name": "X", "symbol": "X"},
 }
 
+# Live free summary: no mintAuthority / freezeAuthority / topHolders.
+RUGCHECK_LIVE = {
+    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "tokenType": "standard",
+    "risks": [
+        {"name": "Mint Authority still enabled", "value": "",
+         "description": "The mint authority is not revoked", "score": 2000,
+         "level": "warn"},
+        {"name": "Freeze Authority still enabled", "value": "",
+         "description": "The freeze authority is not revoked", "score": 1000,
+         "level": "warn"},
+        {"name": "Top 10 holders high ownership", "value": "80%",
+         "description": "Top 10 hold a large share", "score": 2000,
+         "level": "warn"},
+        {"name": "Rug pull", "value": "", "description": "danger",
+         "score": 5000, "level": "danger"},
+    ],
+    "score": 8500,
+    "score_normalised": 85,
+    "lpLockedPct": 10,
+}
+
+RUGCHECK_LIVE_CLEAN = {
+    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "tokenType": "standard",
+    "risks": [
+        {"name": "Mutable metadata", "value": "Yes",
+         "description": "Metadata can change", "score": 100, "level": "info"},
+    ],
+    "score": 100,
+    "score_normalised": 1,
+    "lpLockedPct": 100,
+}
+
+RUGCHECK_LIVE_SINGLE = {
+    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "tokenType": "standard",
+    "risks": [
+        {"name": "Single holder ownership", "value": "45%",
+         "description": "One wallet holds a large share", "score": 2000,
+         "level": "warn"},
+    ],
+    "score": 2000,
+    "score_normalised": 20,
+    "lpLockedPct": 80,
+}
+
+RUGCHECK_NO_RISKS_KEY = {
+    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "tokenType": "standard",
+    "score": 1,
+    "score_normalised": 1,
+    "lpLockedPct": 100,
+}
+
 BIRDEYE_SPENT = {
     "success": True,
     "data": {
@@ -200,10 +255,68 @@ def test_parse_rugcheck_summary_and_full():
     assert summary["rugcheck_score_norm"] == pytest.approx(12)
     assert summary["danger_risk"] == 0
     assert summary["lp_locked_pct"] is None
-    assert summary["mint_authority"] is None
-    assert summary["freeze_authority"] is None
+    assert summary["mint_authority"] == 0
+    assert summary["freeze_authority"] == 0
+    assert summary["top_holder_flag"] == 0
     empty = s.parse_rugcheck({})
     assert empty["danger_risk"] is None
+    assert empty["mint_authority"] is None
+    assert empty["freeze_authority"] is None
+
+
+def test_parse_rugcheck_live_summary_derives_authority_from_risks():
+    import young_trail_signals as s
+    live = s.parse_rugcheck(RUGCHECK_LIVE)
+    assert live["mint_authority"] == 1
+    assert live["freeze_authority"] == 1
+    assert live["top_holder_flag"] == 1
+    assert live["danger_risk"] == 1
+    assert live["lp_locked_pct"] == pytest.approx(10)
+    assert live["rugcheck_score_norm"] == pytest.approx(85)
+    flags = s.skip_flags({**live, "status": "ok"})
+    assert flags["skip_authority"] is True
+    assert flags["skip_lp"] is True
+    assert flags["skip_danger"] is True
+    clean = s.parse_rugcheck(RUGCHECK_LIVE_CLEAN)
+    assert clean["mint_authority"] == 0
+    assert clean["freeze_authority"] == 0
+    assert clean["top_holder_flag"] == 0
+    assert clean["danger_risk"] == 0
+    assert clean["lp_locked_pct"] == pytest.approx(100)
+    cf = s.skip_flags({**clean, "status": "ok"})
+    assert cf["skip_authority"] is False
+    single = s.parse_rugcheck(RUGCHECK_LIVE_SINGLE)
+    assert single["mint_authority"] == 0
+    assert single["freeze_authority"] == 0
+    assert single["top_holder_flag"] == 1
+    mixed_case = s.parse_rugcheck({
+        "tokenProgram": "Tokenkeg",
+        "tokenType": "standard",
+        "risks": [
+            {"name": "MINT AUTHORITY still enabled", "level": "warn", "score": 1,
+             "value": "", "description": ""},
+            {"name": "freeze Authority", "level": "warn", "score": 1,
+             "value": "", "description": ""},
+        ],
+        "score": 10,
+        "score_normalised": 10,
+        "lpLockedPct": 60,
+    })
+    assert mixed_case["mint_authority"] == 1
+    assert mixed_case["freeze_authority"] == 1
+    none = s.parse_rugcheck(RUGCHECK_NO_RISKS_KEY)
+    assert none["mint_authority"] is None
+    assert none["freeze_authority"] is None
+    assert none["top_holder_flag"] is None
+    assert none["danger_risk"] is None
+    empty_risks = s.parse_rugcheck({
+        "tokenProgram": "Tokenkeg", "tokenType": "standard",
+        "risks": [], "score": 1, "score_normalised": 1, "lpLockedPct": 100,
+    })
+    assert empty_risks["mint_authority"] == 0
+    assert empty_risks["freeze_authority"] == 0
+    assert empty_risks["top_holder_flag"] == 0
+    assert empty_risks["danger_risk"] == 0
 
 
 def test_parse_boosts_and_orders():
@@ -262,7 +375,7 @@ def test_skip_flags_per_rule():
     unknown["status"] = "ok"
     uf = s.skip_flags(unknown)
     assert uf["skip_lp"] is None
-    assert uf["skip_authority"] is None
+    assert uf["skip_authority"] is False
     promo = {"status": "ok", "paid_promo": 1, "boost_amount": 0}
     assert s.skip_flags(promo)["skip_promo"] is True
     boost = {"status": "ok", "paid_promo": 0, "boost_amount": 5}
@@ -460,35 +573,47 @@ def test_non_solana_skips_rugcheck_and_birdeye(yts, monkeypatch):
     assert any("/orders/v1/bsc/" in c["url"] for c in http.calls)
 
 
-def test_note_candidate_cache_only_unless_young_trail(yts):
+def test_note_candidate_queues_without_http(yts):
     yt, sig = yts
     http = _scripted(rug=RUGCHECK_CLEAN)
     sig.set_http_fn(http)
-    feat = sig.note_candidate({
+    queued = sig.note_candidate({
         "tid": TID, "ticker": "SIG", "chain": "solana", "net": 1399811149,
         "address": MINT,
     }, now=T0)
-    assert feat is not None
+    assert queued is not None
+    assert queued["tid"] == TID
+    assert queued["mint"] == MINT
+    assert queued["chain"] == "solana"
+    assert http.calls == []
     assert sig.all_rows() == []
+    pending = sig.pending_candidates()
+    assert len(pending) == 1
+    sig.on_sampler_tick({}, now=T0)
+    assert sig.all_rows() == []
+    assert any("rugcheck" in c["url"] for c in http.calls)
     _enter(yt)
-    feat2 = sig.note_candidate({
-        "tid": TID, "ticker": "SIG", "chain": "solana",
-    }, now=T0)
-    assert feat2 is not None
+    sig.on_sampler_tick({}, now=T0)
     rows = sig.all_rows()
     assert len(rows) == 1
     assert rows[0]["tid"] == TID
 
 
-def test_note_candidate_never_raises(yts):
+def test_note_candidate_never_raises_or_fetches(yts):
     yt, sig = yts
+    called = []
 
     def boom(*_a, **_k):
+        called.append(1)
         raise RuntimeError("network down")
 
     sig.set_http_fn(boom)
+    sig.set_sleep_fn(lambda d: called.append(d) or (_ for _ in ()).throw(
+        RuntimeError("sleep on cycle thread")
+    ))
     out = sig.note_candidate({"tid": TID, "ticker": "X", "chain": "solana"}, now=T0)
     assert out is None or isinstance(out, dict)
+    assert called == []
 
 
 def test_keys_never_logged(yts, monkeypatch, caplog):
@@ -651,6 +776,18 @@ def test_sampler_order_rugrisk_then_signals():
     assert r < s
 
 
+def test_note_candidate_source_is_queue_only():
+    src = (ROOT / "young_trail_signals.py").read_text()
+    body = src.split("def note_candidate")[1].split("\ndef ")[0]
+    assert "compute_features" not in body
+    assert "_http_get" not in body
+    assert "begin_cycle" not in body
+    assert "ensure_boosts" not in body
+    assert "fetch_rugcheck" not in body
+    assert "fetch_orders" not in body
+    assert "time.sleep" not in body
+
+
 def test_main_notes_candidate_after_dossier_does_not_gate():
     src = (ROOT / "main.py").read_text()
     dnone = src.find("if d is None:")
@@ -712,3 +849,90 @@ def test_cycle_cap_skips_extra_rugcheck(yts, monkeypatch):
     sig.fetch_rugcheck("mintB", now=T0 + 1)
     rug = [c for c in http.calls if "rugcheck" in c["url"]]
     assert len(rug) == 1
+
+
+def test_run_once_hanging_http_adds_no_cycle_time(monkeypatch, tmp_path):
+    """note_candidate must not fetch or sleep on the main cycle thread."""
+    import book
+    import collect
+    import main as shift
+    import young_trail_signals as sig
+
+    monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    sig.reset()
+    sig.set_time_fn(lambda: T0)
+    hangs = []
+
+    def hang(*_a, **_k):
+        hangs.append("http")
+        time.sleep(30)
+        raise AssertionError("signals HTTP ran on the cycle thread")
+
+    def hang_sleep(d):
+        hangs.append("sleep")
+        time.sleep(30)
+        raise AssertionError("signals sleep ran on the cycle thread")
+
+    sig.set_http_fn(hang)
+    sig.set_sleep_fn(hang_sleep)
+
+    tid = f"{MINT}:1399811149"
+
+    def fake_shortlist(fomo, id_list):
+        return [{
+            "addr": MINT, "net": 1399811149, "tid": tid, "ticker": "HNG",
+            "mcap_usd": 300_000, "liquidity_usd": 48_000, "volume_h24": 610_000,
+            "price_usd": 0.001, "holder_count": 310,
+            "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61},
+            "age_minutes": 42, "chain": "solana",
+        }]
+
+    def fake_judge(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": {
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.75},
+                "momentum_already_spent": {"type": "noul", "noul": 0.40},
+            }, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+
+    def fake_dossier(t, limiter=None):
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None, "net": 1399811149,
+                "address": MINT}
+
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([tid], {}))
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+        {"buys_h1": 540, "sells_h1": 120, "buys_h6": 900, "sells_h6": 400,
+         "trades_h24": 4000}, "ok"))
+    monkeypatch.setattr(shift, "dossier", fake_dossier)
+
+    class Desk:
+        def bank(self): return 1000.0
+        def read_x(self, h, tid=None, token=None): return None
+        def log_shadow(self, o, s, fomo_data=None): pass
+        def report(self, o, s): pass
+        def send_to_seats(self, o): pass
+
+    t0 = time.perf_counter()
+    order, stats = shift.run_once(
+        type("F", (), {"token": lambda self: None})(),
+        fake_judge, Desk(), 1000.0, shadow=True, gt_dossier_reserve=3,
+    )
+    elapsed = time.perf_counter() - t0
+    assert order is None
+    assert stats["seen"] == 1
+    assert hangs == []
+    assert elapsed < 2.0
+    queued = sig.pending_candidates()
+    assert any(q.get("tid") == tid for q in queued)
+    sig.reset()
