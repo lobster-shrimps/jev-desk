@@ -787,6 +787,12 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             if d is None:
                 continue
 
+            try:
+                import young_trail_signals
+                young_trail_signals.note_candidate(d)
+            except Exception as e:
+                log.warning("young_trail_signals candidate: %s", safe_err(e))
+
             if (k := chain_kill(d)):
                 # Log chain kill with holder metrics
                 # Item #12: Add EVM holder details

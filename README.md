@@ -139,6 +139,7 @@ Still true: every number in `thresholds.py` is the guide author's rather than yo
 | `young_trail_fast.py` | paper | Same entries, baseline + `tp_50`, evaluated on 60s Dex marks. |
 | `young_trail_helius.py` | paper | Solana rug-signal paper exits from budgeted Helius RPC. |
 | `young_trail_rugrisk.py` | paper | Entry-time rug-risk features + skip-rule counterfactuals. No gating. |
+| `young_trail_signals.py` | paper | RugCheck / DexScreener boosts / Birdeye skip-rule counterfactuals. No gating. |
 | `judge_client.py` | bots | Six lines. The only place a bot touches the network for a judgement. |
 | `mock_judge.py` | — | Keyless stand-in for Jev so the funnel can be tested. Never trade against it. |
 | `prompts/` | bots | Paste-ready prompts: HANDOFF, SOCIAL, CHIEF, SIZE, FILLS, RISK. |
@@ -484,6 +485,7 @@ FOMO activate control. `GET /ops/summary` is cached 30s; every section fails ope
 | `GET /ops/young_trail_fast` | 60s-mark ledger vs per-cycle, same entries |
 | `GET /ops/young_trail_helius` | Helius rug-signal paper ledger vs fast vs per-cycle |
 | `GET /ops/young_trail_rugrisk` | Paper rug-risk skip-rule counterfactuals (does not gate entries) |
+| `GET /ops/young_trail_signals` | Paper RugCheck / boosts / Birdeye skip-rule counterfactuals (does not gate entries) |
 | `GET /ops/research/query?sql=` | Read-only `SELECT` on `research.db` (limit 500) |
 | `GET /ops/research/report?kind=` | Canned `rugs` / `runners` / `features` |
 | `GET /ops/backtest` | Latest weekly signal-backtest JSON |
@@ -554,6 +556,25 @@ Caps sit beside the helius ledger (12/tick, 800/day; overnight backfill 24/tick)
 and yield when helius is low on its day cap. Does not gate entries, picks, or
 the judge. CLI: `python young_trail_rugrisk.py backfill`.
 
+**`young_trail_signals`:** paper analysis on the same young_trail entries
+until 20 Oct 2026. At sampler (after rugrisk) and at desk chain-check
+(candidates, cache-only unless the tid is already on the ledger): RugCheck.xyz
+summary (`/v1/tokens/{mint}/report/summary`, optional `RUGCHECK_API_KEY`, 3
+req/s, ~30 min cache) records score, risks, LP locked %. Mint/freeze authority
+and a top-holder flag are derived from risk names on the live summary (the
+endpoint has no mintAuthority/freezeAuthority/topHolders fields). Insider/creator
+flags come from the full report when present. Desk chain-check only queues
+`(tid, chain, mint)`; fetches run on the 60s sampler thread. DexScreener boosts
+(`/token-boosts/latest/v1`, `/token-boosts/top/v1`) are fetched once per cycle
+and looked up locally; paid orders (`/orders/v1/{chainId}/{tokenAddress}`) are
+per-entry within ~60 req/min. Birdeye (`token_overview`) runs only when
+`BIRDEYE_API_KEY` is set; otherwise it is skipped silently. Skip rules
+(danger-level risk, LP locked < 50%, mint/freeze still open, score above a
+configurable cut, paid promotion, momentum already spent) are counterfactual
+only: SKIPPED vs KEPT P&L of young_trail, fast baseline, and fast `tp_50`.
+Does not gate entries, picks, or the judge. `/ops` shows the table next to
+rugrisk; the Oct 20 briefing scorecard includes the same lines.
+
 ## research.db
 
 Queryable store at `outbox/research.db` (WAL). Log and analysis only — never called from
@@ -582,7 +603,8 @@ python research.py vacuum                # weekly is automatic
 jsonl / shadow_kills, young_trail + variants, outcomes candles, X cache, and Coinalyze.
 Tokens still missing post-sighting prices are queued for the off-peak outcomes fetcher
 (capped). The 60s sampler also drives the paper `young_trail_fast`,
-`young_trail_helius`, and `young_trail_rugrisk` ledgers on prices it already fetched.
+`young_trail_helius`, `young_trail_rugrisk`, and `young_trail_signals` ledgers
+on prices it already fetched.
 
 ## Outcomes drain
 

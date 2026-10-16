@@ -59,6 +59,8 @@ def isolate_young_trail(tmp_path, monkeypatch):
     monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
     monkeypatch.delenv("YOUNG_TRAIL_UNTIL", raising=False)
     monkeypatch.delenv("YOUNG_TRAIL_ENABLED", raising=False)
+    monkeypatch.delenv("BIRDEYE_API_KEY", raising=False)
+    monkeypatch.delenv("RUGCHECK_API_KEY", raising=False)
     import price_guard
     import young_trail
     price_guard.reset()
@@ -73,6 +75,7 @@ def isolate_young_trail(tmp_path, monkeypatch):
     import young_trail_fast
     import young_trail_helius
     import young_trail_rugrisk
+    import young_trail_signals
     young_trail_fast.reset()
     young_trail_fast.set_time_fn(None)
     young_trail_helius.reset()
@@ -82,6 +85,10 @@ def isolate_young_trail(tmp_path, monkeypatch):
     young_trail_rugrisk.set_time_fn(None)
     young_trail_rugrisk.set_rpc_fn(None)
     young_trail_rugrisk.set_overnight_fn(None)
+    young_trail_signals.reset()
+    young_trail_signals.set_time_fn(None)
+    young_trail_signals.set_http_fn(_no_network)
+    young_trail_signals.set_sleep_fn(lambda _d: None)
     yield
     price_guard.reset()
     young_trail.reset()
@@ -97,6 +104,10 @@ def isolate_young_trail(tmp_path, monkeypatch):
     young_trail_rugrisk.set_time_fn(None)
     young_trail_rugrisk.set_rpc_fn(None)
     young_trail_rugrisk.set_overnight_fn(None)
+    young_trail_signals.reset()
+    young_trail_signals.set_time_fn(None)
+    young_trail_signals.set_http_fn(None)
+    young_trail_signals.set_sleep_fn(None)
 
 
 @pytest.fixture(autouse=True)
