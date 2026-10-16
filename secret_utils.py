@@ -81,6 +81,7 @@ def safe_err(e: Exception) -> str:
         for env_name in (
             "COINGECKO_API_KEY", "DESK_SECRET", "TYPESAFE_API_KEY",
             "COINALYZE_API_KEY", "FOMO_BEARER",
+            "BIRDEYE_API_KEY", "RUGCHECK_API_KEY",
         ):
             val = os.environ.get(env_name)
             if val and len(val) >= 8 and val in msg:

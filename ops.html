@@ -64,7 +64,7 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
 </header>
 <div id="fomo-auth-banner" class="err" hidden style="padding:8px 20px;background:color-mix(in srgb,var(--neg) 18%,var(--bg));border-bottom:1px solid var(--neg)"></div>
 <nav class="jump" aria-label="Sections">
-  <a href="#desk">Desk</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#yt-helius">Helius</a><a href="#yt-rugrisk">Rug-risk</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
+  <a href="#desk">Desk</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#yt-helius">Helius</a><a href="#yt-rugrisk">Rug-risk</a><a href="#yt-signals">Signals</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
 </nav>
 <main>
 <section id="desk" class="s6" aria-labelledby="desk-h">
@@ -106,6 +106,12 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
   <div class="kv" id="ytr-kv"></div>
   <div class="note" id="ytr-note"></div>
   <div class="scroll"><table id="ytr-t"><thead><tr><th>Rule</th><th class="n">Skip n</th><th class="n">Skip YT</th><th class="n">Skip fast</th><th class="n">Skip tp_50</th><th class="n">Keep n</th><th class="n">Keep YT</th><th class="n">Keep fast</th><th class="n">Keep tp_50</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="yt-signals" aria-labelledby="yts-h">
+  <h2 id="yts-h">young_trail_signals <small>paper RugCheck / boosts / Birdeye · no gating</small></h2>
+  <div class="kv" id="yts-kv"></div>
+  <div class="note" id="yts-note"></div>
+  <div class="scroll"><table id="yts-t"><thead><tr><th>Rule</th><th class="n">Skip n</th><th class="n">Skip YT</th><th class="n">Skip fast</th><th class="n">Skip tp_50</th><th class="n">Keep n</th><th class="n">Keep YT</th><th class="n">Keep fast</th><th class="n">Keep tp_50</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="variants" aria-labelledby="var-h">
   <h2 id="var-h">Exit variants <small id="var-cav"></small></h2>
@@ -193,7 +199,7 @@ async function load(){
   if(loadInflight)return;
   loadInflight=true;
   try{
-  const [S,YT,V,SL,B,YF,YH,YR]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius'),J('/ops/young_trail_rugrisk')]);
+  const [S,YT,V,SL,B,YF,YH,YR,YX]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius'),J('/ops/young_trail_rugrisk'),J('/ops/young_trail_signals')]);
   const now=Date.now()/1000;
   if(S){const h=S.health||{};
     $('h-mode').textContent=(h.mode||'shadow')+' · judge '+(h.judge_mode||'?');
@@ -247,6 +253,10 @@ async function load(){
     kv('ytr-kv',[['Entries',s.n||0],['Solana ok',s.ok||0],['n/a',s.n_a||0],['Pending',s.pending||0],['Unavailable',s.unavailable||0],['Error',s.error||0],['Would skip snipers',s.would_skip_snipers||0],['Would skip bundled',s.would_skip_bundled||0],['Would skip dev rugs',s.would_skip_dev_rugs||0]]);
     $('ytr-note').textContent=YR.caveat||'Paper only · skip rules do not gate entries, picks, or the judge';
     rows('ytr-t',(YR.counterfactuals||[]).map(r=>{const sk=r.skipped||{},kp=r.kept||{};return `<tr><td>${esc(r.label||r.id||'')}</td><td class="n">${sk.n??0}</td><td class="n ${cls(sk.young_trail_pnl)}">${fmtUsd(sk.young_trail_pnl)}</td><td class="n ${cls(sk.fast_baseline_pnl)}">${fmtUsd(sk.fast_baseline_pnl)}</td><td class="n ${cls(sk.fast_tp50_pnl)}">${fmtUsd(sk.fast_tp50_pnl)}</td><td class="n">${kp.n??0}</td><td class="n ${cls(kp.young_trail_pnl)}">${fmtUsd(kp.young_trail_pnl)}</td><td class="n ${cls(kp.fast_baseline_pnl)}">${fmtUsd(kp.fast_baseline_pnl)}</td><td class="n ${cls(kp.fast_tp50_pnl)}">${fmtUsd(kp.fast_tp50_pnl)}</td></tr>`}).join(''));}
+  if(YX){const s=YX.summary||{};
+    kv('yts-kv',[['Entries',s.n||0],['ok',s.ok||0],['Pending',s.pending||0],['Error',s.error||0],['Would skip danger',s.would_skip_danger||0],['Would skip LP',s.would_skip_lp||0],['Would skip auth',s.would_skip_authority||0],['Would skip score',s.would_skip_score||0],['Would skip promo',s.would_skip_promo||0],['Would skip momentum',s.would_skip_momentum||0]]);
+    $('yts-note').textContent=YX.caveat||'Paper only · skip rules do not gate entries, picks, or the judge';
+    rows('yts-t',(YX.counterfactuals||[]).map(r=>{const sk=r.skipped||{},kp=r.kept||{};return `<tr><td>${esc(r.label||r.id||'')}</td><td class="n">${sk.n??0}</td><td class="n ${cls(sk.young_trail_pnl)}">${fmtUsd(sk.young_trail_pnl)}</td><td class="n ${cls(sk.fast_baseline_pnl)}">${fmtUsd(sk.fast_baseline_pnl)}</td><td class="n ${cls(sk.fast_tp50_pnl)}">${fmtUsd(sk.fast_tp50_pnl)}</td><td class="n">${kp.n??0}</td><td class="n ${cls(kp.young_trail_pnl)}">${fmtUsd(kp.young_trail_pnl)}</td><td class="n ${cls(kp.fast_baseline_pnl)}">${fmtUsd(kp.fast_baseline_pnl)}</td><td class="n ${cls(kp.fast_tp50_pnl)}">${fmtUsd(kp.fast_tp50_pnl)}</td></tr>`}).join(''));}
   if(V){const rk=[...(V.ranking||[])].sort((a,b)=>b.realized_pnl_usd-a.realized_pnl_usd);const base=rk.find(r=>r.variant==='baseline')?.realized_pnl_usd??0;
     const span=Math.max(1,...rk.map(r=>Math.abs(r.realized_pnl_usd-base)));
     $('var-cav').textContent=V.caveat||'';

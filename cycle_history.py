@@ -1851,7 +1851,17 @@ def _young_trail_md_lines(yt: dict) -> list[str]:
         f"- Open: {sm.get('open_count', 0)} · Closed: {sm.get('closed_count', 0)} · "
         f"Win rate: {wr_s} · Realized: ${realized:+.2f}",
         *_young_trail_variant_md_lines(),
+        *_young_trail_signals_md_lines(),
     ]
+
+
+def _young_trail_signals_md_lines() -> list[str]:
+    try:
+        import young_trail_signals
+        return list(young_trail_signals.briefing_lines() or [])
+    except Exception as e:
+        log.warning("young_trail signals briefing: %s", safe_err(e))
+        return []
 
 
 def _young_trail_variant_md_lines() -> list[str]:

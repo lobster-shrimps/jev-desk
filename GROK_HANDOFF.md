@@ -22,9 +22,9 @@ A finished order then goes SIZE -> FILLS -> RISK, with CHIEF logging. Every thre
 in `thresholds.py` and is the original guide author's, not tuned to you.
 
 Beside the funnel: paper `young_trail` (and variants / 60s fast / Helius rug signals /
-rug-risk skip counterfactuals), `research.db`, an outcomes drain, Coinalyze mood, and a
-redesigned `/ops` page. None of those change filter, pick, questions, collect, or live
-orders.
+rug-risk skip counterfactuals / RugCheck-boosts-Birdeye signals), `research.db`, an
+outcomes drain, Coinalyze mood, and a redesigned `/ops` page. None of those change
+filter, pick, questions, collect, or live orders.
 
 ## 2. Status
 
@@ -86,6 +86,7 @@ Page: `GET /ops` (`ops.html`, no external URLs, no secrets). JSON:
 | `GET /ops/young_trail_fast` | 60s marks vs per-cycle |
 | `GET /ops/young_trail_helius` | Helius vs fast vs cycle |
 | `GET /ops/young_trail_rugrisk` | paper skip-rule counterfactuals (no gating) |
+| `GET /ops/young_trail_signals` | paper RugCheck/boosts/Birdeye skip-rule counterfactuals (no gating) |
 | `GET /ops/research/query?sql=` | read-only SELECT on `research.db` (limit 500) |
 | `GET /ops/research/report?kind=` | rugs / runners / features |
 | `GET /ops/backtest` | weekly signal-backtest JSON |
@@ -105,6 +106,10 @@ $50 ticket, first tid, free-pass and `age_minutes < 60`. Dex marks only. Ends
 - **Rug-risk (paper):** same entries; sniper / bundled / prior-rug features via
   budgeted Helius. Skip rules are counterfactual only (yt / fast / tp_50 SKIPPED vs
   KEPT). Does not gate. Until 20 Oct 2026.
+- **Signals (paper):** RugCheck score/risks/LP/authority, DexScreener boosts and
+  paid orders, optional Birdeye momentum. Skip rules are counterfactual only
+  (yt / fast / tp_50 SKIPPED vs KEPT). Birdeye skipped silently without
+  `BIRDEYE_API_KEY`. Does not gate. Until 20 Oct 2026.
 
 ## 8. research.db and outcomes
 
