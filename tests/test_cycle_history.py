@@ -69,6 +69,8 @@ def test_record_cycle_persists_required_fields(hist):
     assert c["seen"] == 20
     assert c["benched"] == 4
     assert c["judged"] == 2
+    assert c["soft_judged"] == 2
+    assert c["pick_judged"] == 0
     assert c["requeued"] == 1
     assert c["free"] == {"age": 6, "liquidity": 2}
     assert c["trade"] == {"no_sells": 1}
@@ -77,6 +79,64 @@ def test_record_cycle_persists_required_fields(hist):
     assert c["carry"] == 3
     assert c["unevaluated"] == 5
     assert c["source"] == "live"
+
+
+def test_pick_judged_persists_and_migrates(hist, tmp_path, monkeypatch):
+    now = ts(2026, 10, 9, 8, 15)
+    hist.on_cycle(_stats(
+        judged=3, pick_judged=1, soft_judged=3,
+        tokens=[{
+            "tid": "p:1399811149", "ticker": "PK", "net": 1399811149,
+            "chain": "solana", "stage": "judged",
+            "judge_score": 0.7, "judge_confidence": 0.6, "judge_verdict": "pass",
+        }, {
+            "tid": "s:1399811149", "ticker": "SF", "net": 1399811149,
+            "chain": "solana", "stage": "soft", "reason": "momentum_already_spent",
+            "soft_noul": 0.8, "soft_scores": {"momentum_already_spent": 0.8},
+        }],
+    ), shadow=True, now=now, source="live")
+    c = hist.cycles_since(now - 1)[0]
+    assert c["judged"] == 3
+    assert c["soft_judged"] == 3
+    assert c["pick_judged"] == 1
+    w = hist.summarize_window(now - 1, now + 1)
+    assert w["pick_judged"] == 1
+    assert w["soft_judged"] == 3
+
+    import sqlite3
+    old = tmp_path / "old_cycles.db"
+    raw = sqlite3.connect(old)
+    raw.executescript("""
+    CREATE TABLE cycles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      ts_iso TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      seen INTEGER NOT NULL DEFAULT 0,
+      benched INTEGER NOT NULL DEFAULT 0,
+      judged INTEGER NOT NULL DEFAULT 0,
+      requeued INTEGER NOT NULL DEFAULT 0,
+      free_json TEXT NOT NULL DEFAULT '{}',
+      trade_json TEXT NOT NULL DEFAULT '{}',
+      chain_json TEXT NOT NULL DEFAULT '{}',
+      soft_json TEXT NOT NULL DEFAULT '{}',
+      source TEXT NOT NULL DEFAULT 'live'
+    );
+    """)
+    raw.execute(
+        "INSERT INTO cycles (ts, ts_iso, mode, judged) VALUES (1,'t','shadow',4)"
+    )
+    raw.commit()
+    raw.close()
+    monkeypatch.setenv("CYCLE_HISTORY_DB", str(old))
+    hist.reset()
+    db = hist._connect()
+    cols = {row[1] for row in db.execute("PRAGMA table_info(cycles)")}
+    assert "pick_judged" in cols
+    leftover = db.execute("SELECT judged, pick_judged FROM cycles").fetchone()
+    assert leftover[0] == 4
+    assert leftover[1] == 0
+    hist.reset()
 
 
 def test_gt_cache_counts_persist(hist):

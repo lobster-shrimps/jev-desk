@@ -112,6 +112,10 @@ def ops_summary():
                 "tracebacks_24h": {"run_log": 0, "uvicorn_log": 0},
                 "last_traceback": None,
                 "fomo_bearer_ok": False,
+                "fomo_auth_down": False,
+                "fomo_consecutive_auth_failures": 0,
+                "soft_judged": None,
+                "pick_judged": None,
             },
             "judge_hi": [],
             "outcomes": {

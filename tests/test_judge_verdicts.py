@@ -390,6 +390,85 @@ def test_soft_kill_does_not_emit_judge_line(hist, monkeypatch, caplog):
     assert soft and "noul=0.75" in soft[0]
 
 
+def test_soft_and_pick_judged_counts_and_persisted_fields(hist, monkeypatch, caplog):
+    import collect
+    import main as shift
+    _clean_book()
+    soft_tok = _solana_token(tid="SoftMint:1399811149", ticker="SFT")
+    pick_tok = _solana_token(tid="KeepMint:1399811149", ticker="KEP")
+    by = {soft_tok["tid"]: soft_tok, pick_tok["tid"]: pick_tok}
+
+    def fake_shortlist(fomo, id_list):
+        return [dict(by[tid]) for tid in id_list if tid in by]
+
+    def fake_dossier(t, limiter=None):
+        return {
+            **t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+            "developer_holding_percentage": 2, "gt_score_details": None,
+            "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+            "description": "a token", "x_handle": None, "net": 1399811149,
+        }
+
+    def fake_judge(question_set, state):
+        ticker = state.get("ticker") if isinstance(state, dict) else None
+        if question_set == "market":
+            if ticker == "SFT":
+                return {"model": "test", "answers": {
+                    "concentration_is_exit_risk": {"type": "noul", "noul": 0.75},
+                    "momentum_already_spent": {"type": "noul", "noul": 0.40},
+                }, "usage": {}}
+            return {"model": "test", "answers": _pass_soft_answers(), "usage": {}}
+        if question_set == "pick":
+            return {"model": "test", "answers": {
+                "best": {"type": "choice", "choice": "KEP", "confidence": 0.80,
+                         "probabilities": {"KEP": 0.80}},
+                "worth_trading_at_all": {"type": "noul", "noul": 0.70},
+            }, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (
+        [soft_tok["tid"], pick_tok["tid"]], {}
+    ))
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+        {"buys_h1": 540, "sells_h1": 120, "buys_h6": 900, "sells_h6": 400,
+         "trades_h24": 4000}, "ok"))
+    monkeypatch.setattr(shift, "dossier", fake_dossier)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(
+            type("F", (), {"token": lambda self: None})(),
+            fake_judge, _Desk(), 1000.0, shadow=True, gt_dossier_reserve=3,
+        )
+    assert order is None
+    assert stats["soft_judged"] == 2
+    assert stats["judged"] == stats["soft_judged"]
+    assert stats["pick_judged"] == 1
+    summary_lines = [r.message for r in caplog.records if r.message.startswith("cycle summary:")]
+    assert summary_lines
+    assert "soft_judged=2" in summary_lines[0]
+    assert "pick_judged=1" in summary_lines[0]
+
+    stored = hist._tokens_since(0)
+    soft_rows = [t for t in stored if t["kind"] == "soft"]
+    judged_rows = [t for t in stored if t["kind"] == "judged"]
+    assert len(soft_rows) == 1
+    assert soft_rows[0]["noul"] is not None
+    assert soft_rows[0]["soft_scores"]
+    assert "concentration_is_exit_risk" in soft_rows[0]["soft_scores"]
+    assert len(judged_rows) == 1
+    for row in judged_rows:
+        if row.get("judge_verdict") != "error":
+            assert row["judge_score"] is not None
+            assert row["judge_confidence"] is not None
+            assert row["judge_verdict"] is not None
+    cycles = hist.cycles_since(0)
+    assert cycles
+    assert cycles[-1]["pick_judged"] == len(judged_rows)
+    assert cycles[-1]["pick_judged"] == stats["pick_judged"]
+
+
 def test_existing_log_lines_unchanged_in_source():
     src = (ROOT / "main.py").read_text()
     assert (
@@ -405,6 +484,7 @@ def test_existing_log_lines_unchanged_in_source():
     assert 'log.info("unevaluated %d ids (dex_slots=%d, gt_available=%d)",' in src
     assert 'log.warning("judge failed %s: %s", d["ticker"], safe_err(e))' in src
     assert 'ticker=(.+?) verdict=' in (ROOT / "cycle_history.py").read_text()
+    assert "soft_judged=%d pick_judged=%d" in src
 
 
 def test_backfill_parses_judge_line(hist):

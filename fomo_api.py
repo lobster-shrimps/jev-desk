@@ -19,6 +19,7 @@ The bearer is a Privy access token that lives about an hour. Two ways to get it:
 
 netIds: Solana 1399811149 · Robinhood 4663 · BSC 56 · Base 8453 · ETH 1 · Monad 143
 """
+import base64
 import json
 import logging
 import os
@@ -33,7 +34,11 @@ log = logging.getLogger("fomo")
 FOMO_API   = os.environ.get("FOMO_API", "https://prod-api.fomo.family")
 CDP_URL    = os.environ.get("CDP_URL", "http://127.0.0.1:9222")
 BATCH      = 20
-TOKEN_TTL  = 50 * 60            # refresh before the ~60 min Privy expiry
+TOKEN_TTL  = 50 * 60            # fallback TTL when JWT exp is unreadable
+JWT_SKEW_SEC = 300              # refresh when exp - now < 5 min
+RELOAD_WAIT_SEC = 15            # after a 401 page reload, poll this long
+RELOAD_POLL_SEC = 2
+AUTH_DOWN_AFTER = 2             # consecutive failed cycles before the banner
 # Privy keeps the access token in localStorage under these keys (first hit wins)
 PRIVY_KEYS = ("privy:token", "privy:access_token")
 # Multi-chain support: header required for BSC, Robinhood, etc. Without it, FOMO returns Solana only
@@ -48,13 +53,60 @@ class FomoAuthError(RuntimeError):
     pass
 
 
+_time_fn = time.time
+_sleep_fn = time.sleep
+
+
+def set_time_fn(fn):
+    global _time_fn
+    _time_fn = time.time if fn is None else fn
+
+
+def set_sleep_fn(fn):
+    global _sleep_fn
+    _sleep_fn = time.sleep if fn is None else fn
+
+
+def current_time() -> float:
+    return float(_time_fn())
+
+
+def _sleep(seconds: float) -> None:
+    fn = _sleep_fn
+    if fn is not None:
+        fn(max(0.0, float(seconds)))
+        return
+    time.sleep(max(0.0, float(seconds)))
+
+
+def jwt_exp(token: str | None) -> float | None:
+    """JWT `exp` claim only. Never logs the token. None if unreadable."""
+    if not token or not isinstance(token, str) or token.count(".") != 2:
+        return None
+    try:
+        payload = token.split(".")[1]
+        pad = "=" * ((4 - len(payload) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload + pad))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    exp = data.get("exp")
+    try:
+        return float(exp)
+    except (TypeError, ValueError):
+        return None
+
+
 class Fomo:
     def __init__(self, bearer: str | None = None):
         self._bearer = bearer or os.environ.get("FOMO_BEARER")
-        self._fetched_at = time.time() if self._bearer else 0.0
+        self._fetched_at = current_time() if self._bearer else 0.0
         self._last_error = None          # Last FomoAuthError message
         self._last_error_at = None       # When the last error occurred
         self._cdp_reachable = None       # Last CDP reachability check result
+        self._reloaded_this_cycle = False
+        self._consecutive_auth_failures = 0
         self.s = requests.Session()
         self.s.headers.update({"Content-Type": "application/json",
                                "Origin": "https://fomo.family",
@@ -64,72 +116,143 @@ class Fomo:
                                              "AppleWebKit/537.36 Chrome/128.0 Safari/537.36"})
 
     # ---- bearer ----------------------------------------------------------------
+    def begin_cycle(self) -> None:
+        """Reset the one-reload-per-cycle budget. main() calls this each cycle."""
+        self._reloaded_this_cycle = False
+
+    def note_auth_ok(self) -> None:
+        self._consecutive_auth_failures = 0
+
+    def note_auth_failure(self) -> None:
+        self._consecutive_auth_failures = int(self._consecutive_auth_failures or 0) + 1
+        n = self._consecutive_auth_failures
+        if n >= AUTH_DOWN_AFTER:
+            log.error(
+                "FOMO AUTH DOWN: %d consecutive cycles failed; "
+                "log into fomo.family in the FomoDesk Chrome (CDP 9222)",
+                n,
+            )
+
+    def _accept_token(self, tok: str) -> str:
+        self._bearer = tok
+        self._fetched_at = current_time()
+        self._last_error = None
+        return tok
+
+    def _jwt_expired(self, tok: str | None, now: float | None = None) -> bool:
+        exp = jwt_exp(tok)
+        if exp is None:
+            return False
+        ts = current_time() if now is None else float(now)
+        return exp <= ts
+
+    def _bearer_is_fresh(self, now: float | None = None) -> bool:
+        if not self._bearer:
+            return False
+        ts = current_time() if now is None else float(now)
+        exp = jwt_exp(self._bearer)
+        if exp is not None:
+            return (exp - ts) >= JWT_SKEW_SEC
+        return (ts - float(self._fetched_at or 0.0)) < TOKEN_TTL
+
     def token(self, force: bool = False) -> str:
         """Current bearer, refreshed out of Chrome when stale. main() calls this every cycle."""
-        if self._bearer and not force and time.time() - self._fetched_at < TOKEN_TTL:
+        if self._bearer and not force and self._bearer_is_fresh():
             return self._bearer
         fresh = self._from_chrome()
         if fresh:
-            self._bearer, self._fetched_at = fresh, time.time()
-            self._last_error = None  # Clear error on successful refresh
+            return self._accept_token(fresh)
         elif not self._bearer:
             err_msg = "no FOMO bearer: log into fomo.family in Chrome started with --remote-debugging-port=9222, or set FOMO_BEARER"
             self._last_error = err_msg
-            self._last_error_at = time.time()
+            self._last_error_at = current_time()
             raise FomoAuthError(err_msg)
         return self._bearer
-    
+
     def health(self) -> dict:
         """
         Return FOMO auth health status. NEVER returns the bearer token itself.
         Safe for ops panel display and logging.
         """
         bearer_present = self._bearer is not None
-        bearer_age_seconds = time.time() - self._fetched_at if bearer_present else None
+        now = current_time()
+        bearer_age_seconds = now - self._fetched_at if bearer_present else None
         bearer_source = "env" if os.environ.get("FOMO_BEARER") else "cdp"
-        
+        n_fail = int(self._consecutive_auth_failures or 0)
+
         return {
             "bearer_present": bearer_present,
             "bearer_age_seconds": bearer_age_seconds,
             "bearer_source": bearer_source,
             "last_refresh_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._fetched_at)) if bearer_present else None,
             "ttl_seconds": TOKEN_TTL,
-            "needs_refresh": bearer_age_seconds > TOKEN_TTL if bearer_age_seconds else True,
+            "needs_refresh": (not self._bearer_is_fresh(now)) if bearer_present else True,
             "last_error": self._last_error,
             "last_error_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_error_at)) if self._last_error_at else None,
             "cdp_reachable": self._cdp_reachable,
             "cdp_url": CDP_URL,
+            "consecutive_auth_failures": n_fail,
+            "auth_down": n_fail >= AUTH_DOWN_AFTER,
         }
 
-    def _from_chrome(self) -> str | None:
-        """Read the Privy token from the logged-in fomo.family tab via the DevTools protocol."""
+    def _list_tabs(self) -> list | None:
         try:
             tabs = requests.get(f"{CDP_URL}/json", timeout=5).json()
             self._cdp_reachable = True
+            return tabs if isinstance(tabs, list) else []
         except Exception as e:
-            log.debug("CDP not reachable at %s: %s", CDP_URL, e)
+            log.debug("CDP not reachable at %s: %s", CDP_URL, safe_err(e))
             self._cdp_reachable = False
             return None
-        tab = next((t for t in tabs if t.get("type") == "page" and "fomo.family" in t.get("url", "")),
-                   None)
-        if not tab:
-            log.warning("no fomo.family tab open in the CDP Chrome profile")
+
+    def _fomo_tab(self) -> dict | None:
+        tabs = self._list_tabs()
+        if not tabs:
             return None
+        return next(
+            (t for t in tabs if t.get("type") == "page" and "fomo.family" in t.get("url", "")),
+            None,
+        )
+
+    def _cdp_eval(self, tab: dict, expression: str, timeout: float = 5):
+        """Runtime.evaluate on an existing tab. Caller must not log the result."""
         try:
             import websocket                      # websocket-client
         except ImportError:
             log.error("pip install websocket-client to read the bearer out of Chrome")
             return None
+        url = tab.get("webSocketDebuggerUrl")
+        if not url:
+            return None
+        ws = websocket.create_connection(url, timeout=timeout)
+        try:
+            ws.send(json.dumps({
+                "id": 1, "method": "Runtime.evaluate",
+                "params": {"expression": expression, "returnByValue": True},
+            }))
+            return json.loads(ws.recv())
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _from_chrome(self) -> str | None:
+        """Read the Privy token from the logged-in fomo.family tab via the DevTools protocol."""
+        tab = self._fomo_tab()
+        if tab is None and self._cdp_reachable is False:
+            return None
+        if not tab:
+            log.warning("no fomo.family tab open in the CDP Chrome profile")
+            return None
         expr = ("(() => { for (const k of %s) { const v = localStorage.getItem(k); "
                 "if (v) return v; } return null; })()" % json.dumps(list(PRIVY_KEYS)))
         try:
-            ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=5)
-            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
-                                "params": {"expression": expr, "returnByValue": True}}))
-            res = json.loads(ws.recv())
-            ws.close()
+            res = self._cdp_eval(tab, expr)
         except Exception as e:
-            log.warning("CDP evaluate failed: %s", e)
+            log.warning("CDP evaluate failed: %s", safe_err(e))
+            return None
+        if not isinstance(res, dict):
             return None
         raw = ((res.get("result") or {}).get("result") or {}).get("value")
         if not raw:
@@ -139,6 +262,64 @@ class Fomo:
         except (TypeError, ValueError):
             pass
         return raw if isinstance(raw, str) and raw.count(".") == 2 else None
+
+    def _reload_fomo_tab(self) -> None:
+        """Reload the existing fomo.family tab. No new tabs, no cookies stored."""
+        tab = self._fomo_tab()
+        if not tab:
+            log.warning("FOMO reload skipped: no fomo.family tab")
+            return
+        try:
+            self._cdp_eval(tab, "location.reload()")
+        except Exception as e:
+            log.warning("FOMO tab reload: %s", safe_err(e))
+
+    def _poll_new_token(self, rejected: str | None) -> str | None:
+        deadline = current_time() + RELOAD_WAIT_SEC
+        while current_time() < deadline:
+            _sleep(RELOAD_POLL_SEC)
+            fresh = self._from_chrome()
+            if fresh and fresh != rejected and not self._jwt_expired(fresh):
+                return fresh
+        return None
+
+    def _recover_after_401(self, rejected: str | None) -> str:
+        """Re-read the tab token. Reload once per cycle if it is stale or expired."""
+        fresh = self._from_chrome()
+        if fresh and fresh != rejected and not self._jwt_expired(fresh):
+            return self._accept_token(fresh)
+        if not self._reloaded_this_cycle:
+            self._reload_fomo_tab()
+            self._reloaded_this_cycle = True
+            fresh = self._poll_new_token(rejected)
+            if fresh and fresh != rejected and not self._jwt_expired(fresh):
+                return self._accept_token(fresh)
+        if self._bearer:
+            return self._bearer
+        err_msg = "FOMO 401: log into fomo.family again"
+        self._last_error = err_msg
+        self._last_error_at = current_time()
+        raise FomoAuthError(err_msg)
+
+    def _do_post(self, path: str, payload, tok: str, timeout: float = 30):
+        return self.s.post(
+            f"{FOMO_API}{path}", json=payload, timeout=timeout,
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+
+    def _authorized_post(self, path: str, payload, timeout: float = 30):
+        tok = self.token()
+        r = self._do_post(path, payload, tok, timeout)
+        if r.status_code in (401, 403):
+            log.info("FOMO bearer expired, refreshing out of Chrome")
+            tok = self._recover_after_401(tok)
+            r = self._do_post(path, payload, tok, timeout)
+            if r.status_code in (401, 403):
+                err_msg = f"FOMO {r.status_code}: log into fomo.family again"
+                self._last_error = err_msg
+                self._last_error_at = current_time()
+                raise FomoAuthError(err_msg)
+        return r
 
     # ---- data ------------------------------------------------------------------
     def tokens(self, ids: list[str]) -> dict[str, dict]:
@@ -167,15 +348,7 @@ class Fomo:
         """Fetch FOMO trending tokens feed. Returns list of '<addr>:<netId>' token ids.
            Multi-chain with X-Supported-Chains header. Zero GT budget cost."""
         try:
-            r = self.s.post(f"{FOMO_API}/proxy/trendingTokens", json={}, timeout=30,
-                            headers={"Authorization": f"Bearer {self.token()}"})
-            if r.status_code in (401, 403):
-                log.info("FOMO bearer expired on trending, refreshing")
-                r = self.s.post(f"{FOMO_API}/proxy/trendingTokens", json={}, timeout=30,
-                                headers={"Authorization": f"Bearer {self.token(force=True)}"})
-                if r.status_code in (401, 403):
-                    log.error("FOMO trending auth failed after refresh")
-                    return []
+            r = self._authorized_post("/proxy/trendingTokens", {})
             r.raise_for_status()
             rows = r.json()
             if isinstance(rows, dict) and "responseObject" in rows:
@@ -193,6 +366,8 @@ class Fomo:
                 if addr and netid:
                     ids.append(f"{addr}:{netid}")
             return ids
+        except FomoAuthError:
+            raise
         except Exception as e:
             log.warning("FOMO trending_tokens failed: %s", safe_err(e))
             return []
@@ -201,15 +376,7 @@ class Fomo:
         """Fetch FOMO graduated tokens feed. Returns list of '<addr>:<netId>' token ids.
            Multi-chain with X-Supported-Chains header. Zero GT budget cost."""
         try:
-            r = self.s.post(f"{FOMO_API}/proxy/graduatedTokens", json={}, timeout=30,
-                            headers={"Authorization": f"Bearer {self.token()}"})
-            if r.status_code in (401, 403):
-                log.info("FOMO bearer expired on graduated, refreshing")
-                r = self.s.post(f"{FOMO_API}/proxy/graduatedTokens", json={}, timeout=30,
-                                headers={"Authorization": f"Bearer {self.token(force=True)}"})
-                if r.status_code in (401, 403):
-                    log.error("FOMO graduated auth failed after refresh")
-                    return []
+            r = self._authorized_post("/proxy/graduatedTokens", {})
             r.raise_for_status()
             rows = r.json()
             if isinstance(rows, dict) and "responseObject" in rows:
@@ -227,6 +394,8 @@ class Fomo:
                 if addr and netid:
                     ids.append(f"{addr}:{netid}")
             return ids
+        except FomoAuthError:
+            raise
         except Exception as e:
             log.warning("FOMO graduated_tokens failed: %s", safe_err(e))
             return []
@@ -237,17 +406,7 @@ class Fomo:
         base_delay = 0.5
         for attempt in range(max_retries + 1):
             try:
-                r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
-                                headers={"Authorization": f"Bearer {self.token()}"})
-                if r.status_code in (401, 403):
-                    log.info("FOMO bearer expired, refreshing out of Chrome")
-                    r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
-                                    headers={"Authorization": f"Bearer {self.token(force=True)}"})
-                    if r.status_code in (401, 403):
-                        err_msg = f"FOMO {r.status_code}: log into fomo.family again"
-                        self._last_error = err_msg
-                        self._last_error_at = time.time()
-                        raise FomoAuthError(err_msg)
+                r = self._authorized_post("/proxy/filterTokens", chunk)
                 # Retry on 502 Bad Gateway and similar transient failures
                 if r.status_code in (502, 503, 504) and attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
@@ -264,11 +423,13 @@ class Fomo:
                 
                 r.raise_for_status()
                 break
+            except FomoAuthError:
+                raise
             except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
                 if attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
                     log.warning("Connection error on filterTokens: %s, retrying in %.1fs (attempt %d/%d)", 
-                               e, delay, attempt + 1, max_retries + 1)
+                               safe_err(e), delay, attempt + 1, max_retries + 1)
                     # Close adapters to reset connection pool; session will reconnect on next request
                     for adapter in self.s.adapters.values():
                         adapter.close()
@@ -426,7 +587,7 @@ def activate_fomo_tab() -> dict:
         tabs_resp.raise_for_status()
         tabs = tabs_resp.json()
     except Exception as e:
-        log.error("CDP not reachable at %s: %s", CDP_URL, e)
+        log.error("CDP not reachable at %s: %s", CDP_URL, safe_err(e))
         return {
             "success": False,
             "message": f"CDP not reachable at {CDP_URL}. Is Chrome running with --remote-debugging-port=9222?",
@@ -450,7 +611,7 @@ def activate_fomo_tab() -> dict:
                 "action": "activated"
             }
         except Exception as e:
-            log.error("failed to activate tab %s: %s", tab_id, e)
+            log.error("failed to activate tab %s: %s", tab_id, safe_err(e))
             return {
                 "success": False,
                 "message": f"Found fomo.family tab but could not activate it: {e}",
@@ -468,7 +629,7 @@ def activate_fomo_tab() -> dict:
                 "action": "created"
             }
         except Exception as e:
-            log.error("failed to open new tab: %s", e)
+            log.error("failed to open new tab: %s", safe_err(e))
             return {
                 "success": False,
                 "message": f"Could not open fomo.family tab: {e}",

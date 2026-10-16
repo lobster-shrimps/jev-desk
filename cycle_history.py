@@ -131,6 +131,7 @@ def _init_schema(db: sqlite3.Connection) -> None:
       seen INTEGER NOT NULL DEFAULT 0,
       benched INTEGER NOT NULL DEFAULT 0,
       judged INTEGER NOT NULL DEFAULT 0,
+      pick_judged INTEGER NOT NULL DEFAULT 0,
       requeued INTEGER NOT NULL DEFAULT 0,
       free_json TEXT NOT NULL DEFAULT '{}',
       trade_json TEXT NOT NULL DEFAULT '{}',
@@ -256,6 +257,10 @@ def _init_schema(db: sqlite3.Connection) -> None:
     ):
         if name not in cols:
             db.execute(f"ALTER TABLE cycles ADD COLUMN {name} {decl}")
+    cycle_cols = {row[1] for row in db.execute("PRAGMA table_info(cycles)")}
+    if "pick_judged" not in cycle_cols:
+        db.execute("ALTER TABLE cycles ADD COLUMN pick_judged INTEGER NOT NULL DEFAULT 0")
+        db.commit()
     token_cols = {row[1] for row in db.execute("PRAGMA table_info(tokens)")}
     for name, decl in (
         ("judge_verdict", "TEXT"),
@@ -874,17 +879,20 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
         db = _connect()
         cur = db.execute(
             """INSERT OR IGNORE INTO cycles (
-                 ts, ts_iso, mode, seen, benched, judged, requeued,
+                 ts, ts_iso, mode, seen, benched, judged, pick_judged, requeued,
                  free_json, trade_json, chain_json, soft_json,
                  carry, unevaluated, gt_429, gt_defer,
                  gt_cache_hits, gt_cache_misses, gt_dossier_attempts, gt_dossier_ok,
                  source, ts_sec
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 now, _iso(now), mode,
                 int(stats.get("seen") or 0),
                 int(stats.get("benched") or 0),
-                int(stats.get("judged") or 0),
+                int(stats.get("soft_judged") if stats.get("soft_judged") is not None
+                    else stats.get("judged") or 0),
+                int(stats.get("pick_judged") if stats.get("pick_judged") is not None
+                    else sum(1 for t in tokens if t.get("stage") == "judged")),
                 int(stats.get("requeued") or 0),
                 _json(stats.get("free") or {}),
                 _json(stats.get("trade") or {}),
@@ -1161,6 +1169,8 @@ def _cycle_dict(r: sqlite3.Row) -> dict:
         "seen": r["seen"],
         "benched": r["benched"],
         "judged": r["judged"],
+        "soft_judged": r["judged"],
+        "pick_judged": r["pick_judged"] if "pick_judged" in r.keys() else 0,
         "requeued": r["requeued"],
         "free": _loads(r["free_json"]),
         "trade": _loads(r["trade_json"]),
@@ -1583,6 +1593,8 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "seen": seen,
         "benched": sum(c["benched"] for c in cycles),
         "judged": sum(c["judged"] for c in cycles),
+        "soft_judged": sum(c.get("soft_judged", c.get("judged") or 0) for c in cycles),
+        "pick_judged": sum(c.get("pick_judged") or 0 for c in cycles),
         "requeued": sum(c["requeued"] for c in cycles),
         "carry": sum(c["carry"] for c in cycles),
         "unevaluated": sum(c["unevaluated"] for c in cycles),
