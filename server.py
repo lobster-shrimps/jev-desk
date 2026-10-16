@@ -260,6 +260,7 @@ def ops_young_trail_rugrisk():
             "error": "young_trail_rugrisk unavailable",
             "summary": {
                 "n": 0, "ok": 0, "n_a": 0, "pending": 0, "error": 0,
+                "unavailable": 0,
                 "would_skip_snipers": 0, "would_skip_bundled": 0,
                 "would_skip_dev_rugs": 0,
             },

@@ -46,25 +46,32 @@ DEFAULT_DAY_CAP = 800
 DEFAULT_OVERNIGHT_CYCLE_CAP = 24
 DEFAULT_HELIUS_DAY_RESERVE = 400
 
-SNIPER_SLOTS = 32
+# ~3.2s at 400ms/slot. Share is of total supply, not of the early-window buys.
+SNIPER_SLOTS = 8
 SNIPER_SKIP_PCT = 0.30
+# 1–2 bonding-curve buys must not fire the skip rule by themselves.
+SNIPER_MIN_WALLETS = 4
 BUNDLED_MIN_BUYERS = 3
 FRESH_MAX_SIGS = 2
 DEV_RUG_SKIP = 1
 TOP_HOLDERS = 10
 # Do not page mint history. Hot pump mints already have >5k sigs at entry.
 # Find the create tx via the bonding-curve PDA, the creator wallet, or the
-# pool account (short histories), then take the first 15 non-create window
-# txs. Truncated (none of those paths work) is unavailable, never skip.
+# pool account (short histories), then take txs in the sniper slot window.
+# Truncated (none of those paths work) is unavailable, never skip.
 SIG_PAGE_SIZE = 1000
 MINT_SIG_PAGES = 1
 WALLET_SIG_LIMIT = 8
 DEV_SIG_LIMIT = 25
-FRESH_WALLET_RPC_CAP = 6
+DEV_TX_CAP = 4
+# Fresh-wallet share is not a skip rule. Probe only leftover budget / cache.
+FRESH_WALLET_RPC_CAP = 0
 CREATOR_CREATE_TX_CAP = 8
-# Sniper/bundled: create tx plus the first 15 non-create txs. Target ≤20 RPC.
-WINDOW_NON_CREATE_CAP = 15
-TARGET_ENTRY_CALLS = 20
+# Create tx plus non-create txs inside the sniper window. Target ≤8 RPC.
+WINDOW_NON_CREATE_CAP = 8
+TARGET_ENTRY_CALLS = 8
+DEFAULT_TICK_ENTRIES = 8
+START_CALLS = 4
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 BONDING_CURVE_SEED = b"bonding-curve"
 BONDING_CURVE_V2_SEED = b"bonding-curve-v2"
@@ -79,6 +86,10 @@ STATUS_PENDING = "pending"
 STATUS_ERROR = "error"
 STATUS_UNAVAILABLE = "unavailable"
 STATUS_BUDGET = "budget"
+SOURCE_SNIPER_V2 = "sniper_v2"
+SNIPER_V2_OK = "ok"
+SNIPER_V2_NEEDS = "needs_recompute"
+META_SNIPER_V2 = "sniper_v2_invalidate"
 
 RULE_SNIPERS = "snipers_gt_30"
 RULE_BUNDLED = "bundled"
@@ -90,6 +101,7 @@ SKIP_RULES = (
         "label": "snipers > 30%",
         "field": "skip_snipers",
         "threshold": SNIPER_SKIP_PCT,
+        "min_wallets": SNIPER_MIN_WALLETS,
     },
     {
         "id": RULE_BUNDLED,
@@ -123,6 +135,9 @@ _cycle_calls = 0
 _last_new_tids: list[str] = []
 _gtfa_supported: bool | None = None
 _gtfa_retry_after: float = 0.0
+_dev_cache: dict[str, dict] = {}
+_creator_cache: dict[str, str | None] = {}
+_wallet_fresh_cache: dict[str, bool] = {}
 
 
 def set_time_fn(fn) -> None:
@@ -168,11 +183,15 @@ def _close_local() -> None:
 def reset() -> None:
     """Close this thread's cached connection. Tests call this."""
     global _cycle_calls, _last_new_tids, _gtfa_supported, _gtfa_retry_after
+    global _dev_cache, _creator_cache, _wallet_fresh_cache
     _close_local()
     _cycle_calls = 0
     _last_new_tids = []
     _gtfa_supported = None
     _gtfa_retry_after = 0.0
+    _dev_cache = {}
+    _creator_cache = {}
+    _wallet_fresh_cache = {}
 
 
 def _schema_step(db: sqlite3.Connection, name: str, fn) -> None:
@@ -231,8 +250,16 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
     _schema_step(conn, "ytr_dev_initial_share", lambda: _add_column(
         conn, "young_trail_rugrisk", "dev_initial_share", "REAL"
     ))
+    _schema_step(conn, "ytr_sniper_denominator", lambda: _add_column(
+        conn, "young_trail_rugrisk", "sniper_denominator", "REAL"
+    ))
+    _schema_step(conn, "ytr_sniper_min_wallets", lambda: _add_column(
+        conn, "young_trail_rugrisk", "sniper_min_wallets", "INTEGER"
+    ))
     _schema_step(conn, "ytr_reset_truncated_create_path",
                  lambda: _reset_truncated_rows(conn))
+    _schema_step(conn, "ytr_backfill_sniper_v2",
+                 lambda: _backfill_sniper_v2(conn))
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -271,6 +298,61 @@ def _reset_truncated_rows(conn: sqlite3.Connection) -> None:
         """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
         ("reset_truncated_create_path", "1"),
+    )
+
+
+def _backfill_sniper_v2(conn: sqlite3.Connection) -> None:
+    """Recompute sniper share from cached buys+supply only. No RPC.
+
+    Rows without buys or total supply keep status=ok but sniper_share and
+    skip_snipers are NULLed and stamped sniper_v2=needs_recompute (unknown
+    in the counterfactual). They are re-queued overnight, not here.
+    """
+    row = conn.execute(
+        "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
+        (META_SNIPER_V2,),
+    ).fetchone()
+    if row and str(row["value"]) == "1":
+        return
+    cols = _table_columns(conn, "young_trail_rugrisk")
+    if "sniper_min_wallets" not in cols:
+        return
+    try:
+        rows = conn.execute(
+            "SELECT * FROM young_trail_rugrisk WHERE status = 'ok'"
+        ).fetchall()
+        for raw in rows:
+            d = _row_dict(raw)
+            updated = recompute_sniper_from_cached(d)
+            if not updated:
+                continue
+            extra = updated.get("features_json")
+            extra_s = json.dumps(extra) if extra is not None else d.get("features_json")
+            skip = updated.get("skip_snipers")
+            conn.execute(
+                """UPDATE young_trail_rugrisk SET
+                     sniper_share = ?, sniper_wallets = ?, sniper_slots = ?,
+                     sniper_denominator = ?, sniper_min_wallets = ?,
+                     skip_snipers = ?, features_json = ?
+                   WHERE tid = ?""",
+                (
+                    updated.get("sniper_share"),
+                    updated.get("sniper_wallets"),
+                    updated.get("sniper_slots"),
+                    updated.get("sniper_denominator"),
+                    updated.get("sniper_min_wallets"),
+                    None if skip is None else int(bool(skip)),
+                    extra_s,
+                    d["tid"],
+                ),
+            )
+    except Exception as e:
+        log.warning("young_trail_rugrisk sniper v2 backfill: %s", safe_err(e))
+        raise
+    conn.execute(
+        """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (META_SNIPER_V2, "1"),
     )
 
 
@@ -438,6 +520,19 @@ def sniper_skip_pct() -> float:
 
 def sniper_slots() -> int:
     return _env_int("YOUNG_TRAIL_RUGRISK_SNIPER_SLOTS", SNIPER_SLOTS)
+
+
+def sniper_min_wallets() -> int:
+    return _env_int("YOUNG_TRAIL_RUGRISK_SNIPER_MIN_WALLETS", SNIPER_MIN_WALLETS)
+
+
+def tick_entry_cap(now: float | None = None) -> int:
+    """Pending rows to attempt per tick. Budget still binds; fair-share splits."""
+    if is_overnight(now):
+        return _env_int(
+            "YOUNG_TRAIL_RUGRISK_OVERNIGHT_TICK_ENTRIES", DEFAULT_TICK_ENTRIES,
+        )
+    return _env_int("YOUNG_TRAIL_RUGRISK_TICK_ENTRIES", DEFAULT_TICK_ENTRIES)
 
 
 def _day_key(now: float | None = None) -> str:
@@ -611,6 +706,63 @@ def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | Non
     return data["result"]
 
 
+def _rpc_batch(calls: list[tuple[str, list]], timeout: float = RPC_TIMEOUT_SEC,
+               now: float | None = None) -> list:
+    """One HTTP round-trip for many methods. Charges 1 against the rugrisk cap."""
+    if not calls:
+        return []
+    prepared = [(m, _with_max_tx_version(m, p)) for m, p in calls]
+    if not _charge(1, now):
+        raise RuntimeError("rugrisk budget exhausted")
+    if _rpc_fn is not None:
+        out = []
+        for method, params in prepared:
+            try:
+                out.append(_rpc_fn(method, params, timeout))
+            except Exception as e:
+                msg = str(e).lower()
+                if "budget" in msg or isinstance(e, AssertionError):
+                    raise
+                log.warning("young_trail_rugrisk rpc %s: %s", method, safe_err(e))
+                out.append(None)
+        return out
+    import requests
+    rpc_url = os.environ.get("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com"
+    payload = [
+        {"jsonrpc": "2.0", "id": i + 1, "method": method, "params": params}
+        for i, (method, params) in enumerate(prepared)
+    ]
+    try:
+        resp = requests.post(
+            rpc_url, json=payload, timeout=max(0.5, float(timeout)),
+        )
+        data = resp.json()
+    except Exception as e:
+        log.warning("young_trail_rugrisk rpc batch: %s", safe_err(e))
+        raise
+    by_id: dict = {}
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "id" in item:
+                by_id[item["id"]] = item
+    elif isinstance(data, dict) and "id" in data:
+        by_id[data["id"]] = data
+    out = []
+    for i, (method, _params) in enumerate(prepared):
+        item = by_id.get(i + 1)
+        if not isinstance(item, dict):
+            out.append(None)
+            continue
+        if "error" in item:
+            err = item["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            log.warning("young_trail_rugrisk rpc %s: %s", method, msg)
+            out.append(None)
+            continue
+        out.append(item.get("result"))
+    return out
+
+
 def _tok_amt(obj) -> float:
     if not isinstance(obj, dict):
         return 0.0
@@ -627,13 +779,45 @@ def _owner_set(owners) -> set[str]:
     return {str(x) for x in (owners or set()) if x}
 
 
+def sniper_exclude_owners(mint: str | None, creators=None, holders=None) -> set[str]:
+    """Creator, bonding-curve PDAs, and pool/AMM accounts are not sniper wallets."""
+    skip = _owner_set(creators)
+    skip.add(PUMP_PROGRAM_ID)
+    if mint:
+        for addr in (
+            bonding_curve_pda(mint),
+            bonding_curve_v2_pda(mint),
+            _helius_pool_account(mint),
+        ):
+            if addr:
+                skip.add(str(addr))
+    for h in holders or []:
+        if not h.get("is_pool"):
+            continue
+        if h.get("owner"):
+            skip.add(str(h["owner"]))
+        if h.get("account"):
+            skip.add(str(h["account"]))
+    return skip
+
+
 def sniper_share_from_buys(buys: list[dict], supply: float, create_slot: int,
                            n_slots: int, exclude=None) -> dict:
-    """% of supply bought in [create_slot, create_slot+n_slots], excluding creator."""
+    """Share of *total supply* bought in [create_slot, create_slot+n_slots].
+
+    `exclude` should include the creator, bonding-curve PDA, and pool accounts.
+    Denominator is total supply, never the sum of early-window buys.
+    """
+    n_slots = max(0, int(n_slots if n_slots is not None else sniper_slots()))
+    empty = {
+        "sniper_share": None, "sniper_wallets": 0, "sniper_amount": 0.0,
+        "sniper_denominator": None if not supply or supply <= 0 else float(supply),
+        "sniper_slots": n_slots,
+    }
     if not supply or supply <= 0 or create_slot is None:
-        return {"sniper_share": None, "sniper_wallets": 0, "sniper_amount": 0.0}
+        return empty
     skip = _owner_set(exclude)
-    end = int(create_slot) + max(0, int(n_slots))
+    end = int(create_slot) + n_slots
     wallets: dict[str, float] = {}
     for b in buys or []:
         slot = b.get("slot")
@@ -650,7 +834,107 @@ def sniper_share_from_buys(buys: list[dict], supply: float, create_slot: int,
         "sniper_share": amount / float(supply),
         "sniper_wallets": len(wallets),
         "sniper_amount": amount,
+        "sniper_denominator": float(supply),
+        "sniper_slots": n_slots,
     }
+
+
+def _parse_features_blob(raw) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            blob = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return dict(blob) if isinstance(blob, dict) else {}
+    return {}
+
+
+def _slim_sniper_buys(buys: list | None, create_slot, n_slots: int) -> list[dict]:
+    """Compact {owner, delta, slot} for the sniper window only."""
+    if create_slot is None:
+        return []
+    end = int(create_slot) + max(0, int(n_slots))
+    out: list[dict] = []
+    for b in buys or []:
+        if not isinstance(b, dict):
+            continue
+        slot = b.get("slot")
+        owner = b.get("owner")
+        delta = _num(b.get("delta"), 0.0) or 0.0
+        if not owner or slot is None or delta <= 0:
+            continue
+        if int(create_slot) <= int(slot) <= end:
+            out.append({
+                "owner": str(owner), "delta": float(delta), "slot": int(slot),
+            })
+        if len(out) >= 40:
+            break
+    return out
+
+
+def recompute_sniper_from_cached(row: dict) -> dict | None:
+    """Rebuild sniper share from stored buys + total supply. No RPC.
+
+    Without both, the old window-relative share is discarded (NULL share /
+    NULL skip) and stamped needs_recompute so the comparison counts unknown.
+    """
+    if not row or row.get("status") not in (STATUS_OK, None):
+        if row and row.get("status") != STATUS_OK:
+            return None
+    extra = _parse_features_blob(row.get("features_json"))
+    buys = extra.get("buys")
+    if not isinstance(buys, list) or not buys:
+        buys = None
+    supply = (
+        _num(row.get("sniper_denominator"))
+        or _num(extra.get("sniper_denominator"))
+        or _num(extra.get("supply"))
+        or _num(row.get("supply"))
+    )
+    create_slot = extra.get("create_slot")
+    if create_slot is None:
+        create_slot = row.get("create_slot")
+    n_slots = row.get("sniper_slots")
+    if n_slots is None:
+        n_slots = extra.get("sniper_slots")
+    if n_slots is None:
+        n_slots = sniper_slots()
+    n_slots = int(n_slots)
+    creators = extra.get("creators") or []
+    mint, _net = parse_tid(row.get("tid"))
+    min_w = sniper_min_wallets()
+    out = dict(row)
+    out["sniper_min_wallets"] = min_w
+    out["sniper_slots"] = n_slots
+    out["status"] = row.get("status") or STATUS_OK
+    if buys and supply and supply > 0 and create_slot is not None:
+        exclude = sniper_exclude_owners(mint, creators, extra.get("holders"))
+        sn = sniper_share_from_buys(
+            buys, float(supply), int(create_slot), n_slots, exclude=exclude,
+        )
+        out.update(sn)
+        extra["buys"] = _slim_sniper_buys(buys, create_slot, n_slots)
+        extra["supply"] = float(supply)
+        extra["sniper_denominator"] = sn.get("sniper_denominator") or float(supply)
+        extra["sniper_slots"] = n_slots
+        extra["sniper_min_wallets"] = min_w
+        extra["sniper_v2"] = SNIPER_V2_OK
+        extra["create_slot"] = int(create_slot)
+        out["features_json"] = extra
+        out.update(skip_flags(out))
+        return out
+    extra["sniper_v2"] = SNIPER_V2_NEEDS
+    extra.pop("sniper_share", None)
+    out["sniper_share"] = None
+    out["sniper_denominator"] = None
+    out["skip_snipers"] = None
+    out["features_json"] = extra
+    flags = skip_flags(out)
+    flags["skip_snipers"] = None
+    out.update(flags)
+    return out
 
 
 def bundled_from_buys(buys: list[dict], create_slot: int,
@@ -735,7 +1019,29 @@ def skip_flags(features: dict) -> dict:
             "skip_snipers": None, "skip_bundled": None, "skip_dev_rugs": None,
         }
     sniper = _num(features.get("sniper_share"))
-    skip_s = None if sniper is None else bool(sniper > sniper_skip_pct())
+    n_wallets = features.get("sniper_wallets")
+    min_w = features.get("sniper_min_wallets")
+    if min_w is None:
+        min_w = sniper_min_wallets()
+    try:
+        min_w = int(min_w)
+    except (TypeError, ValueError):
+        min_w = sniper_min_wallets()
+    skip_s = None
+    if sniper is None:
+        skip_s = None
+    elif n_wallets is not None:
+        try:
+            n_w = int(n_wallets)
+        except (TypeError, ValueError):
+            n_w = 0
+        if n_w < max(0, min_w):
+            skip_s = False
+        else:
+            skip_s = bool(sniper > sniper_skip_pct())
+    else:
+        # Wallet count missing: fail open (do not skip).
+        skip_s = False
     bundled = features.get("bundled")
     skip_b = None if bundled is None else bool(bundled)
     rugs = features.get("dev_prior_rugs")
@@ -1150,17 +1456,17 @@ def _commit_window(prog: dict, recs: dict, ordered_sigs: list[str], src: str,
     """True when ordered recs contain a CREATE_IX tx. Mutates prog.
 
     Exhausted short histories may use the oldest sig as the create slot when
-    the create instruction wasn't parsed.
+    the create instruction wasn't parsed. Non-create txs are kept only when
+    their slot is inside the sniper window (not an arbitrary N-tx cap).
     """
     cap_n = max(0, int(WINDOW_NON_CREATE_CAP))
+    n_slots = sniper_slots()
     create_sig = None
-    non: list[str] = []
     for sig in ordered_sigs:
         rec = recs.get(sig) or {}
         if rec.get("has_create_ix") and not create_sig:
             create_sig = sig
-        elif sig != create_sig and len(non) < cap_n:
-            non.append(sig)
+            break
     if not create_sig:
         if not (allow_oldest and ordered_sigs):
             return False
@@ -1168,8 +1474,23 @@ def _commit_window(prog: dict, recs: dict, ordered_sigs: list[str], src: str,
         if first.get("slot") is None:
             return False
         create_sig = ordered_sigs[0]
-        non = [s for s in ordered_sigs[1:] if s != create_sig][:cap_n]
     slot = (recs.get(create_sig) or {}).get("slot")
+    end = None if slot is None else int(slot) + max(0, int(n_slots))
+    non: list[str] = []
+    extra_in_window = 0
+    for sig in ordered_sigs:
+        if sig == create_sig:
+            continue
+        rec = recs.get(sig) or {}
+        rec_slot = rec.get("slot")
+        if rec_slot is None or slot is None:
+            if len(non) < cap_n:
+                non.append(sig)
+            continue
+        if int(slot) <= int(rec_slot) <= int(end):
+            extra_in_window += 1
+            if len(non) < cap_n:
+                non.append(sig)
     to_fetch = [create_sig] + [s for s in non if s != create_sig]
     scored = set(to_fetch)
     prog["tx_recs"] = recs
@@ -1177,7 +1498,9 @@ def _commit_window(prog: dict, recs: dict, ordered_sigs: list[str], src: str,
     prog["create_slot"] = slot
     prog["non_create_sigs"] = non
     prog["to_fetch"] = to_fetch
-    prog["window_capped"] = any(s not in scored for s in ordered_sigs)
+    prog["window_capped"] = extra_in_window > len(non) or any(
+        s not in scored for s in ordered_sigs
+    )
     prog["window_src"] = src
     prog["window_done"] = True
     return True
@@ -1222,19 +1545,21 @@ def _fill_create_window(mint: str, creator: str | None, holders: list | None,
             return None
         oldest = list(reversed([s for s in sigs if s.get("signature") and not s.get("err")]))
         take = oldest[: cap_n + 1]
-        for row in take:
-            sig = row["signature"]
-            if sig in recs:
-                continue
+        need = [row["signature"] for row in take if row["signature"] not in recs]
+        if need:
             if not _can_charge(1, now):
                 save()
                 return "pending"
             try:
-                tx = _transaction(sig, now=now)
+                fetched = _transactions(need, now=now)
             except Exception as e:
+                if "budget" in str(e).lower():
+                    save()
+                    return "pending"
                 log.warning("young_trail_rugrisk tx: %s", safe_err(e))
-                tx = None
-            recs[sig] = _tx_record(sig, tx, mint)
+                fetched = {}
+            for sig in need:
+                recs[sig] = _tx_record(sig, fetched.get(sig), mint)
         ordered = [r["signature"] for r in take]
         if _commit_window(prog, recs, ordered, src, allow_oldest=True):
             prog["window_capped"] = len(oldest) > len(prog.get("to_fetch") or [])
@@ -1281,24 +1606,35 @@ def _fill_create_window(mint: str, creator: str | None, holders: list | None,
         except Exception as e:
             log.warning("young_trail_rugrisk creator sigs: %s", safe_err(e))
             csigs = []
+        prog["creator_sigs"] = csigs
         idx = int(prog.get("creator_scan_i") or 0)
         cap_tx = min(len(csigs), max(0, int(CREATOR_CREATE_TX_CAP)))
         create_sig = None
+        need = []
+        walk = []
         while idx < cap_tx:
-            if not _can_charge(1, now):
-                prog["creator_scan_i"] = idx
-                save()
-                return "pending"
             sig = csigs[idx]["signature"]
+            walk.append(sig)
             idx += 1
             if sig not in recs:
-                try:
-                    tx = _transaction(sig, now=now)
-                except Exception as e:
-                    log.warning("young_trail_rugrisk creator tx: %s", safe_err(e))
-                    tx = None
-                recs[sig] = _tx_record(sig, tx, mint)
-            if recs[sig].get("has_create_ix"):
+                need.append(sig)
+        if need:
+            if not _can_charge(1, now):
+                prog["creator_scan_i"] = int(prog.get("creator_scan_i") or 0)
+                save()
+                return "pending"
+            try:
+                fetched = _transactions(need, now=now)
+            except Exception as e:
+                if "budget" in str(e).lower():
+                    save()
+                    return "pending"
+                log.warning("young_trail_rugrisk creator tx: %s", safe_err(e))
+                fetched = {}
+            for sig in need:
+                recs[sig] = _tx_record(sig, fetched.get(sig), mint)
+        for sig in walk:
+            if recs.get(sig, {}).get("has_create_ix"):
                 create_sig = sig
                 break
         prog["creator_scan_i"] = idx
@@ -1369,18 +1705,30 @@ def _tx_has_create_ix(tx: dict, mint: str | None = None) -> bool:
 
 
 def _tx_record(sig: str, tx: dict | None, mint: str) -> dict:
-    """Compact resume record: buyers, signers, create-ix flag. No raw RPC blob."""
+    """Compact resume record: buyers, signers, create/rug ixs. No raw RPC blob."""
     if not tx:
         return {
             "signature": sig, "slot": None, "buyers": [], "signers": [],
-            "has_create_ix": False,
+            "has_create_ix": False, "created_mints": [], "rugged_mints": [],
         }
+    created, rugged = [], []
+    for ix in _iter_parsed_ix(tx):
+        kind = _ix_type(ix)
+        ix_mint = _ix_mint(ix)
+        if not ix_mint:
+            continue
+        if kind in CREATE_IX:
+            created.append(str(ix_mint))
+        if kind in RUG_IX:
+            rugged.append(str(ix_mint))
     return {
         "signature": sig,
         "slot": tx.get("slot"),
         "buyers": _buyers_from_tx(tx, mint),
         "signers": _tx_signers(tx),
         "has_create_ix": _tx_has_create_ix(tx, mint),
+        "created_mints": created,
+        "rugged_mints": rugged,
     }
 
 
@@ -1426,13 +1774,26 @@ def _tx_signers(tx: dict) -> list[str]:
 
 
 def _transaction(sig: str, now: float | None = None) -> dict | None:
-    result = _rpc(
-        "getTransaction",
-        [sig, {"encoding": "jsonParsed",
-               "maxSupportedTransactionVersion": MAX_TX_VERSION}],
-        now=now,
-    )
-    return result if isinstance(result, dict) else None
+    got = _transactions([sig], now=now)
+    rec = got.get(sig)
+    return rec if isinstance(rec, dict) else None
+
+
+def _transactions(sigs: list[str], now: float | None = None) -> dict[str, dict | None]:
+    """Batch getTransaction. One budget charge for the whole list."""
+    out: dict[str, dict | None] = {}
+    pending = [s for s in sigs if s]
+    if not pending:
+        return out
+    opts = {
+        "encoding": "jsonParsed",
+        "maxSupportedTransactionVersion": MAX_TX_VERSION,
+    }
+    calls = [("getTransaction", [s, opts]) for s in pending]
+    results = _rpc_batch(calls, now=now)
+    for sig, rec in zip(pending, results):
+        out[sig] = rec if isinstance(rec, dict) else None
+    return out
 
 
 def _iter_parsed_ix(tx: dict):
@@ -1493,12 +1854,18 @@ def _buyers_from_tx(tx: dict, mint: str) -> list[dict]:
 
 
 def _lookup_creator(tid: str) -> str | None:
+    if not tid:
+        return None
+    if tid in _creator_cache:
+        return _creator_cache[tid]
     try:
         import young_trail_helius as helius
-        return helius.lookup_creator(tid)
+        val = helius.lookup_creator(tid)
     except Exception as e:
         log.warning("young_trail_rugrisk creator: %s", safe_err(e))
-        return None
+        val = None
+    _creator_cache[tid] = val
+    return val
 
 
 def _label_rugged(mint: str) -> bool | None:
@@ -1517,51 +1884,33 @@ def _label_rugged(mint: str) -> bool | None:
         return None
 
 
-def _dev_history(creator: str, current_mint: str,
-                 now: float | None = None) -> dict:
-    """Prior launches by creator + cheap rug flags (LP pull / labels)."""
-    empty = {"dev_prior_launches": 0, "dev_prior_rugs": 0, "prior_mints": []}
-    if not creator or not _can_charge(1, now):
-        return {**empty, "dev_prior_launches": None, "dev_prior_rugs": None}
-    try:
-        sigs = [s for s in _signatures(creator, limit=DEV_SIG_LIMIT, now=now)
-                if not s.get("err")]
-    except Exception as e:
-        log.warning("young_trail_rugrisk dev sigs: %s", safe_err(e))
-        return {**empty, "dev_prior_launches": None, "dev_prior_rugs": None}
+def _dev_from_recs(recs, current_mint: str) -> dict:
+    """Prior launches / rugs already sitting in compact tx recs. No RPC."""
     launches: dict[str, dict] = {}
-    rug_hits: set[str] = set()
-    fetched = 0
-    for sig in sigs:
-        if fetched >= 4 or not _can_charge(1, now):
-            break
-        try:
-            tx = _transaction(sig["signature"], now=now)
-        except Exception as e:
-            log.warning("young_trail_rugrisk dev tx: %s", safe_err(e))
+    if isinstance(recs, dict):
+        items = recs.values()
+    else:
+        items = recs or []
+    for rec in items:
+        if not isinstance(rec, dict):
             continue
-        fetched += 1
-        if not tx:
-            continue
-        slot = tx.get("slot")
-        for ix in _iter_parsed_ix(tx):
-            kind = _ix_type(ix)
-            mint = _ix_mint(ix)
+        slot = rec.get("slot")
+        for mint in rec.get("created_mints") or []:
+            mint = str(mint)
             if not mint or mint == current_mint:
                 continue
-            if kind in CREATE_IX:
-                launches.setdefault(mint, {"mint": mint, "slot": slot, "rugged": False})
-            if kind in RUG_IX:
-                rug_hits.add(mint)
-                if mint in launches:
-                    launches[mint]["rugged"] = True
-                else:
-                    launches[mint] = {"mint": mint, "slot": slot, "rugged": True}
+            launches.setdefault(mint, {"mint": mint, "slot": slot, "rugged": False})
+        for mint in rec.get("rugged_mints") or []:
+            mint = str(mint)
+            if not mint or mint == current_mint:
+                continue
+            if mint in launches:
+                launches[mint]["rugged"] = True
+            else:
+                launches[mint] = {"mint": mint, "slot": slot, "rugged": True}
     for mint, rec in list(launches.items()):
         labeled = _label_rugged(mint)
         if labeled:
-            rec["rugged"] = True
-        if mint in rug_hits:
             rec["rugged"] = True
     n_launch = len(launches)
     n_rug = sum(1 for r in launches.values() if r.get("rugged"))
@@ -1572,12 +1921,118 @@ def _dev_history(creator: str, current_mint: str,
     }
 
 
+def _compact_dev(dev: dict) -> dict:
+    return {
+        "dev_prior_launches": dev.get("dev_prior_launches"),
+        "dev_prior_rugs": dev.get("dev_prior_rugs"),
+        "prior_mints": (dev.get("prior_mints") or [])[:8],
+    }
+
+
+def _dev_history(creator: str, current_mint: str,
+                 now: float | None = None, recs=None, sigs=None) -> dict:
+    """Prior launches by creator + cheap rug flags (LP pull / labels).
+
+    Reuses creator-scan recs / cached history so a low remaining budget does
+    not skip the feature. Unknown (None) only when we could not look.
+    """
+    unknown = {
+        "dev_prior_launches": None, "dev_prior_rugs": None, "prior_mints": [],
+    }
+    empty = {
+        "dev_prior_launches": 0, "dev_prior_rugs": 0, "prior_mints": [],
+    }
+    if not creator:
+        return empty
+    cached = _dev_cache.get(creator)
+    if cached is not None:
+        return dict(cached)
+
+    from_recs = _dev_from_recs(recs, current_mint)
+    if from_recs["dev_prior_launches"] or from_recs["dev_prior_rugs"]:
+        _dev_cache[creator] = _compact_dev(from_recs)
+        log.info(
+            "young_trail_rugrisk dev history src=recs launches=%s rugs=%s",
+            from_recs["dev_prior_launches"], from_recs["dev_prior_rugs"],
+        )
+        return from_recs
+
+    sig_rows = list(sigs) if sigs is not None else []
+    rpc_sigs = False
+    if sigs is None:
+        if not _can_charge(1, now):
+            log.warning("young_trail_rugrisk dev history skipped budget")
+            return unknown
+        try:
+            sig_rows = [s for s in _signatures(creator, limit=DEV_SIG_LIMIT, now=now)
+                        if not s.get("err")]
+            rpc_sigs = True
+        except Exception as e:
+            log.warning("young_trail_rugrisk dev sigs: %s", safe_err(e))
+            return unknown
+    elif from_recs["dev_prior_launches"] is not None and not sig_rows:
+        _dev_cache[creator] = _compact_dev(from_recs)
+        log.info(
+            "young_trail_rugrisk dev history src=recs launches=%s rugs=%s",
+            from_recs["dev_prior_launches"], from_recs["dev_prior_rugs"],
+        )
+        return from_recs
+
+    rec_map: dict = {}
+    if isinstance(recs, dict):
+        rec_map = dict(recs)
+    need = []
+    for row in sig_rows[: max(0, int(DEV_TX_CAP))]:
+        sig = row.get("signature") if isinstance(row, dict) else None
+        if not sig:
+            continue
+        if sig in rec_map and (
+            rec_map[sig].get("created_mints") is not None
+            or rec_map[sig].get("rugged_mints") is not None
+        ):
+            continue
+        need.append(sig)
+    rpc_txs = 0
+    if need:
+        if not _can_charge(1, now):
+            log.warning(
+                "young_trail_rugrisk dev history skipped budget txs need=%d",
+                len(need),
+            )
+            if from_recs["dev_prior_launches"] is not None:
+                return from_recs
+            return unknown
+        try:
+            fetched = _transactions(need, now=now)
+            rpc_txs = 1
+        except Exception as e:
+            if "budget" in str(e).lower():
+                log.warning("young_trail_rugrisk dev history skipped budget")
+                return unknown
+            log.warning("young_trail_rugrisk dev tx: %s", safe_err(e))
+            fetched = {}
+        for sig in need:
+            rec_map[sig] = _tx_record(sig, fetched.get(sig), current_mint)
+
+    merged = _dev_from_recs(rec_map, current_mint)
+    _dev_cache[creator] = _compact_dev(merged)
+    log.info(
+        "young_trail_rugrisk dev history src=rpc sigs=%d rpc_sigs=%s rpc_txs=%d "
+        "launches=%s rugs=%s",
+        len(sig_rows), int(rpc_sigs), rpc_txs,
+        merged["dev_prior_launches"], merged["dev_prior_rugs"],
+    )
+    return merged
+
+
 def _blank_features(status: str, creator: str | None = None, **extra) -> dict:
     feat = {
         "status": status,
         "sniper_share": None,
         "sniper_wallets": None,
         "sniper_slots": sniper_slots(),
+        "sniper_denominator": extra.get("supply"),
+        "sniper_min_wallets": sniper_min_wallets(),
         "bundled": None,
         "bundled_buys": None,
         "dev_wallet": creator,
@@ -1630,32 +2085,38 @@ def compute_features(mint: str, creator: str | None = None,
         return feat
 
     try:
-        if fresh_start and not _can_charge(4, ts):
+        if fresh_start and not _can_charge(START_CALLS, ts):
             return _blank_features(STATUS_BUDGET, creator, error="budget")
         if (not fresh_start) and not _can_charge(1, ts):
             return pending()
 
         if "supply" not in prog:
-            supply = _supply(mint, now=ts)
+            prog["supply"] = _supply(mint, now=ts)
+
+        def load_holders() -> None:
+            if prog.get("holders_tried"):
+                return
+            if not _can_charge(2, ts):
+                return
             largest = _largest_accounts(mint, now=ts)
             addrs = [a["address"] for a in largest]
             owners = _owners_for(addrs, now=ts) if addrs and _can_charge(1, ts) else {}
-            holders = []
+            holders_out = []
             for acc in largest:
                 meta = owners.get(acc["address"]) or {}
                 owner = meta.get("owner")
                 program = meta.get("program")
                 is_pool = bool(program and _is_amm(program))
-                holders.append({
+                holders_out.append({
                     "account": acc["address"],
                     "owner": owner,
                     "amount": acc["amount"],
                     "is_pool": is_pool,
                 })
-            holders.sort(key=lambda h: h["amount"], reverse=True)
-            prog["supply"] = supply
-            prog["holders"] = holders
-            prog["top"] = [h for h in holders if not h.get("is_pool")][:TOP_HOLDERS]
+            holders_out.sort(key=lambda h: h["amount"], reverse=True)
+            prog["holders"] = holders_out
+            prog["top"] = [h for h in holders_out if not h.get("is_pool")][:TOP_HOLDERS]
+            prog["holders_tried"] = True
 
         supply = prog.get("supply")
         holders = prog.get("holders") or []
@@ -1665,6 +2126,16 @@ def compute_features(mint: str, creator: str | None = None,
             found = _fill_create_window(mint, creator, holders, ts, prog)
             if found == "pending":
                 return pending()
+            if found != "ok" and not prog.get("holders_tried"):
+                mint_sigs = prog.get("mint_sigs") or []
+                hot = len(mint_sigs) >= max(1, min(int(SIG_PAGE_SIZE), 1000))
+                if not hot:
+                    load_holders()
+                    holders = prog.get("holders") or []
+                    top = prog.get("top") or []
+                    found = _fill_create_window(mint, creator, holders, ts, prog)
+                    if found == "pending":
+                        return pending()
             if found != "ok":
                 used = calls_used()
                 feat = _blank_features(
@@ -1709,81 +2180,108 @@ def compute_features(mint: str, creator: str | None = None,
                 creators.update(rec.get("signers") or [])
         prog["buys"] = buys
         prog["creators"] = sorted(creators)
+        exclude = sniper_exclude_owners(mint, creators, holders)
 
         dev = prog.get("dev") or {
             "dev_prior_launches": None, "dev_prior_rugs": None, "prior_mints": [],
         }
         if creator and not prog.get("dev_done"):
-            if not _can_charge(1, ts):
-                return pending()
-            dev = _dev_history(creator, mint, now=ts)
-            prog["dev"] = {
-                "dev_prior_launches": dev.get("dev_prior_launches"),
-                "dev_prior_rugs": dev.get("dev_prior_rugs"),
-                "prior_mints": (dev.get("prior_mints") or [])[:8],
-            }
-            prog["dev_done"] = True
+            cached = _dev_cache.get(creator)
+            if cached is not None:
+                dev = dict(cached)
+                prog["dev"] = _compact_dev(dev)
+                prog["dev_done"] = True
+            else:
+                dev = _dev_history(
+                    creator, mint, now=ts,
+                    recs=tx_recs, sigs=prog.get("creator_sigs"),
+                )
+                prog["dev"] = _compact_dev(dev)
+                if dev.get("dev_prior_launches") is None:
+                    log.warning(
+                        "young_trail_rugrisk dev history unknown mint=%s",
+                        (mint or "")[:12],
+                    )
+                    # Do not mark done: retry when budget recovers.
+                    if not _can_charge(1, ts):
+                        return pending()
+                else:
+                    prog["dev_done"] = True
         elif not creator:
             prog["dev_done"] = True
         dev = prog.get("dev") or dev
 
-        candidates = []
-        seen = set()
-        for b in buys:
-            if create_slot is not None and b.get("slot") == create_slot:
-                o = b.get("owner")
-                if o and o not in seen and str(o) not in creators:
-                    seen.add(o)
-                    candidates.append(o)
-        for h in top:
-            o = h.get("owner")
-            if o and o not in seen and str(o) not in creators:
-                seen.add(o)
-                candidates.append(o)
+        # Fresh-wallet share is diagnostic, not a skip rule. Reuse cache; do
+        # not spend RPC once sniper/bundled/dev are determined.
         fresh_owners = set(prog.get("fresh_owners") or [])
         checked_owners = list(prog.get("fresh_checked_owners") or [])
         checked_set = set(checked_owners)
-        for owner in candidates:
-            if owner in checked_set:
-                continue
-            if len(checked_owners) >= FRESH_WALLET_RPC_CAP:
-                break
-            if not _can_charge(1, ts):
-                prog["fresh_owners"] = sorted(fresh_owners)
-                prog["fresh_checked_owners"] = checked_owners
-                return pending()
-            try:
-                wsigs = [s for s in _signatures(owner, limit=WALLET_SIG_LIMIT, now=ts)
-                         if not s.get("err")]
-            except Exception as e:
-                log.warning("young_trail_rugrisk wallet sigs: %s", safe_err(e))
+        cap_fresh = max(0, int(FRESH_WALLET_RPC_CAP))
+        if cap_fresh > 0:
+            candidates = []
+            seen = set()
+            for b in buys:
+                if create_slot is not None and b.get("slot") == create_slot:
+                    o = b.get("owner")
+                    if o and o not in seen and str(o) not in creators:
+                        seen.add(o)
+                        candidates.append(o)
+            for h in top:
+                o = h.get("owner")
+                if o and o not in seen and str(o) not in creators:
+                    seen.add(o)
+                    candidates.append(o)
+            for owner in candidates:
+                if owner in checked_set:
+                    continue
+                cached_fresh = _wallet_fresh_cache.get(owner)
+                if cached_fresh is not None:
+                    checked_owners.append(owner)
+                    checked_set.add(owner)
+                    if cached_fresh:
+                        fresh_owners.add(owner)
+                    continue
+                if len(checked_owners) >= cap_fresh:
+                    break
+                if calls_used() >= TARGET_ENTRY_CALLS or not _can_charge(1, ts):
+                    break
+                try:
+                    wsigs = [s for s in _signatures(owner, limit=WALLET_SIG_LIMIT, now=ts)
+                             if not s.get("err")]
+                except Exception as e:
+                    log.warning("young_trail_rugrisk wallet sigs: %s", safe_err(e))
+                    checked_owners.append(owner)
+                    checked_set.add(owner)
+                    continue
+                is_fresh = len(wsigs) <= FRESH_MAX_SIGS
+                _wallet_fresh_cache[owner] = is_fresh
                 checked_owners.append(owner)
                 checked_set.add(owner)
-                continue
-            checked_owners.append(owner)
-            checked_set.add(owner)
-            if len(wsigs) <= FRESH_MAX_SIGS:
-                fresh_owners.add(owner)
+                if is_fresh:
+                    fresh_owners.add(owner)
         prog["fresh_owners"] = sorted(fresh_owners)
         prog["fresh_checked_owners"] = checked_owners
         prog["enrich_done"] = True
 
         sniper = sniper_share_from_buys(
-            buys, supply or 0.0, create_slot, sniper_slots(), exclude=creators,
+            buys, supply or 0.0, create_slot, sniper_slots(), exclude=exclude,
         )
         bundled = bundled_from_buys(
-            buys, create_slot, fresh_owners, exclude=creators,
+            buys, create_slot, fresh_owners, exclude=exclude,
         )
         fresh = fresh_holder_share(top, fresh_owners)
         dev_share = dev_initial_share_from_buys(
             buys, supply or 0.0, create_slot, creators,
         )
         used = calls_used()
+        compact_buys = _slim_sniper_buys(buys, create_slot, sniper_slots())
         features = {
             "status": STATUS_OK,
             "sniper_share": sniper["sniper_share"],
             "sniper_wallets": sniper["sniper_wallets"],
-            "sniper_slots": sniper_slots(),
+            "sniper_slots": sniper.get("sniper_slots", sniper_slots()),
+            "sniper_denominator": sniper.get("sniper_denominator") or supply,
+            "sniper_min_wallets": sniper_min_wallets(),
             "bundled": bundled["bundled"],
             "bundled_buys": bundled["bundled_buys"],
             "dev_wallet": creator or (next(iter(creators), None)),
@@ -1805,6 +2303,9 @@ def compute_features(mint: str, creator: str | None = None,
             "sig_pages": prog.get("sig_pages"),
             "sig_n": len(mint_sigs),
             "sniper_amount": sniper.get("sniper_amount"),
+            "sniper_denominator": sniper.get("sniper_denominator") or supply,
+            "sniper_min_wallets": sniper_min_wallets(),
+            "sniper_slots": sniper.get("sniper_slots", sniper_slots()),
             "create_slot_buyers": bundled.get("create_slot_buyers"),
             "create_slot_fresh": bundled.get("create_slot_fresh"),
             "creators": sorted(creators),
@@ -1815,6 +2316,9 @@ def compute_features(mint: str, creator: str | None = None,
             "calls_used": used,
             "create_sig": create_sig,
             "window_src": prog.get("window_src"),
+            "supply": supply,
+            "buys": compact_buys,
+            "sniper_v2": SNIPER_V2_OK,
         }
         return features
     except Exception as e:
@@ -1920,7 +2424,8 @@ def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
              fresh_holder_share = ?, top_holder_n = ?,
              skip_snipers = ?, skip_bundled = ?, skip_dev_rugs = ?,
              features_json = ?, error = ?, source = ?, computed_ts = ?,
-             dev_initial_share = ?
+             dev_initial_share = ?,
+             sniper_denominator = ?, sniper_min_wallets = ?
            WHERE tid = ?""",
         (
             feat.get("status") or STATUS_ERROR,
@@ -1934,7 +2439,9 @@ def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
             None if flags["skip_bundled"] is None else int(flags["skip_bundled"]),
             None if flags["skip_dev_rugs"] is None else int(flags["skip_dev_rugs"]),
             extra_s, err, source, float(now),
-            feat.get("dev_initial_share"), tid,
+            feat.get("dev_initial_share"),
+            feat.get("sniper_denominator"), feat.get("sniper_min_wallets"),
+            tid,
         ),
     )
     db.commit()
@@ -1958,10 +2465,68 @@ def _progress_from_row(row) -> dict | None:
     return dict(prog) if isinstance(prog, dict) else None
 
 
+def _is_sniper_v2_row(row) -> bool:
+    try:
+        src = row["source"]
+    except Exception:
+        src = None
+    if src == SOURCE_SNIPER_V2:
+        return True
+    try:
+        extra = _parse_features_blob(row["features_json"])
+    except Exception:
+        extra = {}
+    return extra.get("sniper_v2") == SNIPER_V2_NEEDS
+
+
+def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int,
+                        overnight: bool = False):
+    """Newest-first, ~half new-this-tick and ~half backlog so the queue drains.
+
+    sniper_v2 requeue rows are overnight-only and behind new entries.
+    """
+    cap = max(0, int(cap))
+    if cap <= 0:
+        return []
+    pset = set(priority_tids or [])
+    newest_new = []
+    newest_old = []
+    sniper_v2 = []
+    seen: set[str] = set()
+    for row in rows:
+        tid = row["tid"]
+        if tid in seen:
+            continue
+        seen.add(tid)
+        if tid in pset:
+            newest_new.append(row)
+        elif _is_sniper_v2_row(row):
+            if overnight:
+                sniper_v2.append(row)
+        else:
+            newest_old.append(row)
+    take_new = min(len(newest_new), (cap + 1) // 2)
+    take_old = min(len(newest_old), cap - take_new)
+    leftover = cap - take_new - take_old
+    if leftover and len(newest_new) > take_new:
+        extra = min(leftover, len(newest_new) - take_new)
+        take_new += extra
+        leftover -= extra
+    if leftover and len(newest_old) > take_old:
+        extra = min(leftover, len(newest_old) - take_old)
+        take_old += extra
+        leftover -= extra
+    take_v2 = min(len(sniper_v2), leftover) if overnight else 0
+    return (
+        newest_new[:take_new] + newest_old[:take_old] + sniper_v2[:take_v2]
+    )
+
+
 def compute_pending(now: float | None = None, limit: int | None = None,
                     source: str = "live",
-                    priority_tids: list[str] | None = None) -> int:
-    """Compute features for pending Solana rows. Newest and new-this-tick first."""
+                    priority_tids: list[str] | None = None,
+                    include_sniper_v2: bool | None = None) -> int:
+    """Compute features for pending Solana rows. Newest, fair-shared with new tids."""
     ts = current_time() if now is None else float(now)
     n = 0
     try:
@@ -1973,21 +2538,15 @@ def compute_pending(now: float | None = None, limit: int | None = None,
                WHERE status = 'pending'
                ORDER BY entry_ts DESC""",
         ).fetchall()
-        ordered = []
-        seen: set[str] = set()
-        for tid in priority_tids or []:
-            for row in rows:
-                if row["tid"] == tid and tid not in seen:
-                    ordered.append(row)
-                    seen.add(tid)
-                    break
-        for row in rows:
-            if row["tid"] not in seen:
-                ordered.append(row)
-                seen.add(row["tid"])
-        cap = limit if limit is not None else (8 if is_overnight(ts) else 2)
-        for row in ordered[: max(0, cap)]:
-            need = 1 if _progress_from_row(row) else 4
+        cap = limit if limit is not None else tick_entry_cap(ts)
+        allow_v2 = is_overnight(ts) if include_sniper_v2 is None else bool(
+            include_sniper_v2
+        )
+        ordered = _fair_share_pending(
+            rows, priority_tids, cap, overnight=allow_v2,
+        )
+        for row in ordered:
+            need = 1 if _progress_from_row(row) else START_CALLS
             if not _can_charge(need, ts):
                 break
             tid = row["tid"]
@@ -2006,6 +2565,40 @@ def compute_pending(now: float | None = None, limit: int | None = None,
     return n
 
 
+def requeue_sniper_v2_rows(now: float | None = None, force: bool = False) -> int:
+    """Overnight: mark needs_recompute ok rows pending. No RPC."""
+    ts = current_time() if now is None else float(now)
+    if not force and not is_overnight(ts):
+        return 0
+    n = 0
+    try:
+        db = _connect()
+        rows = db.execute(
+            "SELECT tid, features_json, status FROM young_trail_rugrisk "
+            "WHERE status = 'ok'"
+        ).fetchall()
+        for raw in rows:
+            extra = _parse_features_blob(raw["features_json"])
+            if extra.get("sniper_v2") != SNIPER_V2_NEEDS:
+                continue
+            db.execute(
+                """UPDATE young_trail_rugrisk SET
+                     status = 'pending',
+                     sniper_share = NULL, skip_snipers = NULL,
+                     error = NULL, computed_ts = NULL,
+                     source = ?
+                   WHERE tid = ? AND status = 'ok'""",
+                (SOURCE_SNIPER_V2, raw["tid"]),
+            )
+            n += 1
+        db.commit()
+        if n:
+            log.info("young_trail_rugrisk sniper_v2 requeue n=%d paper=1", n)
+    except Exception as e:
+        log.warning("young_trail_rugrisk sniper_v2 requeue: %s", safe_err(e))
+    return n
+
+
 def backfill_pending(now: float | None = None, limit: int | None = None,
                      force: bool = False) -> int:
     """Overnight (or CLI) backfill of existing pending entries. Budget-limited."""
@@ -2017,8 +2610,11 @@ def backfill_pending(now: float | None = None, limit: int | None = None,
     if not force and not is_overnight(ts):
         return 0
     sync_entries(ts)
+    requeue_sniper_v2_rows(now=ts, force=force)
     cap = limit if limit is not None else 12
-    n = compute_pending(now=ts, limit=cap, source="backfill")
+    n = compute_pending(
+        now=ts, limit=cap, source="backfill", include_sniper_v2=True,
+    )
     if n:
         log.info("young_trail_rugrisk backfill n=%d paper=1", n)
     return n
@@ -2040,7 +2636,9 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
         n = sync_entries(ts)
         new_tids = list(_last_new_tids)
         overnight = is_overnight(ts)
-        cap = 8 if overnight else 2
+        if overnight:
+            requeue_sniper_v2_rows(now=ts)
+        cap = tick_entry_cap(ts)
         src = "live"
         computed = compute_pending(
             now=ts, limit=cap, source=src, priority_tids=new_tids,
@@ -2135,13 +2733,15 @@ def _summary() -> dict:
         n_ok = sum(1 for r in rows if r.get("status") == STATUS_OK)
         n_na = sum(1 for r in rows if r.get("status") == STATUS_NA)
         n_pending = sum(1 for r in rows if r.get("status") == STATUS_PENDING)
-        n_err = sum(1 for r in rows if r.get("status") in (STATUS_ERROR, STATUS_UNAVAILABLE))
+        n_err = sum(1 for r in rows if r.get("status") == STATUS_ERROR)
+        n_unavail = sum(1 for r in rows if r.get("status") == STATUS_UNAVAILABLE)
         return {
             "n": len(rows),
             "ok": n_ok,
             "n_a": n_na,
             "pending": n_pending,
             "error": n_err,
+            "unavailable": n_unavail,
             "would_skip_snipers": sum(1 for r in rows if r.get("skip_snipers") == 1),
             "would_skip_bundled": sum(1 for r in rows if r.get("skip_bundled") == 1),
             "would_skip_dev_rugs": sum(1 for r in rows if r.get("skip_dev_rugs") == 1),
@@ -2150,6 +2750,7 @@ def _summary() -> dict:
         log.warning("young_trail_rugrisk summary: %s", safe_err(e))
         return {
             "n": 0, "ok": 0, "n_a": 0, "pending": 0, "error": 0,
+            "unavailable": 0,
             "would_skip_snipers": 0, "would_skip_bundled": 0,
             "would_skip_dev_rugs": 0,
         }
@@ -2185,6 +2786,8 @@ def ops_payload() -> dict:
                     "id": r["id"], "label": r["label"],
                     "threshold": r["threshold"] if r["id"] != RULE_SNIPERS
                     else sniper_skip_pct(),
+                    **({"min_wallets": sniper_min_wallets()}
+                       if r["id"] == RULE_SNIPERS else {}),
                 }
                 for r in SKIP_RULES
             ],
