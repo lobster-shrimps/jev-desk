@@ -86,6 +86,10 @@ STATUS_PENDING = "pending"
 STATUS_ERROR = "error"
 STATUS_UNAVAILABLE = "unavailable"
 STATUS_BUDGET = "budget"
+SOURCE_SNIPER_V2 = "sniper_v2"
+SNIPER_V2_OK = "ok"
+SNIPER_V2_NEEDS = "needs_recompute"
+META_SNIPER_V2 = "sniper_v2_invalidate"
 
 RULE_SNIPERS = "snipers_gt_30"
 RULE_BUNDLED = "bundled"
@@ -298,10 +302,15 @@ def _reset_truncated_rows(conn: sqlite3.Connection) -> None:
 
 
 def _backfill_sniper_v2(conn: sqlite3.Connection) -> None:
-    """Recompute skip_snipers on ok rows from cached buys / wallet counts. No RPC."""
+    """Recompute sniper share from cached buys+supply only. No RPC.
+
+    Rows without buys or total supply keep status=ok but sniper_share and
+    skip_snipers are NULLed and stamped sniper_v2=needs_recompute (unknown
+    in the counterfactual). They are re-queued overnight, not here.
+    """
     row = conn.execute(
         "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
-        ("sniper_share_v2",),
+        (META_SNIPER_V2,),
     ).fetchone()
     if row and str(row["value"]) == "1":
         return
@@ -317,11 +326,14 @@ def _backfill_sniper_v2(conn: sqlite3.Connection) -> None:
             updated = recompute_sniper_from_cached(d)
             if not updated:
                 continue
+            extra = updated.get("features_json")
+            extra_s = json.dumps(extra) if extra is not None else d.get("features_json")
+            skip = updated.get("skip_snipers")
             conn.execute(
                 """UPDATE young_trail_rugrisk SET
                      sniper_share = ?, sniper_wallets = ?, sniper_slots = ?,
                      sniper_denominator = ?, sniper_min_wallets = ?,
-                     skip_snipers = ?
+                     skip_snipers = ?, features_json = ?
                    WHERE tid = ?""",
                 (
                     updated.get("sniper_share"),
@@ -329,8 +341,8 @@ def _backfill_sniper_v2(conn: sqlite3.Connection) -> None:
                     updated.get("sniper_slots"),
                     updated.get("sniper_denominator"),
                     updated.get("sniper_min_wallets"),
-                    None if updated.get("skip_snipers") is None
-                    else int(bool(updated.get("skip_snipers"))),
+                    None if skip is None else int(bool(skip)),
+                    extra_s,
                     d["tid"],
                 ),
             )
@@ -340,7 +352,7 @@ def _backfill_sniper_v2(conn: sqlite3.Connection) -> None:
     conn.execute(
         """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-        ("sniper_share_v2", "1"),
+        (META_SNIPER_V2, "1"),
     )
 
 
@@ -827,20 +839,54 @@ def sniper_share_from_buys(buys: list[dict], supply: float, create_slot: int,
     }
 
 
+def _parse_features_blob(raw) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            blob = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return dict(blob) if isinstance(blob, dict) else {}
+    return {}
+
+
+def _slim_sniper_buys(buys: list | None, create_slot, n_slots: int) -> list[dict]:
+    """Compact {owner, delta, slot} for the sniper window only."""
+    if create_slot is None:
+        return []
+    end = int(create_slot) + max(0, int(n_slots))
+    out: list[dict] = []
+    for b in buys or []:
+        if not isinstance(b, dict):
+            continue
+        slot = b.get("slot")
+        owner = b.get("owner")
+        delta = _num(b.get("delta"), 0.0) or 0.0
+        if not owner or slot is None or delta <= 0:
+            continue
+        if int(create_slot) <= int(slot) <= end:
+            out.append({
+                "owner": str(owner), "delta": float(delta), "slot": int(slot),
+            })
+        if len(out) >= 40:
+            break
+    return out
+
+
 def recompute_sniper_from_cached(row: dict) -> dict | None:
-    """Rebuild sniper share / skip from stored buys or wallet count. No RPC."""
+    """Rebuild sniper share from stored buys + total supply. No RPC.
+
+    Without both, the old window-relative share is discarded (NULL share /
+    NULL skip) and stamped needs_recompute so the comparison counts unknown.
+    """
     if not row or row.get("status") not in (STATUS_OK, None):
         if row and row.get("status") != STATUS_OK:
             return None
-    extra = row.get("features_json")
-    if isinstance(extra, str):
-        try:
-            extra = json.loads(extra)
-        except (TypeError, ValueError):
-            extra = None
-    if not isinstance(extra, dict):
-        extra = {}
+    extra = _parse_features_blob(row.get("features_json"))
     buys = extra.get("buys")
+    if not isinstance(buys, list) or not buys:
+        buys = None
     supply = (
         _num(row.get("sniper_denominator"))
         or _num(extra.get("sniper_denominator"))
@@ -855,30 +901,39 @@ def recompute_sniper_from_cached(row: dict) -> dict | None:
         n_slots = extra.get("sniper_slots")
     if n_slots is None:
         n_slots = sniper_slots()
+    n_slots = int(n_slots)
     creators = extra.get("creators") or []
     mint, _net = parse_tid(row.get("tid"))
     min_w = sniper_min_wallets()
     out = dict(row)
     out["sniper_min_wallets"] = min_w
-    out["sniper_slots"] = int(n_slots)
-    if buys and supply and create_slot is not None:
+    out["sniper_slots"] = n_slots
+    out["status"] = row.get("status") or STATUS_OK
+    if buys and supply and supply > 0 and create_slot is not None:
         exclude = sniper_exclude_owners(mint, creators, extra.get("holders"))
         sn = sniper_share_from_buys(
-            buys, float(supply), int(create_slot), int(n_slots), exclude=exclude,
+            buys, float(supply), int(create_slot), n_slots, exclude=exclude,
         )
         out.update(sn)
-        out["status"] = row.get("status") or STATUS_OK
+        extra["buys"] = _slim_sniper_buys(buys, create_slot, n_slots)
+        extra["supply"] = float(supply)
+        extra["sniper_denominator"] = sn.get("sniper_denominator") or float(supply)
+        extra["sniper_slots"] = n_slots
+        extra["sniper_min_wallets"] = min_w
+        extra["sniper_v2"] = SNIPER_V2_OK
+        extra["create_slot"] = int(create_slot)
+        out["features_json"] = extra
         out.update(skip_flags(out))
         return out
-    wallets = row.get("sniper_wallets")
-    if wallets is None:
-        wallets = extra.get("sniper_wallets")
-    if wallets is None:
-        return None
-    out["sniper_wallets"] = int(wallets)
-    out["sniper_denominator"] = float(supply) if supply else None
-    out["status"] = row.get("status") or STATUS_OK
-    out.update(skip_flags(out))
+    extra["sniper_v2"] = SNIPER_V2_NEEDS
+    extra.pop("sniper_share", None)
+    out["sniper_share"] = None
+    out["sniper_denominator"] = None
+    out["skip_snipers"] = None
+    out["features_json"] = extra
+    flags = skip_flags(out)
+    flags["skip_snipers"] = None
+    out.update(flags)
     return out
 
 
@@ -2219,11 +2274,7 @@ def compute_features(mint: str, creator: str | None = None,
             buys, supply or 0.0, create_slot, creators,
         )
         used = calls_used()
-        compact_buys = [
-            {"owner": b.get("owner"), "delta": b.get("delta"), "slot": b.get("slot")}
-            for b in buys[:40]
-            if b.get("owner")
-        ]
+        compact_buys = _slim_sniper_buys(buys, create_slot, sniper_slots())
         features = {
             "status": STATUS_OK,
             "sniper_share": sniper["sniper_share"],
@@ -2265,7 +2316,9 @@ def compute_features(mint: str, creator: str | None = None,
             "calls_used": used,
             "create_sig": create_sig,
             "window_src": prog.get("window_src"),
+            "supply": supply,
             "buys": compact_buys,
+            "sniper_v2": SNIPER_V2_OK,
         }
         return features
     except Exception as e:
@@ -2412,14 +2465,33 @@ def _progress_from_row(row) -> dict | None:
     return dict(prog) if isinstance(prog, dict) else None
 
 
-def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int):
-    """Newest-first, ~half new-this-tick and ~half backlog so the queue drains."""
+def _is_sniper_v2_row(row) -> bool:
+    try:
+        src = row["source"]
+    except Exception:
+        src = None
+    if src == SOURCE_SNIPER_V2:
+        return True
+    try:
+        extra = _parse_features_blob(row["features_json"])
+    except Exception:
+        extra = {}
+    return extra.get("sniper_v2") == SNIPER_V2_NEEDS
+
+
+def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int,
+                        overnight: bool = False):
+    """Newest-first, ~half new-this-tick and ~half backlog so the queue drains.
+
+    sniper_v2 requeue rows are overnight-only and behind new entries.
+    """
     cap = max(0, int(cap))
     if cap <= 0:
         return []
     pset = set(priority_tids or [])
     newest_new = []
     newest_old = []
+    sniper_v2 = []
     seen: set[str] = set()
     for row in rows:
         tid = row["tid"]
@@ -2428,6 +2500,9 @@ def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int):
         seen.add(tid)
         if tid in pset:
             newest_new.append(row)
+        elif _is_sniper_v2_row(row):
+            if overnight:
+                sniper_v2.append(row)
         else:
             newest_old.append(row)
     take_new = min(len(newest_new), (cap + 1) // 2)
@@ -2438,13 +2513,19 @@ def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int):
         take_new += extra
         leftover -= extra
     if leftover and len(newest_old) > take_old:
-        take_old += min(leftover, len(newest_old) - take_old)
-    return newest_new[:take_new] + newest_old[:take_old]
+        extra = min(leftover, len(newest_old) - take_old)
+        take_old += extra
+        leftover -= extra
+    take_v2 = min(len(sniper_v2), leftover) if overnight else 0
+    return (
+        newest_new[:take_new] + newest_old[:take_old] + sniper_v2[:take_v2]
+    )
 
 
 def compute_pending(now: float | None = None, limit: int | None = None,
                     source: str = "live",
-                    priority_tids: list[str] | None = None) -> int:
+                    priority_tids: list[str] | None = None,
+                    include_sniper_v2: bool | None = None) -> int:
     """Compute features for pending Solana rows. Newest, fair-shared with new tids."""
     ts = current_time() if now is None else float(now)
     n = 0
@@ -2458,7 +2539,12 @@ def compute_pending(now: float | None = None, limit: int | None = None,
                ORDER BY entry_ts DESC""",
         ).fetchall()
         cap = limit if limit is not None else tick_entry_cap(ts)
-        ordered = _fair_share_pending(rows, priority_tids, cap)
+        allow_v2 = is_overnight(ts) if include_sniper_v2 is None else bool(
+            include_sniper_v2
+        )
+        ordered = _fair_share_pending(
+            rows, priority_tids, cap, overnight=allow_v2,
+        )
         for row in ordered:
             need = 1 if _progress_from_row(row) else START_CALLS
             if not _can_charge(need, ts):
@@ -2479,6 +2565,40 @@ def compute_pending(now: float | None = None, limit: int | None = None,
     return n
 
 
+def requeue_sniper_v2_rows(now: float | None = None, force: bool = False) -> int:
+    """Overnight: mark needs_recompute ok rows pending. No RPC."""
+    ts = current_time() if now is None else float(now)
+    if not force and not is_overnight(ts):
+        return 0
+    n = 0
+    try:
+        db = _connect()
+        rows = db.execute(
+            "SELECT tid, features_json, status FROM young_trail_rugrisk "
+            "WHERE status = 'ok'"
+        ).fetchall()
+        for raw in rows:
+            extra = _parse_features_blob(raw["features_json"])
+            if extra.get("sniper_v2") != SNIPER_V2_NEEDS:
+                continue
+            db.execute(
+                """UPDATE young_trail_rugrisk SET
+                     status = 'pending',
+                     sniper_share = NULL, skip_snipers = NULL,
+                     error = NULL, computed_ts = NULL,
+                     source = ?
+                   WHERE tid = ? AND status = 'ok'""",
+                (SOURCE_SNIPER_V2, raw["tid"]),
+            )
+            n += 1
+        db.commit()
+        if n:
+            log.info("young_trail_rugrisk sniper_v2 requeue n=%d paper=1", n)
+    except Exception as e:
+        log.warning("young_trail_rugrisk sniper_v2 requeue: %s", safe_err(e))
+    return n
+
+
 def backfill_pending(now: float | None = None, limit: int | None = None,
                      force: bool = False) -> int:
     """Overnight (or CLI) backfill of existing pending entries. Budget-limited."""
@@ -2490,8 +2610,11 @@ def backfill_pending(now: float | None = None, limit: int | None = None,
     if not force and not is_overnight(ts):
         return 0
     sync_entries(ts)
+    requeue_sniper_v2_rows(now=ts, force=force)
     cap = limit if limit is not None else 12
-    n = compute_pending(now=ts, limit=cap, source="backfill")
+    n = compute_pending(
+        now=ts, limit=cap, source="backfill", include_sniper_v2=True,
+    )
     if n:
         log.info("young_trail_rugrisk backfill n=%d paper=1", n)
     return n
@@ -2513,6 +2636,8 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
         n = sync_entries(ts)
         new_tids = list(_last_new_tids)
         overnight = is_overnight(ts)
+        if overnight:
+            requeue_sniper_v2_rows(now=ts)
         cap = tick_entry_cap(ts)
         src = "live"
         computed = compute_pending(

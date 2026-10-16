@@ -372,9 +372,16 @@ def test_compute_features_mocked_rpc(ytr):
     assert feat["dev_prior_launches"] == 1
     assert feat["dev_prior_rugs"] == 1
     assert feat["skip_dev_rugs"] is True
-    used = (feat.get("features_json") or {}).get("calls_used", 0)
+    extra = feat.get("features_json") or {}
+    used = extra.get("calls_used", 0)
     assert used >= 4
     assert used <= rug.TARGET_ENTRY_CALLS
+    assert extra.get("supply") == pytest.approx(1000.0)
+    assert extra.get("sniper_denominator") == pytest.approx(1000.0)
+    assert extra.get("sniper_v2") == "ok"
+    assert extra.get("buys")
+    for b in extra["buys"]:
+        assert set(b.keys()) == {"owner", "delta", "slot"}
 
 
 def test_non_solana_is_na_no_rpc(ytr):
@@ -1312,12 +1319,14 @@ def test_recompute_sniper_from_cached_no_rpc():
     assert out["sniper_wallets"] == 2
     assert out["sniper_denominator"] == pytest.approx(1000.0)
     assert out["skip_snipers"] is False
-    cheap = r.recompute_sniper_from_cached({
-        "tid": TID, "status": "ok",
-        "sniper_share": 0.50, "sniper_wallets": 2,
-    })
-    assert cheap["skip_snipers"] is False
-    assert cheap["sniper_min_wallets"] == r.SNIPER_MIN_WALLETS
+    extra = out.get("features_json") or {}
+    assert extra.get("sniper_v2") == "ok"
+    assert extra.get("supply") == pytest.approx(1000.0)
+    live = r.sniper_share_from_buys(
+        extra["buys"], 1000.0, CREATE_SLOT, 32, exclude={DEV},
+    )
+    assert out["sniper_share"] == pytest.approx(live["sniper_share"])
+    assert out["sniper_wallets"] == live["sniper_wallets"]
 
 
 def test_add_column_pragma_before_alter():
@@ -1383,3 +1392,180 @@ def test_dev_history_logs_budget_skip(ytr, caplog):
     assert out["dev_prior_launches"] is None
     assert "skipped budget" in caplog.text
     assert "SUPERSECRET" not in caplog.text
+
+
+def _legacy_ok_features(**extra):
+    blob = {
+        "create_slot": CREATE_SLOT,
+        "sniper_amount": 416.0,
+        "creators": [DEV],
+        "calls_used": 17,
+    }
+    blob.update(extra)
+    return json.dumps(blob)
+
+
+def test_legacy_ok_without_buys_or_supply_is_unknown(ytr):
+    """No stored buys/supply: do not keep the old share or wallet-count skip."""
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = ?",
+        (rug.META_SNIPER_V2,),
+    )
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             sniper_share, sniper_wallets, sniper_slots, skip_snipers,
+             bundled, skip_bundled, features_json, source
+           ) VALUES (?, 'RRK', 'solana', ?, 1.0, 'ok',
+                      0.416, 4, 32, 1, 0, 0, ?, 'live')""",
+        (TID, T0, _legacy_ok_features()),
+    )
+    db.commit()
+    out = rug.recompute_sniper_from_cached(rug.all_rows()[0])
+    assert out["sniper_share"] is None
+    assert out["skip_snipers"] is None
+    assert (out.get("features_json") or {}).get("sniper_v2") == "needs_recompute"
+    assert rug.would_skip(out, "snipers_gt_30") is None
+
+
+def test_recompute_with_buys_matches_live_path(ytr):
+    _yt, helius, rug = ytr
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    helius.note_creator(TID, DEV, now=T0)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "ok"
+    extra = feat.get("features_json") or {}
+    assert extra.get("supply") is not None
+    assert extra.get("buys")
+    row = {
+        "tid": TID, "status": "ok",
+        "sniper_share": feat["sniper_share"],
+        "sniper_wallets": feat["sniper_wallets"],
+        "sniper_slots": feat["sniper_slots"],
+        "features_json": extra,
+    }
+    out = rug.recompute_sniper_from_cached(row)
+    assert out["sniper_share"] == pytest.approx(feat["sniper_share"])
+    assert out["sniper_wallets"] == feat["sniper_wallets"]
+    assert out["skip_snipers"] == feat["skip_snipers"]
+    assert out["sniper_denominator"] == pytest.approx(feat["sniper_denominator"])
+    live = rug.sniper_share_from_buys(
+        extra["buys"], extra["supply"], extra["create_slot"],
+        extra.get("sniper_slots") or rug.sniper_slots(),
+        exclude=rug.sniper_exclude_owners(
+            MINT, extra.get("creators"), extra.get("holders"),
+        ),
+    )
+    assert out["sniper_share"] == pytest.approx(live["sniper_share"])
+    assert out["sniper_wallets"] == live["sniper_wallets"]
+
+
+def test_sniper_v2_backfill_makes_zero_rpc_calls(ytr):
+    _yt, _helius, rug = ytr
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = ?",
+        (rug.META_SNIPER_V2,),
+    )
+    other = "OtherMintSniperV21111111111111111111:1399811149"
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             sniper_share, sniper_wallets, skip_snipers, features_json, source
+           ) VALUES (?, 'LEG', 'solana', ?, 1.0, 'ok', 0.50, 4, 1, ?, 'live')""",
+        (TID, T0, _legacy_ok_features()),
+    )
+    cached = {
+        "buys": [
+            {"owner": S1, "delta": 200, "slot": CREATE_SLOT},
+            {"owner": S2, "delta": 200, "slot": CREATE_SLOT},
+            {"owner": S3, "delta": 100, "slot": CREATE_SLOT},
+            {"owner": S4, "delta": 50, "slot": CREATE_SLOT},
+        ],
+        "supply": 1000.0, "create_slot": CREATE_SLOT, "creators": [DEV],
+    }
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             sniper_share, sniper_wallets, skip_snipers, features_json, source
+           ) VALUES (?, 'CACHED', 'solana', ?, 1.0, 'ok', 0.99, 9, 1, ?, 'live')""",
+        (other, T0, json.dumps(cached)),
+    )
+    db.commit()
+    n_before = len(rpc.calls)
+    rug._backfill_sniper_v2(db)
+    db.commit()
+    assert len(rpc.calls) == n_before
+    rows = {r["tid"]: r for r in rug.all_rows()}
+    assert rows[TID]["status"] == "ok"
+    assert rows[TID]["sniper_share"] is None
+    assert rows[TID]["skip_snipers"] is None
+    blob = _feat_json(rows[TID])
+    assert blob.get("sniper_v2") == "needs_recompute"
+    assert rows[other]["sniper_share"] == pytest.approx(0.55)
+    assert rows[other]["skip_snipers"] == 1
+    assert _feat_json(rows[other]).get("sniper_v2") == "ok"
+    assert _feat_json(rows[other]).get("supply") == pytest.approx(1000.0)
+
+
+def test_sniper_v2_requeue_overnight_only_lower_than_new(ytr):
+    yt, helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             sniper_share, skip_snipers, features_json, source
+           ) VALUES (?, 'LEG', 'solana', ?, 1.0, 'ok', NULL, NULL, ?, 'live')""",
+        (TID, T0 - 60, _legacy_ok_features(sniper_v2="needs_recompute")),
+    )
+    db.commit()
+    rug.set_overnight_fn(lambda _n: False)
+    assert rug.requeue_sniper_v2_rows(now=T0) == 0
+    assert rug.all_rows()[0]["status"] == "ok"
+    rug.set_overnight_fn(lambda _n: True)
+    n = rug.requeue_sniper_v2_rows(now=T0)
+    assert n == 1
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["status"] == "pending"
+    assert row["source"] == "sniper_v2"
+    assert row["sniper_share"] is None
+    assert row["skip_snipers"] is None
+    rug.set_overnight_fn(lambda _n: False)
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    n_calls = len(rpc.calls)
+    assert rug.compute_pending(now=T0, limit=8) == 0
+    assert len(rpc.calls) == n_calls
+    assert {r["tid"]: r for r in rug.all_rows()}[TID]["status"] == "pending"
+
+    old_tid = "OldPendingRugRisk11111111111111111:1399811149"
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, source
+           ) VALUES (?, 'OLD', 'solana', ?, 1.0, 'pending', 'sync')""",
+        (old_tid, T0 - 3600),
+    )
+    db.commit()
+    new_row = {"tid": "new:1"}
+    v2_row = {"tid": TID, "source": "sniper_v2",
+              "features_json": json.dumps({"sniper_v2": "needs_recompute"})}
+    old_row = {"tid": old_tid, "source": "sync", "features_json": None}
+    day = rug._fair_share_pending(
+        [new_row, v2_row, old_row], ["new:1"], 2, overnight=False,
+    )
+    assert [x["tid"] for x in day] == ["new:1", old_tid]
+    night = rug._fair_share_pending(
+        [new_row, v2_row, old_row], ["new:1"], 2, overnight=True,
+    )
+    assert [x["tid"] for x in night] == ["new:1", old_tid]
+    leftover = rug._fair_share_pending(
+        [v2_row], [], 2, overnight=True,
+    )
+    assert [x["tid"] for x in leftover] == [TID]
