@@ -191,7 +191,9 @@ class Desk:
             "cycle": {
                 "seen": stats.get("seen", 0),
                 "benched": stats.get("benched", 0),
-                "judged": stats.get("judged", 0),
+                "judged": stats.get("soft_judged", stats.get("judged", 0)),
+                "soft_judged": stats.get("soft_judged", stats.get("judged", 0)),
+                "pick_judged": stats.get("pick_judged", 0),
                 "requeued": stats.get("requeued", 0),
                 "killed": kill_histograms,
                 "outcome": outcome,

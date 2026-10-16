@@ -889,13 +889,15 @@ def test_write_state_held_position():
     assert state["cycle"]["error"] is None
 
 
-def test_api_state_returns_file():
+def test_api_state_returns_file(tmp_path, monkeypatch):
     """GET /api/state should return the state.json file."""
     import os
     os.environ.setdefault("DESK_SECRET", "test-secret-for-ops-panel-test")
     os.environ.setdefault("JUDGE_MOCK", "1")
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
     
     import desk as desk_mod
+    monkeypatch.setattr(desk_mod, "OUTBOX", tmp_path)
     desk = desk_mod.Desk()
     stats = {
         "seen": 10,
@@ -920,14 +922,16 @@ def test_api_state_returns_file():
     assert data["cycle"]["seen"] == 10
 
 
-def test_api_state_404_when_missing():
+def test_api_state_404_when_missing(tmp_path, monkeypatch):
     """GET /api/state should return 404 with demo:false when state.json doesn't exist."""
     import os
     os.environ.setdefault("DESK_SECRET", "test-secret-for-ops-panel-test")
     os.environ.setdefault("JUDGE_MOCK", "1")
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
     
-    import pathlib
-    state_path = pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox")) / "state.json"
+    import desk as desk_mod
+    monkeypatch.setattr(desk_mod, "OUTBOX", tmp_path)
+    state_path = tmp_path / "state.json"
     if state_path.exists():
         state_path.unlink()
     

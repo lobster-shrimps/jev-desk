@@ -125,6 +125,9 @@ def test_ops_summary_shape_and_no_secrets(ops, monkeypatch):
     assert payload["health"]["ops"]["loaded"] is True
     assert payload["health"]["mode"] == "shadow"
     assert payload["health"]["judge_mode"] == "mock"
+    assert payload["health"]["soft_judged"] == 0
+    assert payload["health"]["pick_judged"] == 0
+    assert payload["health"]["fomo_auth_down"] is False
     assert payload["health"]["cycles_24h"] == 2
     assert payload["health"]["shadow_24h"] == 1
     assert payload["health"]["no_trade_24h"] == 1

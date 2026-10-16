@@ -273,6 +273,11 @@ def _health(now: float, cycles_24h: int, no_trade_24h: int, shadow_24h: int,
         },
         "last_traceback": log_bits.get("last_tb"),
         "fomo_bearer_ok": bearer_ok,
+        "fomo_auth_down": bool(fomo.get("auth_down")),
+        "fomo_consecutive_auth_failures": int(fomo.get("consecutive_auth_failures") or 0),
+        "soft_judged": (last_cycle.get("soft_judged", last_cycle.get("judged"))
+                        if last_cycle else None),
+        "pick_judged": (last_cycle.get("pick_judged") if last_cycle else None),
     }
 
 
@@ -674,6 +679,10 @@ def _empty_payload(now: float, extra: dict | None = None) -> dict:
             "tracebacks_24h": {"run_log": 0, "uvicorn_log": 0},
             "last_traceback": None,
             "fomo_bearer_ok": False,
+            "fomo_auth_down": False,
+            "fomo_consecutive_auth_failures": 0,
+            "soft_judged": None,
+            "pick_judged": None,
         },
         "judge_hi": [],
         "outcomes": {

@@ -835,3 +835,210 @@ def test_csrf_protection_on_fomo_activate(monkeypatch):
     response = client.post("/api/fomo_activate", headers={"X-Ops-Action": "activate-fomo"})
     # May be 500 if CDP not reachable, but shouldn't be 403
     assert response.status_code in (200, 500)
+
+
+def _jwt(exp: float, secret: str = "sig") -> str:
+    """Unsigned JWT with only an exp claim. Tests never log this."""
+    import base64
+    import json
+
+    def b64(obj):
+        raw = json.dumps(obj, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    return f"{b64({'alg': 'none'})}.{b64({'exp': int(exp)})}.{secret}"
+
+
+class _Resp:
+    def __init__(self, code, body=None):
+        self.status_code = code
+        self._body = body if body is not None else {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code}")
+
+    def json(self):
+        return self._body
+
+
+def test_jwt_exp_triggers_early_refresh(monkeypatch):
+    import fomo_api
+    now = [1_700_000_000.0]
+    fomo_api.set_time_fn(lambda: now[0])
+    fomo_api.set_sleep_fn(lambda s: None)
+    try:
+        chrome = _jwt(now[0] + 3600, secret="chrome")
+        calls = []
+
+        def fake_chrome(self):
+            calls.append(1)
+            return chrome
+
+        monkeypatch.setattr(fomo_api.Fomo, "_from_chrome", fake_chrome)
+        fresh = _jwt(now[0] + 600, secret="fresh")
+        fomo = fomo_api.Fomo(bearer=fresh)
+        fomo._fetched_at = now[0] - 100
+        assert fomo.token() == fresh
+        assert calls == []
+
+        soon = _jwt(now[0] + 200, secret="soon")
+        fomo._bearer = soon
+        fomo._fetched_at = now[0]
+        assert fomo.token() == chrome
+        assert calls == [1]
+
+        fomo2 = fomo_api.Fomo(bearer="aaa.bbb.ccc")
+        fomo2._fetched_at = now[0] - 100
+        assert fomo2.token() == "aaa.bbb.ccc"
+        fomo2._fetched_at = now[0] - fomo_api.TOKEN_TTL - 1
+        assert fomo2.token() == chrome
+    finally:
+        fomo_api.set_time_fn(None)
+        fomo_api.set_sleep_fn(None)
+
+
+def test_401_stale_token_reloads_once_then_succeeds(monkeypatch, caplog):
+    import logging
+    import fomo_api
+    now = [1_700_000_000.0]
+    fomo_api.set_time_fn(lambda: now[0])
+    fomo_api.set_sleep_fn(lambda s: now.__setitem__(0, now[0] + s))
+    stale = _jwt(now[0] + 3600, secret="staleTOKEN")
+    fresh = _jwt(now[0] + 7200, secret="freshTOKEN")
+    fomo = fomo_api.Fomo(bearer=stale)
+    fomo.begin_cycle()
+    box = {"tok": stale, "reloads": 0}
+
+    def fake_chrome():
+        return box["tok"]
+
+    def fake_reload():
+        box["reloads"] += 1
+        box["tok"] = fresh
+
+    monkeypatch.setattr(fomo, "_from_chrome", fake_chrome)
+    monkeypatch.setattr(fomo, "_reload_fomo_tab", fake_reload)
+    posts = []
+
+    def fake_post(path, payload, tok, timeout=30):
+        posts.append(tok)
+        if tok == stale:
+            return _Resp(401)
+        return _Resp(200, [{
+            "token": {"address": "Mint1", "networkId": 1399811149, "symbol": "X",
+                      "marketCap": 1, "liquidity": 1, "priceUSD": 1},
+        }])
+
+    monkeypatch.setattr(fomo, "_do_post", fake_post)
+    caplog.set_level(logging.DEBUG)
+    try:
+        out = fomo.tokens(["Mint1:1399811149"])
+        assert box["reloads"] == 1
+        assert posts == [stale, fresh]
+        assert "Mint1:1399811149" in out
+        blob = caplog.text
+        assert stale not in blob
+        assert fresh not in blob
+        assert "staleTOKEN" not in blob
+        assert "freshTOKEN" not in blob
+    finally:
+        fomo_api.set_time_fn(None)
+        fomo_api.set_sleep_fn(None)
+
+
+def test_401_after_reload_no_second_reload_that_cycle(monkeypatch, caplog):
+    import logging
+    import fomo_api
+    now = [1_700_000_000.0]
+    fomo_api.set_time_fn(lambda: now[0])
+    fomo_api.set_sleep_fn(lambda s: now.__setitem__(0, now[0] + s))
+    stale = _jwt(now[0] + 3600, secret="stayTOKEN")
+    fomo = fomo_api.Fomo(bearer=stale)
+    fomo.begin_cycle()
+    box = {"reloads": 0}
+
+    monkeypatch.setattr(fomo, "_from_chrome", lambda: stale)
+
+    def fake_reload():
+        box["reloads"] += 1
+
+    monkeypatch.setattr(fomo, "_reload_fomo_tab", fake_reload)
+    monkeypatch.setattr(fomo, "_do_post", lambda *a, **k: _Resp(401))
+    caplog.set_level(logging.DEBUG)
+    try:
+        with pytest.raises(fomo_api.FomoAuthError):
+            fomo.tokens(["Mint1:1399811149"])
+        assert box["reloads"] == 1
+        with pytest.raises(fomo_api.FomoAuthError):
+            fomo.trending_tokens()
+        assert box["reloads"] == 1
+        blob = caplog.text
+        assert stale not in blob
+        assert "stayTOKEN" not in blob
+    finally:
+        fomo_api.set_time_fn(None)
+        fomo_api.set_sleep_fn(None)
+
+
+def test_reload_sends_location_reload_via_cdp(monkeypatch):
+    import json
+    import sys
+    import types
+    import fomo_api
+    sent = []
+
+    class WS:
+        def __init__(self, url, timeout=5):
+            pass
+
+        def send(self, payload):
+            sent.append(json.loads(payload))
+
+        def recv(self):
+            return json.dumps({"result": {"result": {"value": None}}})
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "websocket", types.SimpleNamespace(
+        create_connection=lambda url, timeout=5: WS(url, timeout),
+    ))
+    tab = {"type": "page", "url": "https://fomo.family/",
+           "webSocketDebuggerUrl": "ws://127.0.0.1/devtools"}
+    monkeypatch.setattr(fomo_api.requests, "get", mock.Mock(
+        return_value=mock.Mock(json=lambda: [tab]),
+    ))
+    fomo = fomo_api.Fomo(bearer="aaa.bbb.ccc")
+    fomo._reload_fomo_tab()
+    assert sent
+    assert sent[0]["method"] == "Runtime.evaluate"
+    assert sent[0]["params"]["expression"] == "location.reload()"
+
+
+def test_consecutive_auth_failures_banner_and_reset(caplog):
+    import logging
+    import fomo_api
+    fomo = fomo_api.Fomo(bearer="aaa.bbb.ccc")
+    caplog.set_level(logging.ERROR)
+    h = fomo.health()
+    assert h["consecutive_auth_failures"] == 0
+    assert h["auth_down"] is False
+    assert "aaa.bbb.ccc" not in str(h)
+    fomo.note_auth_failure()
+    h = fomo.health()
+    assert h["consecutive_auth_failures"] == 1
+    assert h["auth_down"] is False
+    assert not any("FOMO AUTH DOWN" in (r.message or "") for r in caplog.records)
+    fomo.note_auth_failure()
+    h = fomo.health()
+    assert h["consecutive_auth_failures"] == 2
+    assert h["auth_down"] is True
+    down = [r.message for r in caplog.records if "FOMO AUTH DOWN" in (r.message or "")]
+    assert down and "2 consecutive cycles failed" in down[0]
+    assert "aaa.bbb.ccc" not in caplog.text
+    fomo.note_auth_ok()
+    h = fomo.health()
+    assert h["consecutive_auth_failures"] == 0
+    assert h["auth_down"] is False

@@ -351,7 +351,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         return None, {"held": h["ticker"], "minutes": round(h["minutes"])}
 
     stats = {"seen": 0, "benched": 0, "free": {}, "trade": {},
-             "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0,
+             "chain": {}, "soft": {}, "judged": 0, "soft_judged": 0, "pick_judged": 0,
+             "tokens": [], "requeued": 0,
              "gt_universe": 0, "gt_dossier_attempts": 0, "gt_dossier_ok": 0, "gt_retry": 0,
              "gt_cache_hits": 0, "gt_cache_misses": 0,
              "free_passed": 0, "dossiered": 0}
@@ -923,14 +924,20 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Get carried count
     unevaluated_count = len(book.get_carry())
     
+    stats["soft_judged"] = int(stats.get("judged") or 0)
+    stats["pick_judged"] = sum(
+        1 for t in (stats.get("tokens") or [])
+        if isinstance(t, dict) and t.get("stage") == "judged"
+    )
     # Keep existing log line for external monitoring (F6)
     log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
              "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s, requeued %(requeued)s", stats)
     
-    # New comprehensive cycle logging
-    log.info("cycle summary: seen=%d benched=%d free_passed=%d dossiered=%d judged=%d requeued=%d carried=%d",
+    # New comprehensive cycle logging. `judged` is an alias of soft_judged.
+    log.info("cycle summary: seen=%d benched=%d free_passed=%d dossiered=%d soft_judged=%d pick_judged=%d requeued=%d carried=%d",
              stats["seen"], stats["benched"], stats["free_passed"], 
-             stats["dossiered"], stats["judged"], stats["requeued"], unevaluated_count)
+             stats["dossiered"], stats["soft_judged"], stats["pick_judged"],
+             stats["requeued"], unevaluated_count)
     log.info("cycle GT calls: universe=%d dossier_attempts=%d dossier_ok=%d retry=%d 429s=%d wait_time=%.1fs cache_hits=%d cache_misses=%d",
              stats["gt_universe"], stats["gt_dossier_attempts"], stats["gt_dossier_ok"], stats["gt_retry"],
              gt_limiter.stats_429_count, gt_limiter.stats_wait_time,
@@ -1028,20 +1035,31 @@ def main(fomo, judge, desk, shadow=True, once=False):
     while True:
         cycle_start_actual = _now()
         try:
+            if hasattr(fomo, "begin_cycle"):
+                fomo.begin_cycle()
             fomo.token()                         # Privy bearer lives ~60 min, refresh it
             order, stats = run_once(fomo, judge, desk, desk.bank(), shadow)
+            if hasattr(fomo, "note_auth_ok"):
+                fomo.note_auth_ok()
             desk.report(order, stats)            # every cycle, trade or not
             if order:
                 desk.send_to_seats(order)
         except FomoAuthError as e:
-            log.error("FOMO auth failed: %s", e)
+            log.error("FOMO auth failed: %s", safe_err(e))
+            try:
+                if hasattr(fomo, "note_auth_failure"):
+                    fomo.note_auth_failure()
+            except Exception as e2:
+                log.warning("FOMO auth counter: %s", safe_err(e2))
             # Write error state with FOMO error flag for ops panel banner
             desk.write_state(None, {
-                "error": f"FomoAuthError: {e}",
-                "fomo_error": str(e),
+                "error": f"FomoAuthError: {safe_err(e)}",
+                "fomo_error": safe_err(e),
                 "seen": 0,
                 "benched": 0,
                 "judged": 0,
+                "soft_judged": 0,
+                "pick_judged": 0,
                 "free": {},
                 "trade": {},
                 "chain": {},
@@ -1059,6 +1077,8 @@ def main(fomo, judge, desk, shadow=True, once=False):
                 "seen": 0,
                 "benched": 0,
                 "judged": 0,
+                "soft_judged": 0,
+                "pick_judged": 0,
                 "free": {},
                 "trade": {},
                 "chain": {},
