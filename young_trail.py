@@ -2,10 +2,12 @@
 Young-trail paper ledger — a week-long SIMULATED experiment.
 
 Every token that free-passes with age_minutes < 60 is paper-bought once (first
-tid seen) at $50, then marked each desk cycle. Exits match stop-study
-semantics in outcomes.simulate(trail=True) minus take-profit: hard stop -30%
-from entry, 30% trail from peak (price <= peak * 0.7), time exit at 6h;
-whichever first.
+tid seen) at $50, then marked each desk cycle. New entries default to the
+young_trail_fast tp_50 rule: sell the whole position at +50% on 60s Dex
+samples. Stop-loss, trailing stop and 6h time exits stay on the cycle marks
+(hard stop -30% from entry, 30% trail from peak, time at 6h). Pre-deploy
+rows keep the legacy rules (no take-profit). Override with
+YOUNG_TRAIL_EXIT_POLICY=legacy.
 
 Does NOT affect judging, picks, thresholds, cutoff, ticket size, or live
 orders. Own DexScreener lookups (priceUsd, tokens/v1), never GT. Fail open.
@@ -36,6 +38,9 @@ TICKET_USD = 50.0
 SL_PCT = -0.30
 TRAIL_PCT = 0.30
 WINDOW_SEC = 6 * 3600
+POLICY_LEGACY = "legacy"
+POLICY_TP50 = "tp50"
+DEFAULT_EXIT_POLICY = POLICY_TP50
 # Rob's chosen end: 2026-10-20 23:59 ET (EDT). Override with YOUNG_TRAIL_UNTIL.
 DEFAULT_UNTIL_ISO = "2026-10-21T03:59:59Z"
 HTTP_TIMEOUT = 5
@@ -149,6 +154,19 @@ def _init_schema(db: sqlite3.Connection) -> None:
     """)
     db.commit()
     try:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(young_trail)")}
+        if "exit_policy" not in cols:
+            db.execute(
+                "ALTER TABLE young_trail ADD COLUMN exit_policy TEXT DEFAULT 'legacy'"
+            )
+            db.commit()
+    except Exception as e:
+        log.warning("young_trail schema exit_policy: %s", safe_err(e))
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    try:
         import young_trail_variants
         young_trail_variants.init_schema(db)
     except Exception as e:
@@ -160,6 +178,29 @@ def enabled() -> bool:
     if raw is None or raw == "":
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def configured_exit_policy() -> str:
+    """New-entry exit policy. YOUNG_TRAIL_EXIT_POLICY=legacy reverts without a code change."""
+    raw = os.environ.get("YOUNG_TRAIL_EXIT_POLICY")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_EXIT_POLICY
+    val = str(raw).strip().lower()
+    if val in (POLICY_LEGACY, POLICY_TP50):
+        return val
+    return DEFAULT_EXIT_POLICY
+
+
+def row_exit_policy(row) -> str:
+    if not row:
+        return POLICY_LEGACY
+    try:
+        val = row.get("exit_policy") if isinstance(row, dict) else row["exit_policy"]
+    except Exception:
+        val = None
+    if val in (POLICY_LEGACY, POLICY_TP50):
+        return val
+    return POLICY_LEGACY
 
 
 def _parse_until(raw: str) -> float | None:
@@ -419,20 +460,11 @@ def fetch_dex_prices(tids: list[str], *, cap: int | None = None,
 
 
 def _row_dict(row: sqlite3.Row) -> dict:
-    return {
-        "tid": row["tid"],
-        "ticker": row["ticker"],
-        "chain": row["chain"],
-        "entry_ts": row["entry_ts"],
-        "entry_price": row["entry_price"],
-        "peak": row["peak"],
-        "last_price": row["last_price"],
-        "last_mark_ts": row["last_mark_ts"],
-        "exit_ts": row["exit_ts"],
-        "exit_price": row["exit_price"],
-        "exit_reason": row["exit_reason"],
-        "pnl_usd": row["pnl_usd"],
-    }
+    d = {k: row[k] for k in row.keys()}
+    d.setdefault("exit_policy", POLICY_LEGACY)
+    if not d.get("exit_policy"):
+        d["exit_policy"] = POLICY_LEGACY
+    return d
 
 
 def has_tid(tid: str) -> bool:
@@ -461,23 +493,29 @@ def enter(tid: str, token: dict | None, price: float, now: float | None = None) 
     if not chain:
         _, net = parse_tid(tid)
         chain = DEX_CHAIN.get(net) if net is not None else token.get("net")
+    policy = configured_exit_policy()
     try:
         db = _connect()
         cur = db.execute(
             """INSERT OR IGNORE INTO young_trail
-               (tid, ticker, chain, entry_ts, entry_price, peak, last_price, last_mark_ts)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (tid, ticker, chain, ts, float(price), float(price), float(price), ts),
+               (tid, ticker, chain, entry_ts, entry_price, peak, last_price,
+                last_mark_ts, exit_policy)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (tid, ticker, chain, ts, float(price), float(price), float(price),
+             ts, policy),
         )
         db.commit()
         if cur.rowcount:
             log.info(
-                "young_trail entry tid=%s ticker=%s price=%s ticket=%s paper=1",
-                tid, ticker, price, TICKET_USD,
+                "young_trail entry tid=%s ticker=%s price=%s ticket=%s "
+                "exit_policy=%s paper=1",
+                tid, ticker, price, TICKET_USD, policy,
             )
             try:
                 import young_trail_variants
                 young_trail_variants.on_entry(tid, float(price), ts)
+                if policy == POLICY_TP50:
+                    young_trail_variants.seed_legacy_base(tid, float(price))
             except Exception as e:
                 log.warning("young_trail variants entry: %s", safe_err(e))
             return True
@@ -612,6 +650,74 @@ def mark_open(prices: dict[str, float] | None = None, now: float | None = None) 
     return {"marked": marked, "closed": closed, "stale": stale}
 
 
+def _mark_price(mark) -> float | None:
+    """Sampler prices are floats; cycle tokens are dicts. Fail open."""
+    if mark is None:
+        return None
+    if isinstance(mark, dict):
+        return _price_from_token(mark)
+    try:
+        px = float(mark)
+    except (TypeError, ValueError):
+        return None
+    return px if px >= 0 else None
+
+
+def apply_tp50_on_marks(prices: dict | None = None, now: float | None = None) -> dict:
+    """Close tp50-policy rows on the fast tp_50 take-profit. 60s samples.
+
+    Uses young_trail_fast's tp_50 rule and decide_variant_tick. Only honors a
+    'tp' decision — SL, trail and time stay on cycle mark_open. Fail open.
+    """
+    prices = prices or {}
+    ts = current_time() if now is None else float(now)
+    closed = 0
+    try:
+        from young_trail_variants import decide_variant_tick
+        import young_trail_fast as fast
+        import price_guard
+        rule = fast.VARIANT_BY_ID["tp_50"]
+        for pos in open_rows():
+            if row_exit_policy(pos) != POLICY_TP50:
+                continue
+            tid = pos["tid"]
+            entry_price = float(pos["entry_price"])
+            last_px = pos.get("last_price")
+            try:
+                last_px = float(last_px) if last_px is not None else None
+            except (TypeError, ValueError):
+                last_px = None
+            if last_px is None or last_px <= 0:
+                last_px = entry_price
+            px = price_guard.accept_price(
+                _mark_price(prices.get(tid)),
+                entry=entry_price, prev=last_px, tid=tid, now=ts,
+            )
+            peak = float(pos["peak"] or entry_price)
+            if px is not None and px > peak + 1e-15:
+                peak = float(px)
+            decision, state = decide_variant_tick(
+                rule,
+                entry_price=entry_price,
+                peak=peak,
+                price=px,
+                entry_ts=float(pos["entry_ts"]),
+                now=ts,
+                last_price=last_px,
+            )
+            if not decision:
+                continue
+            reason, exit_px = decision
+            if reason != "tp":
+                continue
+            close_peak = float(state.get("peak") or peak)
+            if _close_row(tid, ts, exit_px, "tp_50", close_peak):
+                closed += 1
+    except Exception as e:
+        log.warning("young_trail tp50 marks: %s", safe_err(e))
+    return {"closed": closed}
+
+
 def consider_entries(candidates: list[dict], prices: dict[str, float] | None = None,
                      now: float | None = None) -> int:
     """Paper-enter young free-passers (age < 60), first tid only."""
@@ -693,29 +799,111 @@ def on_cycle(stats=None, tokens=None, now: float | None = None) -> dict:
         return empty
 
 
+def _stats_for(opens: list[dict], closes: list[dict]) -> dict:
+    wins = sum(1 for c in closes if (c.get("pnl_usd") or 0) > 0)
+    losses = sum(1 for c in closes if (c.get("pnl_usd") or 0) < 0)
+    n = len(closes)
+    realized = sum(c.get("pnl_usd") or 0 for c in closes)
+    return {
+        "open_count": len(opens),
+        "closed_count": n,
+        "winning_trades": wins,
+        "losing_trades": losses,
+        "win_rate": (wins / n) if n else 0.0,
+        "realized_pnl_usd": realized,
+    }
+
+
 def summary() -> dict:
-    """Realized P&L counts closed rows only."""
+    """Realized P&L counts closed rows only. Split by exit_policy plus combined."""
+    empty = {
+        "open_count": 0, "closed_count": 0, "winning_trades": 0,
+        "losing_trades": 0, "win_rate": 0.0, "realized_pnl_usd": 0.0,
+    }
     try:
         opens = open_rows()
         closes = closed_rows(limit=None)
-        wins = sum(1 for c in closes if (c.get("pnl_usd") or 0) > 0)
-        losses = sum(1 for c in closes if (c.get("pnl_usd") or 0) < 0)
-        n = len(closes)
-        realized = sum(c.get("pnl_usd") or 0 for c in closes)
+        combined = _stats_for(opens, closes)
+        by = {}
+        for pol in (POLICY_LEGACY, POLICY_TP50):
+            o = [r for r in opens if row_exit_policy(r) == pol]
+            c = [r for r in closes if row_exit_policy(r) == pol]
+            by[pol] = _stats_for(o, c)
+        by["combined"] = combined
+        return {**combined, "by_exit_policy": by}
+    except Exception as e:
+        log.warning("young_trail summary: %s", safe_err(e))
         return {
-            "open_count": len(opens),
+            **empty,
+            "by_exit_policy": {
+                POLICY_LEGACY: dict(empty),
+                POLICY_TP50: dict(empty),
+                "combined": dict(empty),
+            },
+        }
+
+
+def _legacy_base_summary() -> dict:
+    empty = {
+        "variant": "legacy_base", "open_count": 0, "closed_count": 0,
+        "winning_trades": 0, "losing_trades": 0, "win_rate": 0.0,
+        "realized_pnl_usd": 0.0,
+    }
+    try:
+        import young_trail_variants as ytv
+        db = ytv._db()
+        rows = db.execute(
+            "SELECT exit_ts, pnl_usd FROM young_trail_variants WHERE variant = ?",
+            ("legacy_base",),
+        ).fetchall()
+        opens = sum(1 for r in rows if r["exit_ts"] is None)
+        closes = [r for r in rows if r["exit_ts"] is not None]
+        wins = sum(1 for c in closes if (c["pnl_usd"] or 0) > 0)
+        n = len(closes)
+        realized = sum(c["pnl_usd"] or 0 for c in closes)
+        return {
+            "variant": "legacy_base",
+            "open_count": opens,
             "closed_count": n,
             "winning_trades": wins,
-            "losing_trades": losses,
+            "losing_trades": n - wins,
             "win_rate": (wins / n) if n else 0.0,
             "realized_pnl_usd": realized,
         }
     except Exception as e:
-        log.warning("young_trail summary: %s", safe_err(e))
-        return {
-            "open_count": 0, "closed_count": 0, "winning_trades": 0,
-            "losing_trades": 0, "win_rate": 0.0, "realized_pnl_usd": 0.0,
-        }
+        log.warning("young_trail legacy_base summary: %s", safe_err(e))
+        return empty
+
+
+def policy_comparison(limit: int = 40) -> list[dict]:
+    """New tp50 entries vs the legacy_base shadow. Fail open."""
+    try:
+        import young_trail_variants as ytv
+        rows = [
+            r for r in open_rows() + closed_rows(limit=None)
+            if row_exit_policy(r) == POLICY_TP50
+        ]
+        rows.sort(
+            key=lambda r: float(r.get("exit_ts") or r.get("entry_ts") or 0),
+            reverse=True,
+        )
+        out = []
+        for r in rows[: max(0, int(limit))]:
+            shadow = ytv.get_variant(r["tid"], "legacy_base") or {}
+            out.append({
+                "tid": r["tid"],
+                "ticker": r.get("ticker"),
+                "chain": r.get("chain"),
+                "exit_policy": POLICY_TP50,
+                "live_exit_reason": r.get("exit_reason"),
+                "live_pnl_usd": r.get("pnl_usd"),
+                "legacy_base_exit_reason": shadow.get("exit_reason"),
+                "legacy_base_pnl_usd": shadow.get("pnl_usd"),
+            })
+        return out
+    except Exception as e:
+        log.warning("young_trail policy comparison: %s", safe_err(e))
+        return []
 
 
 def ops_payload() -> dict:
@@ -733,15 +921,20 @@ def ops_payload() -> dict:
             "until_ts": until,
             "until_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until)) if until else None,
             "ticket_usd": TICKET_USD,
+            "exit_policy": configured_exit_policy(),
             "rules": {
                 "sl_pct": SL_PCT,
                 "trail_pct": TRAIL_PCT,
                 "window_hours": WINDOW_SEC / 3600.0,
                 "young_max_minutes": YOUNG_MAX_MINUTES,
+                "tp50_tp_pct": 0.50,
+                "tp50_mark_interval_sec": 60,
             },
             "open_positions": open_rows(),
             "closed_trades": closed_rows(limit=50),
             "summary": sm,
+            "legacy_base": _legacy_base_summary(),
+            "comparison": policy_comparison(limit=40),
         }
     except Exception as e:
         log.warning("young_trail ops: %s", safe_err(e))
@@ -752,8 +945,32 @@ def ops_payload() -> dict:
             "error": "unavailable",
             "open_positions": [],
             "closed_trades": [],
+            "exit_policy": configured_exit_policy(),
             "summary": {
                 "open_count": 0, "closed_count": 0, "win_rate": 0.0,
                 "realized_pnl_usd": 0.0, "winning_trades": 0, "losing_trades": 0,
+                "by_exit_policy": {
+                    POLICY_LEGACY: {
+                        "open_count": 0, "closed_count": 0, "win_rate": 0.0,
+                        "realized_pnl_usd": 0.0, "winning_trades": 0,
+                        "losing_trades": 0,
+                    },
+                    POLICY_TP50: {
+                        "open_count": 0, "closed_count": 0, "win_rate": 0.0,
+                        "realized_pnl_usd": 0.0, "winning_trades": 0,
+                        "losing_trades": 0,
+                    },
+                    "combined": {
+                        "open_count": 0, "closed_count": 0, "win_rate": 0.0,
+                        "realized_pnl_usd": 0.0, "winning_trades": 0,
+                        "losing_trades": 0,
+                    },
+                },
             },
+            "legacy_base": {
+                "variant": "legacy_base", "open_count": 0, "closed_count": 0,
+                "winning_trades": 0, "losing_trades": 0, "win_rate": 0.0,
+                "realized_pnl_usd": 0.0,
+            },
+            "comparison": [],
         }

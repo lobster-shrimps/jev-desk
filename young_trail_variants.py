@@ -44,6 +44,13 @@ VARIANTS: list[dict] = [
      "be_trigger_pct": 0.30, "label": "breakeven stop after +30%"},
 ]
 VARIANT_BY_ID = {v["id"]: v for v in VARIANTS}
+# Shadow of the pre-tp50 live ledger. Seeded only on new tp50 entries; same
+# SL/trail/time as baseline. Not in VARIANTS so ranking stays one-lever-at-a-time.
+LEGACY_BASE_RULE = {
+    "id": "legacy_base", "sl_pct": -0.30, "trail_pct": 0.30,
+    "window_sec": 6 * 3600, "label": "legacy base (no TP)",
+}
+VARIANT_BY_ID[LEGACY_BASE_RULE["id"]] = LEGACY_BASE_RULE
 
 
 def init_schema(db) -> None:
@@ -176,6 +183,25 @@ def decide_variant_tick(
         fallback = marked if marked > 0 else float(entry_price)
         return ("time", fallback), state
     return None, state
+
+
+def seed_legacy_base(tid: str, entry_price: float) -> None:
+    """Record the old base exit as a shadow on new tp50 entries. Fail open."""
+    try:
+        if not tid or not entry_price or entry_price <= 0:
+            return
+        db = _db()
+        init_schema(db)
+        px = float(entry_price)
+        db.execute(
+            """INSERT OR IGNORE INTO young_trail_variants
+               (tid, variant, peak, last_price, remaining_frac, partial_pnl, be_armed)
+               VALUES (?, ?, ?, ?, 1.0, 0.0, 0)""",
+            (tid, LEGACY_BASE_RULE["id"], px, px),
+        )
+        db.commit()
+    except Exception as e:
+        log.warning("young_trail variants seed legacy_base: %s", safe_err(e))
 
 
 def on_entry(tid: str, entry_price: float, entry_ts: float) -> None:

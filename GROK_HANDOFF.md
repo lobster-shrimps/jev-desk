@@ -96,7 +96,7 @@ Page: `GET /ops` (`ops.html`, no external URLs, no secrets). JSON:
 $50 ticket, first tid, free-pass and `age_minutes < 60`. Dex marks only. Ends
 2026-10-20 11:59 PM ET.
 
-- **Baseline:** −30% stop, 30% trail from peak, 6h.
+- **Baseline:** new entries `tp50` (+50% TP on 60s Dex samples); SL −30%, 30% trail, 6h on cycle marks. Pre-deploy rows stay `legacy`. `YOUNG_TRAIL_EXIT_POLICY` reverts.
 - **Variants (per-cycle marks):** `tp_50`, `tp_100`, `half_50_trail`, `trail_20`,
   `trail_40`, `sl_20`, `time_1h` / `time_2h` / `time_3h`, `be_after_30`.
 - **Fast:** same entries, baseline + `tp_50` on the 60s Dex sampler.

@@ -41,6 +41,7 @@ def ytf(monkeypatch):
     monkeypatch.delenv("YOUNG_TRAIL_UNTIL", raising=False)
     monkeypatch.delenv("YOUNG_TRAIL_FAST_UNTIL", raising=False)
     monkeypatch.delenv("YOUNG_TRAIL_FAST_ENABLED", raising=False)
+    monkeypatch.delenv("YOUNG_TRAIL_EXIT_POLICY", raising=False)
     young_trail.reset()
     young_trail.set_time_fn(lambda: T0)
     young_trail.set_sleep_fn(lambda _d: None)
@@ -141,7 +142,9 @@ def test_tp_50_on_60s_mark(ytf):
     assert tp[0]["peak"] == pytest.approx(1.50)
     assert tp[0]["time_to_peak_sec"] == pytest.approx(60.0)
     assert base and base[0]["exit_ts"] is None
-    assert yt.open_rows()[0]["exit_ts"] is None
+    live = yt.closed_rows()
+    assert live and live[0]["exit_reason"] == "tp_50"
+    assert live[0]["exit_policy"] == "tp50"
 
 
 def test_sampler_reuses_dex_batch_no_extra_http(ytf, monkeypatch):

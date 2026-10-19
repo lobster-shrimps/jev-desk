@@ -2,7 +2,8 @@
 
 Copies young_trail entries from deploy onward (same tid + entry price) and
 evaluates baseline (-30% SL, 30% trail, 6h) plus tp_50 on every research
-sampler mark. Does NOT change young_trail, variants, judging, or live orders.
+sampler mark. Does NOT change judging or live orders. After marking, propagates a tp_50
+take-profit onto young_trail rows whose exit_policy is tp50.
 No Dex/GT calls of its own — uses prices the sampler already fetched.
 Fail open. Exceptions through safe_err. Never logs secrets.
 """
@@ -425,16 +426,25 @@ def on_marks(prices: dict | None, now: float | None = None) -> dict:
 
 
 def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dict:
-    """Sampler hook: copy new young_trail entries, then mark. No Dex."""
+    """Sampler hook: copy new young_trail entries, then mark. No Dex.
+
+    Also applies the tp_50 take-profit to young_trail rows with exit_policy=tp50.
+    """
     empty = {"entries": 0, "marked": 0, "closed": 0}
     try:
-        if not enabled():
-            return empty
         ts = current_time() if now is None else float(now)
-        until_ts(ts)
-        deploy_ts()
-        n = sync_entries(ts)
-        marks = on_marks(prices or {}, ts)
+        n = 0
+        marks = {"marked": 0, "closed": 0}
+        if enabled():
+            until_ts(ts)
+            deploy_ts()
+            n = sync_entries(ts)
+            marks = on_marks(prices or {}, ts)
+        try:
+            import young_trail
+            young_trail.apply_tp50_on_marks(prices or {}, ts)
+        except Exception as e:
+            log.warning("young_trail_fast tp50 propagate: %s", safe_err(e))
         return {"entries": n, **marks}
     except Exception as e:
         log.warning("young_trail_fast sampler: %s", safe_err(e))
