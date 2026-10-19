@@ -1846,10 +1846,21 @@ def _young_trail_md_lines(yt: dict) -> list[str]:
     until = yt.get("until_iso") or ""
     until_bit = f" until {until}" if until else ""
     flag = "on" if yt.get("enabled", True) else "off"
+    policy = yt.get("exit_policy") or "tp50"
+    by = sm.get("by_exit_policy") or {}
+    tp = by.get("tp50") or {}
+    lg = by.get("legacy") or {}
+    split = (
+        f" · tp50 ${float(tp.get('realized_pnl_usd') or 0):+.2f} "
+        f"n={tp.get('closed_count', 0)}"
+        f" · legacy ${float(lg.get('realized_pnl_usd') or 0):+.2f} "
+        f"n={lg.get('closed_count', 0)}"
+    )
     return [
-        f"- Paper $50 · SL -30% · trail 30% from peak · 6h time · no live orders ({flag}{until_bit})",
+        f"- Paper $50 · new entries {policy} (+50% TP on 60s) · SL -30% · "
+        f"trail 30% from peak · 6h time · no live orders ({flag}{until_bit})",
         f"- Open: {sm.get('open_count', 0)} · Closed: {sm.get('closed_count', 0)} · "
-        f"Win rate: {wr_s} · Realized: ${realized:+.2f}",
+        f"Win rate: {wr_s} · Realized: ${realized:+.2f}{split}",
         *_young_trail_variant_md_lines(),
         *_young_trail_signals_md_lines(),
     ]

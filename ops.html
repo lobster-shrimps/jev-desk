@@ -83,11 +83,13 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
 </section>
 <section class="s6" aria-label="young_trail open positions">
   <h2>Open positions <small>last vs entry</small></h2>
-  <div class="scroll"><table id="yt-open"><thead><tr><th>Ticker</th><th>Chain</th><th class="n">Age</th><th class="n">Last/entry</th><th class="n">Peak/entry</th><th class="n">Unrealized</th></tr></thead><tbody></tbody></table></div>
+  <div class="scroll"><table id="yt-open"><thead><tr><th>Ticker</th><th>Chain</th><th>Policy</th><th class="n">Age</th><th class="n">Last/entry</th><th class="n">Peak/entry</th><th class="n">Unrealized</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section class="s6" aria-label="young_trail recent closes">
   <h2>Recent closes</h2>
-  <div class="scroll"><table id="yt-closed"><thead><tr><th>Closed</th><th>Ticker</th><th>Reason</th><th class="n">Held</th><th class="n">P&amp;L</th></tr></thead><tbody></tbody></table></div>
+  <div class="scroll"><table id="yt-closed"><thead><tr><th>Closed</th><th>Ticker</th><th>Policy</th><th>Reason</th><th class="n">Held</th><th class="n">P&amp;L</th></tr></thead><tbody></tbody></table></div>
+  <h2 style="margin-top:16px">tp50 vs legacy_base <small>new entries only</small></h2>
+  <div class="scroll"><table id="yt-cmp"><thead><tr><th>Ticker</th><th>Live exit</th><th class="n">Live P&amp;L</th><th>legacy_base</th><th class="n">legacy P&amp;L</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="yt-fast" aria-labelledby="ytf-h">
   <h2 id="ytf-h">young_trail_fast <small>60s marks vs per-cycle · same entries</small></h2>
@@ -236,11 +238,12 @@ async function load(){
   if(SL){const all=[...(SL.open_positions||[]).map(p=>({...p,_s:'open'})),...(SL.closed_positions||[]).map(p=>({...p,_s:'closed'}))];
     rows('shadow-t',all.slice(-10).reverse().map(p=>`<tr><td>${esc(p.ticker)}</td><td>${p._s}</td><td class="n">${fmtPx(p.entry_price_usd)}</td><td class="n">${fmtPx(p.exit_price_usd)}</td><td class="n ${cls(p.realized_pnl_usd)}">${fmtUsd(p.realized_pnl_usd)}</td><td class="stat">${esc(p.reason||'')}</td></tr>`).join(''));
     $('desk-sub').textContent=`shadow closed ${SL.summary?.closed_trades_count??0}`;}
-  if(YT){const s=YT.summary||{};const left=YT.until_ts?(YT.until_ts-now)/86400:null;
-    $('yt-days').textContent=left!=null?`${Math.max(0,left).toFixed(1)} days left · ends ${tLocal(YT.until_ts)}`:'';
-    kv('yt-kv',[['Realized',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Closed',s.closed_count],['Wins',s.winning_trades],['Win rate',pct(s.win_rate)],['Open',s.open_count]]);
-    rows('yt-open',(YT.open_positions||[]).map(p=>{const r=p.last_price/p.entry_price;return `<tr><td>${esc(p.ticker)}</td><td>${esc(p.chain)}</td><td class="n">${ago(now-p.entry_ts)}</td><td class="n ${cls(r-1)}">${x(r)}</td><td class="n">${x(p.peak/p.entry_price)}</td><td class="n ${cls(r-1)}">${fmtUsd((YT.ticket_usd||50)*(r-1))}</td></tr>`}).join(''));
-    rows('yt-closed',(YT.closed_trades||[]).slice(0,12).map(c=>`<tr><td>${tLocal(c.exit_ts)}</td><td>${esc(c.ticker)}</td><td>${esc(c.exit_reason)}</td><td class="n">${ago(c.exit_ts-c.entry_ts)}</td><td class="n ${cls(c.pnl_usd)}">${fmtUsd(c.pnl_usd)}</td></tr>`).join(''));}
+  if(YT){const s=YT.summary||{};const by=s.by_exit_policy||{};const tp=by.tp50||{};const lg=by.legacy||{};const lb=YT.legacy_base||{};const left=YT.until_ts?(YT.until_ts-now)/86400:null;
+    $('yt-days').textContent=left!=null?`${Math.max(0,left).toFixed(1)} days left · ends ${tLocal(YT.until_ts)} · new ${esc(YT.exit_policy||'tp50')}`:'';
+    kv('yt-kv',[['Combined',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Closed',s.closed_count],['Open',s.open_count],['tp50 P&L',fmtUsd(tp.realized_pnl_usd),cls(tp.realized_pnl_usd)],['tp50 closed',tp.closed_count],['legacy P&L',fmtUsd(lg.realized_pnl_usd),cls(lg.realized_pnl_usd)],['legacy closed',lg.closed_count],['legacy_base shadow',fmtUsd(lb.realized_pnl_usd),cls(lb.realized_pnl_usd)]]);
+    rows('yt-open',(YT.open_positions||[]).map(p=>{const r=p.last_price/p.entry_price;return `<tr><td>${esc(p.ticker)}</td><td>${esc(p.chain)}</td><td>${esc(p.exit_policy||'legacy')}</td><td class="n">${ago(now-p.entry_ts)}</td><td class="n ${cls(r-1)}">${x(r)}</td><td class="n">${x(p.peak/p.entry_price)}</td><td class="n ${cls(r-1)}">${fmtUsd((YT.ticket_usd||50)*(r-1))}</td></tr>`}).join(''));
+    rows('yt-closed',(YT.closed_trades||[]).slice(0,12).map(c=>`<tr><td>${tLocal(c.exit_ts)}</td><td>${esc(c.ticker)}</td><td>${esc(c.exit_policy||'legacy')}</td><td>${esc(c.exit_reason)}</td><td class="n">${ago(c.exit_ts-c.entry_ts)}</td><td class="n ${cls(c.pnl_usd)}">${fmtUsd(c.pnl_usd)}</td></tr>`).join(''));
+    rows('yt-cmp',(YT.comparison||[]).slice(0,12).map(r=>`<tr><td>${esc(r.ticker||'')}</td><td>${esc(r.live_exit_reason||'open')}</td><td class="n ${cls(r.live_pnl_usd)}">${fmtUsd(r.live_pnl_usd)}</td><td>${esc(r.legacy_base_exit_reason||'open')}</td><td class="n ${cls(r.legacy_base_pnl_usd)}">${fmtUsd(r.legacy_base_pnl_usd)}</td></tr>`).join(''));}
   if(YF){const sb=YF.summary&&YF.summary.baseline||{};const st=YF.summary&&YF.summary.tp_50||{};
     kv('ytf-kv',[['Fast baseline',fmtUsd(sb.realized_pnl_usd),cls(sb.realized_pnl_usd)],['Fast closed',sb.closed_count],['Fast tp_50',fmtUsd(st.realized_pnl_usd),cls(st.realized_pnl_usd)],['Open',sb.open_count]]);
     $('ytf-note').textContent=YF.caveat||'Paper only · 60s Dex marks · no live orders';

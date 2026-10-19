@@ -134,7 +134,7 @@ Still true: every number in `thresholds.py` is the guide author's rather than yo
 | `gt_api.py` | research | Onchain helper: free GT, Demo, Pro. Demo monthly cap 9000. |
 | `research.py` | research | `research.db` snapshots, 60s marks, labels, CLI, backfill. |
 | `cycle_history.py` | OPS | Cycle store + morning briefing (`/ops/briefing`). |
-| `young_trail.py` | paper | $50 paper ledger on free-passers younger than 60 min. |
+| `young_trail.py` | paper | $50 paper ledger on free-passers younger than 60 min. New entries default to +50% TP on 60s marks. |
 | `young_trail_variants.py` | paper | Exit-rule replay on the same per-cycle marks. |
 | `young_trail_fast.py` | paper | Same entries, baseline + `tp_50`, evaluated on 60s Dex marks. |
 | `young_trail_helius.py` | paper | Solana rug-signal paper exits from budgeted Helius RPC. |
@@ -505,8 +505,13 @@ at a $50 ticket. Marks use DexScreener, never GeckoTerminal. Does not change
 `thresholds.py`, `pick.py`, `filter.py`, `questions.py`, or `collect.py`. Same experiment
 end as the live week: **2026-10-20 11:59 PM ET**.
 
-**Baseline exits** (whichever first): hard stop −30% from entry, 30% trail from peak
-(price ≤ peak × 0.7), time exit at 6h.
+**Live exits (from this deploy):** new entries default to `tp50` — the
+`young_trail_fast` `tp_50` rule: sell the whole position at +50% on 60s Dex
+samples. Stop-loss −30%, 30% trail from peak, and 6h time exit stay on the
+cycle marks. Pre-deploy open rows keep the old rules (`exit_policy=legacy`).
+Set `YOUNG_TRAIL_EXIT_POLICY=legacy` to revert new entries without a code
+change. The old base exit is recorded as a `legacy_base` shadow on new rows
+so `/ops/young_trail` can show both side by side.
 
 **Per-cycle variants** (`young_trail_variants`, same marks, ~15 min cadence):
 

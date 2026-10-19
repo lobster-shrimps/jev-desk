@@ -32,6 +32,7 @@ def yt(monkeypatch):
     import young_trail
     monkeypatch.delenv("YOUNG_TRAIL_UNTIL", raising=False)
     monkeypatch.delenv("YOUNG_TRAIL_ENABLED", raising=False)
+    monkeypatch.delenv("YOUNG_TRAIL_EXIT_POLICY", raising=False)
     young_trail.reset()
     young_trail.set_time_fn(lambda: T0)
     young_trail.set_sleep_fn(lambda _d: None)

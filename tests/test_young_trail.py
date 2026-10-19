@@ -40,6 +40,7 @@ def yt(monkeypatch):
     import young_trail
     monkeypatch.delenv("YOUNG_TRAIL_UNTIL", raising=False)
     monkeypatch.delenv("YOUNG_TRAIL_ENABLED", raising=False)
+    monkeypatch.delenv("YOUNG_TRAIL_EXIT_POLICY", raising=False)
     young_trail.reset()
     young_trail.set_time_fn(lambda: T0)
     young_trail.set_sleep_fn(lambda _d: None)
@@ -277,6 +278,9 @@ def test_ops_young_trail_json(yt):
     assert data["summary"]["closed_count"] == 1
     assert data["summary"]["realized_pnl_usd"] == pytest.approx(-15.0)
     assert data["closed_trades"][0]["exit_reason"] == "sl"
+    assert data["exit_policy"] == "tp50"
+    assert "by_exit_policy" in data["summary"]
+    assert data["summary"]["by_exit_policy"]["combined"]["closed_count"] == 1
     assert "SUPERSECRET" not in json.dumps(data)
 
 
@@ -287,8 +291,10 @@ def test_ops_html_has_young_trail_panel():
     html = client.get("/ops").text
     assert 'id="yt"' in html
     assert 'id="yt-curve"' in html
+    assert 'id="yt-cmp"' in html
     assert "/ops/young_trail" in html
     assert "young_trail" in html
+    assert "legacy_base" in html
     assert "No live orders" in html or "no live orders" in html.lower()
 
 
@@ -301,12 +307,14 @@ def test_briefing_includes_young_trail_line(yt):
     assert "## Young trail (paper, simulated)" in md
     assert "no live orders" in md
     assert "Realized:" in md
+    assert "tp50" in md
     assert payload["young_trail"]["summary"]["closed_count"] == 1
     assert "SUPERSECRET" not in md
 
 
 def test_protected_modules_untouched():
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py"):
+    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py",
+                 "collect.py", "judge.py"):
         r = subprocess.run(
             ["git", "diff", "--", name],
             cwd=str(ROOT), capture_output=True, text=True, check=True,
@@ -399,3 +407,76 @@ def test_never_logs_keys(yt, caplog, monkeypatch):
     blob = caplog.text
     assert "cg-secret-should-never-appear" not in blob
     assert "desk-secret-should-never-appear" not in blob
+
+
+def test_new_entry_tp50_on_60s_sample(yt):
+    """A new entry that hits +50% on a 60s sample closes as tp_50."""
+    import young_trail_fast as fast
+    import young_trail_variants as ytv
+    t = _tok()
+    assert yt.configured_exit_policy() == "tp50"
+    assert yt.consider_entries([t], now=T0) == 1
+    row = yt.open_rows()[0]
+    assert row["exit_policy"] == "tp50"
+    assert ytv.get_variant(t["tid"], "legacy_base") is not None
+    assert ytv.get_variant(t["tid"], "legacy_base")["exit_ts"] is None
+    fast.set_time_fn(lambda: T0 + 60)
+    fast.on_sampler_tick({t["tid"]: 1.50}, now=T0 + 60)
+    closed = yt.closed_rows()
+    assert len(closed) == 1
+    assert closed[0]["exit_reason"] == "tp_50"
+    assert closed[0]["exit_price"] == pytest.approx(1.50)
+    assert closed[0]["pnl_usd"] == pytest.approx(25.0)
+    assert closed[0]["exit_policy"] == "tp50"
+    shadow = ytv.get_variant(t["tid"], "legacy_base")
+    assert shadow is not None
+    assert shadow["exit_ts"] is None
+    sm = yt.summary()
+    assert sm["by_exit_policy"]["tp50"]["closed_count"] == 1
+    assert sm["by_exit_policy"]["legacy"]["closed_count"] == 0
+    assert sm["by_exit_policy"]["combined"]["realized_pnl_usd"] == pytest.approx(25.0)
+
+
+def test_pre_deploy_open_keeps_legacy_rules(yt, monkeypatch):
+    """A pre-deploy open position keeps the legacy rules."""
+    import young_trail_fast as fast
+    monkeypatch.setenv("YOUNG_TRAIL_EXIT_POLICY", "legacy")
+    t = _tok()
+    assert yt.consider_entries([t], now=T0) == 1
+    row = yt.open_rows()[0]
+    assert row["exit_policy"] == "legacy"
+    monkeypatch.setenv("YOUNG_TRAIL_EXIT_POLICY", "tp50")
+    fast.set_time_fn(lambda: T0 + 60)
+    fast.on_sampler_tick({t["tid"]: 1.50}, now=T0 + 60)
+    still = yt.open_rows()
+    assert still and still[0]["exit_ts"] is None
+    assert still[0]["peak"] == pytest.approx(ENTRY)
+    yt.mark_open({t["tid"]: 0.70}, now=T0 + 180)
+    closed = yt.closed_rows()
+    assert len(closed) == 1
+    assert closed[0]["exit_reason"] == "sl"
+    assert closed[0]["exit_policy"] == "legacy"
+
+
+def test_legacy_base_variant_recorded_for_new_entries(yt):
+    """The legacy_base variant is recorded for new entries."""
+    import young_trail_variants as ytv
+    t = _tok()
+    yt.consider_entries([t], now=T0)
+    shadow = ytv.get_variant(t["tid"], "legacy_base")
+    assert shadow is not None
+    assert shadow["exit_ts"] is None
+    assert shadow["peak"] == pytest.approx(ENTRY)
+    cmp_rows = yt.policy_comparison()
+    assert cmp_rows and cmp_rows[0]["tid"] == t["tid"]
+    assert cmp_rows[0]["exit_policy"] == "tp50"
+    payload = yt.ops_payload()
+    assert payload["exit_policy"] == "tp50"
+    assert payload["legacy_base"]["variant"] == "legacy_base"
+    assert payload["legacy_base"]["open_count"] == 1
+    yt.mark_open({t["tid"]: 0.70}, now=T0 + 60)
+    live = yt.closed_rows()[0]
+    assert live["exit_reason"] == "sl"
+    shadow = ytv.get_variant(t["tid"], "legacy_base")
+    assert shadow["exit_reason"] == "sl"
+    assert shadow["pnl_usd"] == pytest.approx(live["pnl_usd"])

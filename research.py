@@ -818,12 +818,13 @@ def fetch_dex_batch(tids: list[str], entries: dict | None = None,
 
 
 def tick_sampler(now: float | None = None) -> dict:
-    """One 60s sample: up to 30 Dex batch marks. Never touches young_trail exits.
+    """One 60s sample: up to 30 Dex batch marks. Does not call young_trail.mark_open.
 
     After logging marks, drives the paper young_trail_fast ledger on the same
-    prices (no extra Dex), the paper young_trail_helius rug-signal checks, then
-    the paper young_trail_rugrisk entry features (after helius, leftover budget),
-    then paper young_trail_signals (RugCheck / boosts / Birdeye).
+    prices (no extra Dex). Fast then applies the tp_50 take-profit to young_trail
+    rows whose exit_policy is tp50. Then paper young_trail_helius rug-signal
+    checks, paper young_trail_rugrisk entry features (after helius, leftover
+    budget), then paper young_trail_signals (RugCheck / boosts / Birdeye).
     Fail open. Never gates entries.
     """
     ts = current_time() if now is None else float(now)

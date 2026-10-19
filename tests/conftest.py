@@ -59,6 +59,7 @@ def isolate_young_trail(tmp_path, monkeypatch):
     monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
     monkeypatch.delenv("YOUNG_TRAIL_UNTIL", raising=False)
     monkeypatch.delenv("YOUNG_TRAIL_ENABLED", raising=False)
+    monkeypatch.delenv("YOUNG_TRAIL_EXIT_POLICY", raising=False)
     monkeypatch.delenv("BIRDEYE_API_KEY", raising=False)
     monkeypatch.delenv("RUGCHECK_API_KEY", raising=False)
     import price_guard
