@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 
 import requests
@@ -21,6 +22,11 @@ HOLDER_GROWTH_MAX_AGE_MIN = 120
 DEV_SELLS_CAP = 5
 DEV_SELLS_TIMEOUT_SEC = 8.0
 DEV_SELLS_SIG_LIMIT = 20
+MAX_TX_VERSION = 1
+MAX_TX_VERSION_CAP = 2
+_TX_VERSION_RE = re.compile(
+    r"Transaction version \((\d+)\) is not supported", re.IGNORECASE
+)
 
 _lookups_this_cycle = 0
 _time_fn = time.time
@@ -190,15 +196,45 @@ def _balance_for(entries, mint: str, owner: str) -> int | None:
     return None
 
 
-def _rpc(method: str, params, timeout: float):
-    if method in ("getTransaction", "getBlock"):
-        params = list(params or [])
+def _clamp_tx_version(version) -> int:
+    try:
+        ver = int(version)
+    except (TypeError, ValueError):
+        ver = MAX_TX_VERSION
+    return min(max(0, ver), MAX_TX_VERSION_CAP)
+
+
+def _with_max_tx_version(method: str, params, version: int | None = None):
+    if method not in ("getTransaction", "getBlock", "getTransactionsForAddress"):
+        return params
+    params = list(params or [])
+    if not params:
+        return params
+    ver = MAX_TX_VERSION if version is None else _clamp_tx_version(version)
+    if len(params) < 2 or not isinstance(params[1], dict):
         if len(params) == 1:
-            params.append({"maxSupportedTransactionVersion": 0})
-        elif len(params) >= 2 and isinstance(params[1], dict):
-            cfg = dict(params[1])
-            cfg["maxSupportedTransactionVersion"] = 0
-            params[1] = cfg
+            params.append({"maxSupportedTransactionVersion": ver})
+        return params
+    cfg = dict(params[1])
+    cfg["maxSupportedTransactionVersion"] = ver
+    params[1] = cfg
+    return params
+
+
+def _tx_version_from_error(err) -> int | None:
+    if err is None:
+        return None
+    if isinstance(err, dict):
+        msg = str(err.get("message") or err)
+    else:
+        msg = str(err)
+    m = _TX_VERSION_RE.search(msg)
+    if not m:
+        return None
+    return _clamp_tx_version(m.group(1))
+
+
+def _rpc_raw(method: str, params, timeout: float):
     if _rpc_fn is not None:
         return _rpc_fn(method, params, timeout)
     rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -207,6 +243,8 @@ def _rpc(method: str, params, timeout: float):
         json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
         timeout=max(0.5, float(timeout)),
     )
+    if getattr(resp, "status_code", 200) >= 500:
+        raise RuntimeError(f"HTTP {resp.status_code}")
     data = resp.json()
     if not isinstance(data, dict):
         raise RuntimeError("solana rpc: non-object response")
@@ -218,6 +256,18 @@ def _rpc(method: str, params, timeout: float):
     if "result" not in data:
         raise RuntimeError("solana rpc: missing result")
     return data["result"]
+
+
+def _rpc(method: str, params, timeout: float):
+    params = _with_max_tx_version(method, params)
+    try:
+        return _rpc_raw(method, params, timeout)
+    except Exception as e:
+        ver = _tx_version_from_error(e)
+        if ver is None:
+            raise
+        retry_params = _with_max_tx_version(method, params, version=ver)
+        return _rpc_raw(method, retry_params, timeout)
 
 
 def _dev_sells_from_parsed(txs: list, mint: str, creator: str) -> str | None:
@@ -295,7 +345,7 @@ def solana_dev_sells(d: dict) -> str | None:
             try:
                 tx = _rpc(
                     "getTransaction",
-                    [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+                    [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": MAX_TX_VERSION}],
                     remaining,
                 )
             except Exception as e:

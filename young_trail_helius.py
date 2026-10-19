@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sqlite3
 import threading
 import time
@@ -33,8 +34,12 @@ FRESH_MARK_SEC = 15 * 60
 LOCK_TIMEOUT_SEC = 0.2
 RPC_TIMEOUT_SEC = 8.0
 DEFAULT_UNTIL_ISO = "2026-10-21T03:59:59Z"
-MAX_TX_VERSION = 0
+MAX_TX_VERSION = 1
+MAX_TX_VERSION_CAP = 2
 SOL_NET = 1399811149
+_TX_VERSION_RE = re.compile(
+    r"Transaction version \((\d+)\) is not supported", re.IGNORECASE
+)
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 # Helius free ~1M credits/month. Standard JSON-RPC is typically 1 credit.
 # 3000/day ≈ 90k/month leaves headroom; 12/tick keeps a 60s sample short.
@@ -536,27 +541,45 @@ def lookup_creator(tid: str) -> str | None:
     return None
 
 
-def _with_max_tx_version(method: str, params):
+def _clamp_tx_version(version) -> int:
+    try:
+        ver = int(version)
+    except (TypeError, ValueError):
+        ver = MAX_TX_VERSION
+    return min(max(0, ver), MAX_TX_VERSION_CAP)
+
+
+def _with_max_tx_version(method: str, params, version: int | None = None):
     if method not in ("getTransaction", "getBlock", "getTransactionsForAddress"):
         return params
     params = list(params or [])
     if not params:
         return params
+    ver = MAX_TX_VERSION if version is None else _clamp_tx_version(version)
     if len(params) < 2 or not isinstance(params[1], dict):
         if len(params) == 1:
-            params.append({"maxSupportedTransactionVersion": MAX_TX_VERSION})
+            params.append({"maxSupportedTransactionVersion": ver})
         return params
     cfg = dict(params[1])
-    cfg["maxSupportedTransactionVersion"] = MAX_TX_VERSION
+    cfg["maxSupportedTransactionVersion"] = ver
     params[1] = cfg
     return params
 
 
-def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | None = None):
-    """One Helius JSON-RPC call. Charges the budget first. Never logs the URL."""
-    params = _with_max_tx_version(method, params)
-    if not _charge(1, now):
-        raise RuntimeError("helius budget exhausted")
+def _tx_version_from_error(err) -> int | None:
+    if err is None:
+        return None
+    if isinstance(err, dict):
+        msg = str(err.get("message") or err)
+    else:
+        msg = str(err)
+    m = _TX_VERSION_RE.search(msg)
+    if not m:
+        return None
+    return _clamp_tx_version(m.group(1))
+
+
+def _rpc_raw(method: str, params, timeout: float):
     if _rpc_fn is not None:
         return _rpc_fn(method, params, timeout)
     import requests
@@ -567,6 +590,8 @@ def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | Non
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             timeout=max(0.5, float(timeout)),
         )
+        if getattr(resp, "status_code", 200) >= 500:
+            raise RuntimeError(f"HTTP {resp.status_code}")
         data = resp.json()
     except Exception as e:
         log.warning("young_trail_helius rpc %s: %s", method, safe_err(e))
@@ -581,6 +606,25 @@ def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | Non
     if "result" not in data:
         raise RuntimeError("solana rpc: missing result")
     return data["result"]
+
+
+def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | None = None):
+    """One Helius JSON-RPC call. Charges the budget first. Never logs the URL."""
+    params = _with_max_tx_version(method, params)
+    if not _charge(1, now):
+        raise RuntimeError("helius budget exhausted")
+    try:
+        return _rpc_raw(method, params, timeout)
+    except Exception as e:
+        if "budget" in str(e).lower():
+            raise
+        ver = _tx_version_from_error(e)
+        if ver is None:
+            raise
+        retry_params = _with_max_tx_version(method, params, version=ver)
+        if not _charge(1, now):
+            raise RuntimeError("helius budget exhausted")
+        return _rpc_raw(method, retry_params, timeout)
 
 
 def _largest_accounts(mint: str, now: float | None = None) -> list[dict]:

@@ -198,6 +198,10 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
                 {"signature": f"{addr[:6]}s{i}", "slot": CREATE_SLOT + i, "err": None}
                 for i in range(n)
             ][:limit]
+        if method == "getHealth":
+            return "ok"
+        if method == "getSlot":
+            return CREATE_SLOT
         if method == "getTransactionsForAddress":
             if gtfa_by_addr is None:
                 raise RuntimeError("Method not found")
@@ -888,7 +892,7 @@ def test_create_ix_only_creators_same_slot_buys_are_bundled(ytr):
 def test_partial_window_resumes_never_ok_while_partial(ytr, monkeypatch):
     """Capped window that needs more than one tick stays pending until complete."""
     yt, helius, rug = ytr
-    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_CYCLE_CAP", "4")
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_CYCLE_CAP", "5")
     tx_list = [{
         "signature": "asigcreate", "slot": CREATE_SLOT,
         "deltas": [(DEV, 0, 50)],
@@ -1145,11 +1149,11 @@ def test_get_transaction_sets_max_supported_version(ytr):
     assert tx_calls
     for _method, params in tx_calls:
         assert isinstance(params[1], dict)
-        assert params[1].get("maxSupportedTransactionVersion") == 0
+        assert params[1].get("maxSupportedTransactionVersion") == 1
     for _method, params in rpc.calls:
         if _method in ("getTransaction", "getBlock", "getTransactionsForAddress"):
             assert isinstance(params[1], dict)
-            assert params[1].get("maxSupportedTransactionVersion") == 0
+            assert params[1].get("maxSupportedTransactionVersion") == 1
 
 
 def test_gtfa_network_blip_retries_after_cooldown(ytr, monkeypatch):
@@ -1540,6 +1544,7 @@ def test_sniper_v2_requeue_overnight_only_lower_than_new(ytr):
     rpc = _rpc_scripted()
     rug.set_rpc_fn(rpc)
     rug.begin_cycle(T0)
+    rug._meta_set(rug.META_LAST_OVERNIGHT, str(T0))
     n_calls = len(rpc.calls)
     assert rug.compute_pending(now=T0, limit=8) == 0
     assert len(rpc.calls) == n_calls
@@ -1564,8 +1569,404 @@ def test_sniper_v2_requeue_overnight_only_lower_than_new(ytr):
     night = rug._fair_share_pending(
         [new_row, v2_row, old_row], ["new:1"], 2, overnight=True,
     )
-    assert [x["tid"] for x in night] == ["new:1", old_tid]
+    assert [x["tid"] for x in night] == ["new:1", TID]
     leftover = rug._fair_share_pending(
         [v2_row], [], 2, overnight=True,
     )
     assert [x["tid"] for x in leftover] == [TID]
+
+
+def test_max_tx_version_is_one_on_all_three_methods():
+    import young_trail_rugrisk as r
+    for method in ("getTransaction", "getBlock", "getTransactionsForAddress"):
+        out = r._with_max_tx_version(method, ["addr", {"encoding": "jsonParsed"}])
+        assert out[1]["maxSupportedTransactionVersion"] == 1
+        bare = r._with_max_tx_version(method, ["addr"])
+        assert bare[1]["maxSupportedTransactionVersion"] == 1
+    other = r._with_max_tx_version("getTokenSupply", ["mint"])
+    assert other == ["mint"]
+
+
+def test_tx_version_error_retries_once_and_succeeds(ytr):
+    _yt, _helius, rug = ytr
+    inner = _rpc_scripted()
+    n = {"n": 0}
+
+    def rpc(method, params, timeout):
+        if method == "getTransaction":
+            n["n"] += 1
+            ver = (params[1] or {}).get("maxSupportedTransactionVersion")
+            if n["n"] == 1:
+                assert ver == 1
+                raise RuntimeError("Transaction version (1) is not supported")
+            assert ver == 1
+            return inner(method, params, timeout)
+        return inner(method, params, timeout)
+
+    rpc.calls = inner.calls
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    used0 = rug.budget_remaining(T0)["cycle_used"]
+    got = rug._rpc("getTransaction", ["mintsig00", {"encoding": "jsonParsed"}], now=T0)
+    assert got is not None
+    assert n["n"] == 2
+    assert rug.budget_remaining(T0)["cycle_used"] == used0 + 2
+
+
+def test_tx_version_error_retries_once_in_batch(ytr):
+    _yt, _helius, rug = ytr
+    inner = _rpc_scripted()
+    n = {"n": 0}
+
+    def rpc(method, params, timeout):
+        if method == "getTransaction":
+            n["n"] += 1
+            if n["n"] == 1:
+                raise RuntimeError("Transaction version (1) is not supported")
+            return inner(method, params, timeout)
+        return inner(method, params, timeout)
+
+    rpc.calls = inner.calls
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    used0 = rug.budget_remaining(T0)["cycle_used"]
+    out = rug._rpc_batch(
+        [("getTransaction", ["mintsig00", {"encoding": "jsonParsed"}])], now=T0,
+    )
+    assert out[0] is not None
+    assert n["n"] == 2
+    assert rug.budget_remaining(T0)["cycle_used"] == used0 + 2
+
+
+def test_gtfa_version_error_does_not_disable_probe(ytr):
+    _yt, _helius, rug = ytr
+    inner = _rpc_scripted()
+    n = {"gtfa": 0}
+
+    def rpc(method, params, timeout):
+        if method == "getTransactionsForAddress":
+            n["gtfa"] += 1
+            if n["gtfa"] == 1:
+                raise RuntimeError("Transaction version (1) is not supported")
+            return {"data": []}
+        return inner(method, params, timeout)
+
+    rpc.calls = inner.calls
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    addr = "SomeCurve11111111111111111111111111"
+    got = rug._gtfa_oldest(addr, now=T0)
+    assert got == []
+    assert rug._gtfa_supported is True
+    assert n["gtfa"] == 2
+    rug.begin_cycle(T0)
+    rug._gtfa_oldest(addr, now=T0 + 60)
+    assert n["gtfa"] == 3
+    assert rug._gtfa_supported is not False
+
+
+def test_jsonparsed_v1_tx_does_not_raise(ytr):
+    _yt, _helius, rug = ytr
+    v1 = {
+        "slot": CREATE_SLOT,
+        "version": 1,
+        "transaction": {
+            "message": {
+                "accountKeys": [
+                    {"pubkey": DEV, "signer": True, "source": "transaction"},
+                    {"pubkey": S1, "signer": False, "source": "lookupTable"},
+                ],
+                "instructions": [_ix("create", MINT)],
+                "addressTableLookups": [{"accountKey": "Alt111"}],
+            }
+        },
+        "meta": {
+            "loadedAddresses": {"writable": [S1], "readonly": []},
+            "preTokenBalances": [
+                {"mint": MINT, "owner": S1,
+                 "uiTokenAmount": {"uiAmount": 0, "amount": "0"}},
+            ],
+            "postTokenBalances": [
+                {"mint": MINT, "owner": S1,
+                 "uiTokenAmount": {"uiAmount": 10, "amount": "10"}},
+            ],
+            "innerInstructions": None,
+        },
+    }
+    rec = rug._tx_record("v1sig", v1, MINT)
+    assert rec["signers"] == [DEV]
+    assert rec["has_create_ix"] is True
+    assert rec["buyers"][0]["owner"] == S1
+    junk = rug._tx_record("bad", {"version": 1, "transaction": None, "meta": 1}, MINT)
+    assert junk["buyers"] == []
+    assert junk["signers"] == []
+    assert list(rug._iter_parsed_ix({"version": 1, "transaction": "nope"})) == []
+
+
+def test_v1tx_requeue_truncated_after_oct15(ytr):
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = ?", (rug.META_V1TX,),
+    )
+    after = rug.V1TX_AFTER_TS + 3600
+    before = rug.V1TX_AFTER_TS - 3600
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error,
+             features_json, computed_ts
+           ) VALUES (?, 'NEW', 'solana', ?, 1.0, 'unavailable', ?, ?, ?)""",
+        (TID, T0, "history_truncated", json.dumps({"history_truncated": True}),
+         after),
+    )
+    old = "OldTruncMint11111111111111111111111:1399811149"
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error,
+             features_json, computed_ts
+           ) VALUES (?, 'OLD', 'solana', ?, 1.0, 'unavailable', ?, ?, ?)""",
+        (old, T0, "history_truncated", json.dumps({"history_truncated": True}),
+         before),
+    )
+    db.commit()
+    rug._requeue_v1tx_rows(db)
+    db.commit()
+    rows = {r["tid"]: r for r in rug.all_rows()}
+    assert rows[TID]["status"] == "pending"
+    assert rows[TID]["source"] == "v1tx"
+    assert rows[old]["status"] == "unavailable"
+    rug._requeue_v1tx_rows(db)
+    db.commit()
+    assert {r["tid"]: r for r in rug.all_rows()}[TID]["status"] == "pending"
+
+
+def test_dev_history_from_create_tx_signer_when_no_creator(ytr):
+    _yt, _helius, rug = ytr
+    rpc = _rpc_scripted(
+        tx_list=[
+            {
+                "signature": "asigcreate", "slot": CREATE_SLOT,
+                "deltas": [(DEV, 0, 50)],
+                "ixs": [_ix("create", MINT)], "signer": DEV,
+            },
+            {
+                "signature": "bsigbuy1", "slot": CREATE_SLOT,
+                "deltas": [(S1, 0, 100)], "signer": S1,
+            },
+            {
+                "signature": "bsigbuy2", "slot": CREATE_SLOT,
+                "deltas": [(S2, 0, 100)], "signer": S2,
+            },
+            {
+                "signature": "bsigbuy3", "slot": CREATE_SLOT,
+                "deltas": [(S3, 0, 100)], "signer": S3,
+            },
+        ],
+        supply=1000.0,
+        wallet_n={S1: 1, S2: 1, S3: 1, DEV: 8, WHALE: 20},
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=None, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["dev_wallet"] == DEV
+    assert feat["dev_prior_launches"] == 1
+    assert feat["dev_prior_rugs"] == 1
+    assert feat["skip_dev_rugs"] is True
+    used = (feat.get("features_json") or {}).get("calls_used", 99)
+    assert used <= rug.TARGET_ENTRY_CALLS
+
+
+def test_dev_history_unknown_with_no_signer_no_extra_rpc(ytr):
+    _yt, _helius, rug = ytr
+    rpc = _rpc_scripted(
+        tx_list=[
+            {
+                "signature": "asigcreate", "slot": CREATE_SLOT,
+                "deltas": [(S1, 0, 50)],
+                "ixs": [_ix("create", MINT)],
+            },
+            {
+                "signature": "bsigbuy1", "slot": CREATE_SLOT,
+                "deltas": [(S1, 0, 100), (S2, 0, 100), (S3, 0, 100), (S4, 0, 50)],
+            },
+        ],
+        creator_txs=[],
+        supply=1000.0,
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    before = len(rpc.calls)
+    feat = rug.compute_features(MINT, creator=None, now=T0)
+    assert feat["status"] == "ok"
+    assert feat["dev_prior_launches"] is None
+    assert feat["dev_prior_rugs"] is None
+    assert feat["skip_dev_rugs"] is None
+    addrs = [
+        c[1][0] for c in rpc.calls[before:]
+        if c[0] == "getSignaturesForAddress"
+    ]
+    assert DEV not in addrs
+
+
+def test_transient_error_stays_pending_with_retry_after(ytr):
+    yt, helius, rug = ytr
+    inner = _rpc_scripted()
+
+    def rpc(method, params, timeout):
+        if method == "getTokenSupply":
+            raise ConnectionError("timed out contacting rpc")
+        return inner(method, params, timeout)
+
+    rpc.calls = inner.calls
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    feat = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert feat["status"] == "pending"
+    extra = feat.get("features_json") or {}
+    assert extra.get("retry_after") == pytest.approx(T0 + rug.RETRY_AFTER_SEC)
+    _enter(yt, helius, creator=DEV)
+    rug.sync_entries(now=T0)
+    _store = rug._store_features
+    _store(TID, feat, T0, "live")
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["status"] == "pending"
+    assert row["error"] in (None, "")
+    rug.begin_cycle(T0)
+    n_before = len(rpc.calls)
+    assert rug.compute_pending(now=T0, limit=8) == 0
+    assert len(rpc.calls) == n_before
+    rug.begin_cycle(T0 + rug.RETRY_AFTER_SEC + 1)
+    # Health probe + compute still hits the same ConnectionError → pending.
+    n = rug.compute_pending(now=T0 + rug.RETRY_AFTER_SEC + 1, limit=1)
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["status"] == "pending"
+    assert row["error"] in (None, "")
+
+
+def test_transient_error_migration_requeues(ytr):
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = ?",
+        (rug.META_TRANSIENT,),
+    )
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error
+           ) VALUES (?, 'E', 'solana', ?, 1.0, 'error', ?)""",
+        (TID, T0, "ConnectionError: timed out contacting rpc"),
+    )
+    perm = "PermErrMint111111111111111111111111:1399811149"
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, error
+           ) VALUES (?, 'P', 'solana', ?, 1.0, 'error', ?)""",
+        (perm, T0, "ValueError: bad program"),
+    )
+    db.commit()
+    rug._requeue_transient_rpc_errors(db)
+    db.commit()
+    rows = {r["tid"]: r for r in rug.all_rows()}
+    assert rows[TID]["status"] == "pending"
+    assert rows[perm]["status"] == "error"
+    rug._requeue_transient_rpc_errors(db)
+    db.commit()
+    assert {r["tid"]: r for r in rug.all_rows()}[TID]["status"] == "pending"
+
+
+def test_overnight_backlog_gets_half_after_new():
+    import young_trail_rugrisk as r
+    new = [{"tid": f"new:{i}"} for i in range(4)]
+    v2 = [{"tid": f"v2:{i}", "source": "sniper_v2"} for i in range(4)]
+    v1 = [{"tid": f"v1:{i}", "source": "v1tx"} for i in range(4)]
+    old = [{"tid": f"old:{i}", "source": "sync"} for i in range(4)]
+    ordered = r._fair_share_pending(
+        new + v2 + v1 + old, [x["tid"] for x in new], 8, overnight=True,
+    )
+    tids = [x["tid"] for x in ordered]
+    assert len(tids) == 8
+    n_new = sum(t.startswith("new:") for t in tids)
+    n_back = sum(t.startswith("v2:") or t.startswith("v1:") for t in tids)
+    assert n_new == 4
+    assert n_back >= 2
+    day = r._fair_share_pending(
+        new + v2 + v1 + old, [x["tid"] for x in new], 8, overnight=False,
+    )
+    assert all(not t.startswith("v2:") and not t.startswith("v1:")
+               for t in [x["tid"] for x in day])
+
+
+def test_overnight_backlog_never_exceeds_day_cap(ytr, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    yt, helius, rug = ytr
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_DAY_CAP", "10")
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_CYCLE_CAP", "40")
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_HELIUS_DAY_RESERVE", "0")
+    db = rug._connect()
+    for i in range(6):
+        db.execute(
+            """INSERT INTO young_trail_rugrisk (
+                 tid, ticker, chain, entry_ts, entry_price, status, source
+               ) VALUES (?, ?, 'solana', ?, 1.0, 'pending', ?)""",
+            (f"V2mint{i:02d}11111111111111111111111111:1399811149",
+             f"V{i}", T0 - i, "sniper_v2"),
+        )
+    db.commit()
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    rug.set_overnight_fn(lambda _n: True)
+    rug.begin_cycle(T0)
+    rug._log_backlog_hourly(T0)
+    assert "young_trail_rugrisk backlog sniper_v2=6 v1tx=0 pending" in caplog.text
+    n = rug.compute_pending(now=T0, limit=8, include_sniper_v2=True)
+    used = rug._day_used(T0)
+    assert used <= 10
+    assert n >= 1
+    assert rug.budget_remaining(T0)["day_used"] <= 10
+
+
+def test_backlog_catchup_when_overnight_missed(ytr, monkeypatch):
+    yt, helius, rug = ytr
+    monkeypatch.setenv("YOUNG_TRAIL_RUGRISK_DAY_CAP", "100")
+    db = rug._connect()
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status, source
+           ) VALUES (?, 'V2', 'solana', ?, 1.0, 'pending', ?)""",
+        (TID, T0 - 60, "sniper_v2"),
+    )
+    db.commit()
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    rug.set_overnight_fn(lambda _n: False)
+    rug.begin_cycle(T0)
+    rug._meta_set(rug.META_LAST_OVERNIGHT, str(T0 - 25 * 3600))
+    n = rug.compute_pending(now=T0, limit=8)
+    assert n >= 1
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["status"] in ("ok", "pending", "unavailable")
+
+
+def test_health_probe_skips_tick_when_unreachable(ytr):
+    yt, helius, rug = ytr
+    _enter(yt, helius, creator=DEV)
+    rug.sync_entries(now=T0)
+    inner = _rpc_scripted()
+
+    def rpc(method, params, timeout):
+        if method == "getHealth":
+            inner.calls.append((method, params))
+            raise ConnectionError("rpc host down")
+        return inner(method, params, timeout)
+
+    rpc.calls = inner.calls
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    assert rug.compute_pending(now=T0, limit=8) == 0
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["status"] == "pending"
+    assert row["error"] in (None, "")
+    methods = [c[0] for c in rpc.calls]
+    assert methods.count("getHealth") == 1
+    assert "getTokenSupply" not in methods

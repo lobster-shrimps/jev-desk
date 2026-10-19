@@ -456,13 +456,39 @@ def test_schema_alter_skips_existing_column(yth, caplog):
 def test_rpc_injects_max_supported_tx_version():
     import young_trail_helius as h
     tx = h._with_max_tx_version("getTransaction", ["sig", {"encoding": "jsonParsed"}])
-    assert tx[1]["maxSupportedTransactionVersion"] == 0
+    assert tx[1]["maxSupportedTransactionVersion"] == 1
     bare = h._with_max_tx_version("getTransaction", ["sig"])
-    assert bare[1]["maxSupportedTransactionVersion"] == 0
+    assert bare[1]["maxSupportedTransactionVersion"] == 1
     block = h._with_max_tx_version("getBlock", [1, {"encoding": "jsonParsed"}])
-    assert block[1]["maxSupportedTransactionVersion"] == 0
+    assert block[1]["maxSupportedTransactionVersion"] == 1
+    gtfa = h._with_max_tx_version(
+        "getTransactionsForAddress", ["addr", {"encoding": "jsonParsed"}],
+    )
+    assert gtfa[1]["maxSupportedTransactionVersion"] == 1
     other = h._with_max_tx_version("getTokenSupply", ["mint"])
     assert other == ["mint"]
+
+
+def test_tx_version_error_retries_once_and_succeeds(yth):
+    _yt, helius = yth
+    n = {"n": 0}
+    versions = []
+
+    def rpc(method, params, timeout):
+        n["n"] += 1
+        versions.append((params[1] or {}).get("maxSupportedTransactionVersion"))
+        if n["n"] == 1:
+            raise RuntimeError("Transaction version (1) is not supported")
+        return {"slot": 1}
+
+    helius.set_rpc_fn(rpc)
+    helius.begin_cycle(T0)
+    used0 = helius.budget_remaining(T0)["cycle_used"]
+    got = helius._rpc("getTransaction", ["sig", {"encoding": "jsonParsed"}], now=T0)
+    assert got == {"slot": 1}
+    assert n["n"] == 2
+    assert versions == [1, 1]
+    assert helius.budget_remaining(T0)["cycle_used"] == used0 + 2
 
 
 def test_schema_steps_commit_independently(tmp_path, monkeypatch):
