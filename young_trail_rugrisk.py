@@ -16,11 +16,13 @@ the shared Helius day budget.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import logging
 import os
 import pathlib
+import re
 import sqlite3
 import threading
 import time
@@ -35,9 +37,18 @@ RPC_TIMEOUT_SEC = 8.0
 # 2026-10-20 23:59 America/New_York (EDT). Override with YOUNG_TRAIL_UNTIL /
 # YOUNG_TRAIL_RUGRISK_UNTIL.
 DEFAULT_UNTIL_ISO = "2026-10-21T03:59:59Z"
-MAX_TX_VERSION = 0
+MAX_TX_VERSION = 1
+MAX_TX_VERSION_CAP = 2
 GTFA_RETRY_SEC = 30 * 60
+RETRY_AFTER_SEC = 10 * 60
+# Unavailable+truncated rows computed on/after this instant are requeued as v1tx.
+V1TX_AFTER_TS = calendar.timegm(
+    time.strptime("2026-10-15T00:00:00Z", "%Y-%m-%dT%H:%M:%SZ")
+)
 SOL_NET = 1399811149
+_TX_VERSION_RE = re.compile(
+    r"Transaction version \((\d+)\) is not supported", re.IGNORECASE
+)
 
 # Own caps (same per-tick shape as helius, smaller day cap). Sit out when
 # helius day_left drops below the reserve so the rug-signal ledger is not starved.
@@ -87,9 +98,14 @@ STATUS_ERROR = "error"
 STATUS_UNAVAILABLE = "unavailable"
 STATUS_BUDGET = "budget"
 SOURCE_SNIPER_V2 = "sniper_v2"
+SOURCE_V1TX = "v1tx"
 SNIPER_V2_OK = "ok"
 SNIPER_V2_NEEDS = "needs_recompute"
 META_SNIPER_V2 = "sniper_v2_invalidate"
+META_V1TX = "requeue_v1tx"
+META_TRANSIENT = "requeue_transient_rpc_errors"
+META_LAST_OVERNIGHT = "last_overnight_ts"
+META_BACKLOG_LOG_HOUR = "backlog_log_hour"
 
 RULE_SNIPERS = "snipers_gt_30"
 RULE_BUNDLED = "bundled"
@@ -135,6 +151,7 @@ _cycle_calls = 0
 _last_new_tids: list[str] = []
 _gtfa_supported: bool | None = None
 _gtfa_retry_after: float = 0.0
+_tick_rpc_ok: bool | None = None
 _dev_cache: dict[str, dict] = {}
 _creator_cache: dict[str, str | None] = {}
 _wallet_fresh_cache: dict[str, bool] = {}
@@ -183,12 +200,13 @@ def _close_local() -> None:
 def reset() -> None:
     """Close this thread's cached connection. Tests call this."""
     global _cycle_calls, _last_new_tids, _gtfa_supported, _gtfa_retry_after
-    global _dev_cache, _creator_cache, _wallet_fresh_cache
+    global _tick_rpc_ok, _dev_cache, _creator_cache, _wallet_fresh_cache
     _close_local()
     _cycle_calls = 0
     _last_new_tids = []
     _gtfa_supported = None
     _gtfa_retry_after = 0.0
+    _tick_rpc_ok = None
     _dev_cache = {}
     _creator_cache = {}
     _wallet_fresh_cache = {}
@@ -260,6 +278,10 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
                  lambda: _reset_truncated_rows(conn))
     _schema_step(conn, "ytr_backfill_sniper_v2",
                  lambda: _backfill_sniper_v2(conn))
+    _schema_step(conn, "ytr_requeue_v1tx",
+                 lambda: _requeue_v1tx_rows(conn))
+    _schema_step(conn, "ytr_requeue_transient_rpc_errors",
+                 lambda: _requeue_transient_rpc_errors(conn))
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -353,6 +375,62 @@ def _backfill_sniper_v2(conn: sqlite3.Connection) -> None:
         """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
         (META_SNIPER_V2, "1"),
+    )
+
+
+def _requeue_v1tx_rows(conn: sqlite3.Connection) -> None:
+    """One-time: truncated unavailable rows computed after Oct 15 → pending v1tx."""
+    row = conn.execute(
+        "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
+        (META_V1TX,),
+    ).fetchone()
+    if row and str(row["value"]) == "1":
+        return
+    conn.execute(
+        """UPDATE young_trail_rugrisk
+           SET status = 'pending',
+               sniper_share = NULL, sniper_wallets = NULL,
+               bundled = NULL, bundled_buys = NULL,
+               skip_snipers = NULL, skip_bundled = NULL, skip_dev_rugs = NULL,
+               features_json = NULL, error = NULL, computed_ts = NULL,
+               source = ?
+           WHERE status = 'unavailable'
+             AND computed_ts IS NOT NULL
+             AND computed_ts >= ?
+             AND (
+               IFNULL(error, '') LIKE '%history_truncated%'
+               OR IFNULL(features_json, '') LIKE '%history_truncated%'
+             )""",
+        (SOURCE_V1TX, float(V1TX_AFTER_TS)),
+    )
+    conn.execute(
+        """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (META_V1TX, "1"),
+    )
+
+
+def _requeue_transient_rpc_errors(conn: sqlite3.Connection) -> None:
+    """One-time: ConnectionError / JSONDecodeError rows go back to pending."""
+    row = conn.execute(
+        "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
+        (META_TRANSIENT,),
+    ).fetchone()
+    if row and str(row["value"]) == "1":
+        return
+    conn.execute(
+        """UPDATE young_trail_rugrisk
+           SET status = 'pending', error = NULL, computed_ts = NULL
+           WHERE status = 'error'
+             AND (
+               IFNULL(error, '') LIKE 'ConnectionError%'
+               OR IFNULL(error, '') LIKE 'JSONDecodeError%'
+             )"""
+    )
+    conn.execute(
+        """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (META_TRANSIENT, "1"),
     )
 
 
@@ -553,8 +631,9 @@ def _day_used(now: float | None = None) -> int:
 
 def begin_cycle(now: float | None = None) -> None:
     """Reset the per-tick call counter. Does not touch young_trail_helius."""
-    global _cycle_calls
+    global _cycle_calls, _tick_rpc_ok
     _cycle_calls = 0
+    _tick_rpc_ok = None
     key = _day_key(now)
     if _meta_get("budget_day") != key:
         _meta_set("budget_day", key)
@@ -658,28 +737,77 @@ def is_solana(tid: str | None = None, chain=None, net=None) -> bool:
     return False
 
 
-def _with_max_tx_version(method: str, params):
-    """Ensure getTransaction / getBlock / GTFA request v0+ txs."""
+def _clamp_tx_version(version) -> int:
+    try:
+        ver = int(version)
+    except (TypeError, ValueError):
+        ver = MAX_TX_VERSION
+    return min(max(0, ver), MAX_TX_VERSION_CAP)
+
+
+def _with_max_tx_version(method: str, params, version: int | None = None):
+    """Ensure getTransaction / getBlock / GTFA request versioned txs."""
     if method not in ("getTransaction", "getBlock", "getTransactionsForAddress"):
         return params
     params = list(params or [])
     if not params:
         return params
+    ver = MAX_TX_VERSION if version is None else _clamp_tx_version(version)
     if len(params) < 2 or not isinstance(params[1], dict):
         if len(params) == 1:
-            params.append({"maxSupportedTransactionVersion": MAX_TX_VERSION})
+            params.append({"maxSupportedTransactionVersion": ver})
         return params
     cfg = dict(params[1])
-    cfg["maxSupportedTransactionVersion"] = MAX_TX_VERSION
+    cfg["maxSupportedTransactionVersion"] = ver
     params[1] = cfg
     return params
 
 
-def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | None = None):
-    """One Helius JSON-RPC call. Charges rugrisk budget first. Never logs the URL."""
-    params = _with_max_tx_version(method, params)
-    if not _charge(1, now):
-        raise RuntimeError("rugrisk budget exhausted")
+def _tx_version_from_error(err) -> int | None:
+    """Parse `Transaction version (N) is not supported`. None if not that error."""
+    if err is None:
+        return None
+    if isinstance(err, dict):
+        msg = str(err.get("message") or err)
+    else:
+        msg = str(err)
+    m = _TX_VERSION_RE.search(msg)
+    if not m:
+        return None
+    return _clamp_tx_version(m.group(1))
+
+
+def _is_transient_rpc_error(err) -> bool:
+    if err is None:
+        return False
+    if isinstance(err, json.JSONDecodeError):
+        return True
+    if isinstance(err, (ConnectionError, TimeoutError)):
+        return True
+    name = type(err).__name__
+    if name in (
+        "ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout",
+        "TimeoutError", "JSONDecodeError", "ChunkedEncodingError",
+        "ProtocolError", "SSLError",
+    ):
+        return True
+    msg = safe_err(err) if isinstance(err, BaseException) else str(err)
+    if msg.startswith("ConnectionError") or msg.startswith("JSONDecodeError"):
+        return True
+    low = msg.lower()
+    if "timed out" in low or "timeout" in low:
+        return True
+    if "json" in low and "decode" in low:
+        return True
+    if re.search(r"\bHTTP 5\d{2}\b", msg):
+        return True
+    if re.search(r"\bstatus(?:\s+code)?[:\s]+5\d{2}\b", low):
+        return True
+    return False
+
+
+def _rpc_raw(method: str, params, timeout: float):
+    """One injected or HTTP JSON-RPC call. No budget, no version retry."""
     if _rpc_fn is not None:
         return _rpc_fn(method, params, timeout)
     import requests
@@ -690,6 +818,8 @@ def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | Non
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             timeout=max(0.5, float(timeout)),
         )
+        if getattr(resp, "status_code", 200) >= 500:
+            raise RuntimeError(f"HTTP {resp.status_code}")
         data = resp.json()
     except Exception as e:
         log.warning("young_trail_rugrisk rpc %s: %s", method, safe_err(e))
@@ -706,6 +836,49 @@ def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | Non
     return data["result"]
 
 
+def _rpc_call(method: str, params, timeout: float, now: float | None,
+              allow_version_retry: bool):
+    """Charge once, call, optionally retry once on a tx-version error."""
+    if not _charge(1, now):
+        raise RuntimeError("rugrisk budget exhausted")
+    try:
+        return _rpc_raw(method, params, timeout)
+    except Exception as e:
+        if "budget" in str(e).lower():
+            raise
+        ver = _tx_version_from_error(e) if allow_version_retry else None
+        if ver is None:
+            raise
+        retry_params = _with_max_tx_version(method, params, version=ver)
+        if not _charge(1, now):
+            raise RuntimeError("rugrisk budget exhausted")
+        return _rpc_raw(method, retry_params, timeout)
+
+
+def _rpc(method: str, params, timeout: float = RPC_TIMEOUT_SEC, now: float | None = None):
+    """One Helius JSON-RPC call. Charges rugrisk budget first. Never logs the URL."""
+    params = _with_max_tx_version(method, params)
+    return _rpc_call(method, params, timeout, now, allow_version_retry=True)
+
+
+def _retry_version_item(method: str, params, err, timeout: float,
+                        now: float | None):
+    """Retry one batch item at the unsupported version. None if not that error."""
+    ver = _tx_version_from_error(err)
+    if ver is None:
+        return None, False
+    retry_params = _with_max_tx_version(method, params, version=ver)
+    try:
+        return _rpc_call(method, retry_params, timeout, now, False), True
+    except Exception as e:
+        if "budget" in str(e).lower() or isinstance(e, AssertionError):
+            raise
+        if _is_transient_rpc_error(e):
+            raise
+        log.warning("young_trail_rugrisk rpc %s: %s", method, safe_err(e))
+        return None, True
+
+
 def _rpc_batch(calls: list[tuple[str, list]], timeout: float = RPC_TIMEOUT_SEC,
                now: float | None = None) -> list:
     """One HTTP round-trip for many methods. Charges 1 against the rugrisk cap."""
@@ -719,9 +892,18 @@ def _rpc_batch(calls: list[tuple[str, list]], timeout: float = RPC_TIMEOUT_SEC,
         for method, params in prepared:
             try:
                 out.append(_rpc_fn(method, params, timeout))
+                continue
             except Exception as e:
                 msg = str(e).lower()
                 if "budget" in msg or isinstance(e, AssertionError):
+                    raise
+                retried, handled = _retry_version_item(
+                    method, params, e, timeout, now,
+                )
+                if handled:
+                    out.append(retried)
+                    continue
+                if _is_transient_rpc_error(e):
                     raise
                 log.warning("young_trail_rugrisk rpc %s: %s", method, safe_err(e))
                 out.append(None)
@@ -736,6 +918,8 @@ def _rpc_batch(calls: list[tuple[str, list]], timeout: float = RPC_TIMEOUT_SEC,
         resp = requests.post(
             rpc_url, json=payload, timeout=max(0.5, float(timeout)),
         )
+        if getattr(resp, "status_code", 200) >= 500:
+            raise RuntimeError(f"HTTP {resp.status_code}")
         data = resp.json()
     except Exception as e:
         log.warning("young_trail_rugrisk rpc batch: %s", safe_err(e))
@@ -748,19 +932,45 @@ def _rpc_batch(calls: list[tuple[str, list]], timeout: float = RPC_TIMEOUT_SEC,
     elif isinstance(data, dict) and "id" in data:
         by_id[data["id"]] = data
     out = []
-    for i, (method, _params) in enumerate(prepared):
+    for i, (method, params) in enumerate(prepared):
         item = by_id.get(i + 1)
         if not isinstance(item, dict):
             out.append(None)
             continue
         if "error" in item:
             err = item["error"]
+            retried, handled = _retry_version_item(
+                method, params, err, timeout, now,
+            )
+            if handled:
+                out.append(retried)
+                continue
             msg = err.get("message") if isinstance(err, dict) else str(err)
-            log.warning("young_trail_rugrisk rpc %s: %s", method, msg)
+            log.warning(
+                "young_trail_rugrisk rpc %s: %s", method,
+                safe_err(RuntimeError(str(msg))),
+            )
             out.append(None)
             continue
         out.append(item.get("result"))
     return out
+
+
+def _rpc_reachable(now: float | None = None) -> bool:
+    """One cheap getHealth per tick. False if the host is down. Counts against budget."""
+    global _tick_rpc_ok
+    if _tick_rpc_ok is not None:
+        return _tick_rpc_ok
+    ts = current_time() if now is None else float(now)
+    if not _can_charge(1, ts):
+        return False
+    try:
+        _rpc("getHealth", [], now=ts)
+        _tick_rpc_ok = True
+    except Exception as e:
+        log.warning("young_trail_rugrisk rpc health: %s", safe_err(e))
+        _tick_rpc_ok = False
+    return bool(_tick_rpc_ok)
 
 
 def _tok_amt(obj) -> float:
@@ -1405,6 +1615,14 @@ def _gtfa_oldest(address: str, now: float | None = None, limit: int = 16,
         if "budget" in msg:
             raise
         global _gtfa_retry_after
+        # Tx-version errors are retried inside _rpc. Never treat them as
+        # "method missing" — cool down and probe again later.
+        if _tx_version_from_error(e) is not None:
+            _set_gtfa_supported(None)
+            ts = current_time() if now is None else float(now)
+            _gtfa_retry_after = ts + max(0.0, float(GTFA_RETRY_SEC))
+            log.warning("young_trail_rugrisk gtfa probe: %s", safe_err(e))
+            return None
         if _is_rpc_method_missing(e):
             _set_gtfa_supported(False)
             log.warning("young_trail_rugrisk gtfa unsupported: %s", safe_err(e))
@@ -1431,24 +1649,30 @@ def _gtfa_oldest(address: str, now: float | None = None, limit: int = 16,
 
 
 def _gtfa_row_to_tx(row: dict) -> dict | None:
-    tx_body = row.get("transaction") if isinstance(row.get("transaction"), dict) else None
-    meta = row.get("meta") if isinstance(row.get("meta"), dict) else None
-    if tx_body is None and isinstance(row.get("value"), dict):
-        tx_body = (row["value"] or {}).get("transaction")
-        meta = (row["value"] or {}).get("meta")
-    sig = row.get("signature")
-    if not sig and isinstance(tx_body, dict):
-        sigs = tx_body.get("signatures") or []
-        if sigs:
-            sig = sigs[0]
-    if not sig:
+    try:
+        if not isinstance(row, dict):
+            return None
+        tx_body = row.get("transaction") if isinstance(row.get("transaction"), dict) else None
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else None
+        if tx_body is None and isinstance(row.get("value"), dict):
+            tx_body = (row["value"] or {}).get("transaction")
+            meta = (row["value"] or {}).get("meta")
+        sig = row.get("signature")
+        if not sig and isinstance(tx_body, dict):
+            sigs = tx_body.get("signatures") or []
+            if sigs:
+                sig = sigs[0]
+        if not sig:
+            return None
+        tx = {
+            "slot": row.get("slot"),
+            "version": row.get("version"),
+            "transaction": tx_body or {"message": {}, "signatures": [sig]},
+            "meta": meta or {},
+        }
+        return {"signature": str(sig), "slot": row.get("slot"), "tx": tx}
+    except Exception:
         return None
-    tx = {
-        "slot": row.get("slot"),
-        "transaction": tx_body or {"message": {}, "signatures": [sig]},
-        "meta": meta or {},
-    }
-    return {"signature": str(sig), "slot": row.get("slot"), "tx": tx}
 
 
 def _commit_window(prog: dict, recs: dict, ordered_sigs: list[str], src: str,
@@ -1691,45 +1915,55 @@ def _fill_create_window(mint: str, creator: str | None, holders: list | None,
     return "truncated"
 
 
+def _empty_tx_record(sig: str) -> dict:
+    return {
+        "signature": sig, "slot": None, "buyers": [], "signers": [],
+        "has_create_ix": False, "created_mints": [], "rugged_mints": [],
+    }
+
+
 def _tx_has_create_ix(tx: dict, mint: str | None = None) -> bool:
     """True when this tx contains a mint/create instruction for `mint`."""
     if not tx:
         return False
-    for ix in _iter_parsed_ix(tx):
-        if _ix_type(ix) not in CREATE_IX:
-            continue
-        ix_mint = _ix_mint(ix)
-        if mint is None or not ix_mint or ix_mint == mint:
-            return True
+    try:
+        for ix in _iter_parsed_ix(tx):
+            if _ix_type(ix) not in CREATE_IX:
+                continue
+            ix_mint = _ix_mint(ix)
+            if mint is None or not ix_mint or ix_mint == mint:
+                return True
+    except Exception:
+        return False
     return False
 
 
 def _tx_record(sig: str, tx: dict | None, mint: str) -> dict:
     """Compact resume record: buyers, signers, create/rug ixs. No raw RPC blob."""
-    if not tx:
+    if not tx or not isinstance(tx, dict):
+        return _empty_tx_record(sig)
+    try:
+        created, rugged = [], []
+        for ix in _iter_parsed_ix(tx):
+            kind = _ix_type(ix)
+            ix_mint = _ix_mint(ix)
+            if not ix_mint:
+                continue
+            if kind in CREATE_IX:
+                created.append(str(ix_mint))
+            if kind in RUG_IX:
+                rugged.append(str(ix_mint))
         return {
-            "signature": sig, "slot": None, "buyers": [], "signers": [],
-            "has_create_ix": False, "created_mints": [], "rugged_mints": [],
+            "signature": sig,
+            "slot": tx.get("slot"),
+            "buyers": _buyers_from_tx(tx, mint),
+            "signers": _tx_signers(tx),
+            "has_create_ix": _tx_has_create_ix(tx, mint),
+            "created_mints": created,
+            "rugged_mints": rugged,
         }
-    created, rugged = [], []
-    for ix in _iter_parsed_ix(tx):
-        kind = _ix_type(ix)
-        ix_mint = _ix_mint(ix)
-        if not ix_mint:
-            continue
-        if kind in CREATE_IX:
-            created.append(str(ix_mint))
-        if kind in RUG_IX:
-            rugged.append(str(ix_mint))
-    return {
-        "signature": sig,
-        "slot": tx.get("slot"),
-        "buyers": _buyers_from_tx(tx, mint),
-        "signers": _tx_signers(tx),
-        "has_create_ix": _tx_has_create_ix(tx, mint),
-        "created_mints": created,
-        "rugged_mints": rugged,
-    }
+    except Exception:
+        return _empty_tx_record(sig)
 
 
 def _in_window_sigs(mint_sigs: list[dict], create_slot: int | None,
@@ -1751,26 +1985,35 @@ def _in_window_sigs(mint_sigs: list[dict], create_slot: int | None,
 
 
 def _tx_signers(tx: dict) -> list[str]:
-    """Fee-payer / required signers of a jsonParsed transaction."""
-    if not tx:
+    """Fee-payer / required signers of a jsonParsed transaction (v0 or v1)."""
+    if not tx or not isinstance(tx, dict):
         return []
-    msg = ((tx.get("transaction") or {}).get("message") or {})
-    keys = msg.get("accountKeys") or []
-    signers = []
-    for k in keys:
-        if isinstance(k, dict) and k.get("signer") and k.get("pubkey"):
-            signers.append(str(k["pubkey"]))
-    if signers:
+    try:
+        body = tx.get("transaction")
+        if isinstance(body, dict):
+            msg = body.get("message") or {}
+        else:
+            msg = tx.get("message") or {}
+        if not isinstance(msg, dict):
+            return []
+        keys = msg.get("accountKeys") or []
+        signers = []
+        for k in keys:
+            if isinstance(k, dict) and k.get("signer") and k.get("pubkey"):
+                signers.append(str(k["pubkey"]))
+        if signers:
+            return signers
+        n = _num((msg.get("header") or {}).get("numRequiredSignatures"), 0) or 0
+        for i, k in enumerate(keys):
+            if i >= int(n):
+                break
+            if isinstance(k, str):
+                signers.append(k)
+            elif isinstance(k, dict) and k.get("pubkey"):
+                signers.append(str(k["pubkey"]))
         return signers
-    n = _num((msg.get("header") or {}).get("numRequiredSignatures"), 0) or 0
-    for i, k in enumerate(keys):
-        if i >= int(n):
-            break
-        if isinstance(k, str):
-            signers.append(k)
-        elif isinstance(k, dict) and k.get("pubkey"):
-            signers.append(str(k["pubkey"]))
-    return signers
+    except Exception:
+        return []
 
 
 def _transaction(sig: str, now: float | None = None) -> dict | None:
@@ -1797,15 +2040,31 @@ def _transactions(sigs: list[str], now: float | None = None) -> dict[str, dict |
 
 
 def _iter_parsed_ix(tx: dict):
-    msg = ((tx.get("transaction") or {}).get("message") or {})
-    for ix in msg.get("instructions") or []:
-        if isinstance(ix, dict):
-            yield ix
-    meta = tx.get("meta") or {}
-    for inner in meta.get("innerInstructions") or []:
-        for ix in (inner.get("instructions") or []):
+    """Yield jsonParsed instructions from a v0 or v1 transaction. Empty on junk."""
+    try:
+        if not isinstance(tx, dict):
+            return
+        body = tx.get("transaction")
+        if isinstance(body, dict):
+            msg = body.get("message") or {}
+        elif isinstance(tx.get("message"), dict):
+            msg = tx.get("message") or {}
+        else:
+            msg = {}
+        if not isinstance(msg, dict):
+            return
+        for ix in msg.get("instructions") or []:
             if isinstance(ix, dict):
                 yield ix
+        meta = tx.get("meta") if isinstance(tx.get("meta"), dict) else {}
+        for inner in meta.get("innerInstructions") or []:
+            if not isinstance(inner, dict):
+                continue
+            for ix in (inner.get("instructions") or []):
+                if isinstance(ix, dict):
+                    yield ix
+    except Exception:
+        return
 
 
 def _ix_type(ix: dict) -> str:
@@ -1826,31 +2085,34 @@ def _ix_mint(ix: dict) -> str | None:
 
 def _buyers_from_tx(tx: dict, mint: str) -> list[dict]:
     """Wallets whose balance of `mint` rose in this transaction."""
-    if not tx or not mint:
+    if not tx or not mint or not isinstance(tx, dict):
         return []
-    slot = tx.get("slot")
-    meta = tx.get("meta") or {}
-    pre = {}
-    for row in meta.get("preTokenBalances") or []:
-        if not isinstance(row, dict) or row.get("mint") != mint:
-            continue
-        owner = row.get("owner")
-        if owner:
-            pre[owner] = _tok_amt(row.get("uiTokenAmount") or row)
-    post = {}
-    for row in meta.get("postTokenBalances") or []:
-        if not isinstance(row, dict) or row.get("mint") != mint:
-            continue
-        owner = row.get("owner")
-        if owner:
-            post[owner] = _tok_amt(row.get("uiTokenAmount") or row)
-    out = []
-    for owner, after in post.items():
-        before = pre.get(owner, 0.0)
-        delta = after - before
-        if delta > 0:
-            out.append({"owner": owner, "delta": delta, "slot": slot})
-    return out
+    try:
+        slot = tx.get("slot")
+        meta = tx.get("meta") if isinstance(tx.get("meta"), dict) else {}
+        pre = {}
+        for row in meta.get("preTokenBalances") or []:
+            if not isinstance(row, dict) or row.get("mint") != mint:
+                continue
+            owner = row.get("owner")
+            if owner:
+                pre[owner] = _tok_amt(row.get("uiTokenAmount") or row)
+        post = {}
+        for row in meta.get("postTokenBalances") or []:
+            if not isinstance(row, dict) or row.get("mint") != mint:
+                continue
+            owner = row.get("owner")
+            if owner:
+                post[owner] = _tok_amt(row.get("uiTokenAmount") or row)
+        out = []
+        for owner, after in post.items():
+            before = pre.get(owner, 0.0)
+            delta = after - before
+            if delta > 0:
+                out.append({"owner": owner, "delta": delta, "slot": slot})
+        return out
+    except Exception:
+        return []
 
 
 def _lookup_creator(tid: str) -> str | None:
@@ -1939,11 +2201,8 @@ def _dev_history(creator: str, current_mint: str,
     unknown = {
         "dev_prior_launches": None, "dev_prior_rugs": None, "prior_mints": [],
     }
-    empty = {
-        "dev_prior_launches": 0, "dev_prior_rugs": 0, "prior_mints": [],
-    }
     if not creator:
-        return empty
+        return unknown
     cached = _dev_cache.get(creator)
     if cached is not None:
         return dict(cached)
@@ -2174,27 +2433,49 @@ def compute_features(mint: str, creator: str | None = None,
         # Known FOMO/Helius creator + signers of the CREATE_IX tx only.
         # Bundled same-slot buyers are not creators.
         creators = _owner_set([creator] if creator else [])
+        create_signers: list[str] = []
         if create_sig:
             rec = tx_recs.get(create_sig) or {}
             if rec.get("has_create_ix"):
-                creators.update(rec.get("signers") or [])
+                create_signers = [
+                    str(s) for s in (rec.get("signers") or []) if s
+                ]
+                creators.update(create_signers)
         prog["buys"] = buys
         prog["creators"] = sorted(creators)
         exclude = sniper_exclude_owners(mint, creators, holders)
 
+        # Dev wallet is the FOMO/Helius creator, else the create-tx fee payer
+        # (first signer). Only skip the lookup when no wallet exists at all.
+        dev_wallet = creator or (create_signers[0] if create_signers else None)
         dev = prog.get("dev") or {
             "dev_prior_launches": None, "dev_prior_rugs": None, "prior_mints": [],
         }
-        if creator and not prog.get("dev_done"):
-            cached = _dev_cache.get(creator)
+        if not dev_wallet:
+            prog["dev_done"] = True
+        elif not prog.get("dev_done"):
+            cached = _dev_cache.get(dev_wallet)
             if cached is not None:
                 dev = dict(cached)
                 prog["dev"] = _compact_dev(dev)
                 prog["dev_done"] = True
+            elif calls_used() >= TARGET_ENTRY_CALLS:
+                from_recs = _dev_from_recs(tx_recs, mint)
+                if from_recs["dev_prior_launches"] or from_recs["dev_prior_rugs"]:
+                    dev = from_recs
+                    prog["dev"] = _compact_dev(dev)
+                    _dev_cache[dev_wallet] = _compact_dev(dev)
+                    prog["dev_done"] = True
+                else:
+                    log.warning("young_trail_rugrisk dev history skipped budget")
+                    prog["dev_done"] = True
             else:
+                reuse_sigs = prog.get("creator_sigs")
+                if not creator and reuse_sigs is None:
+                    reuse_sigs = None
                 dev = _dev_history(
-                    creator, mint, now=ts,
-                    recs=tx_recs, sigs=prog.get("creator_sigs"),
+                    dev_wallet, mint, now=ts,
+                    recs=tx_recs, sigs=reuse_sigs,
                 )
                 prog["dev"] = _compact_dev(dev)
                 if dev.get("dev_prior_launches") is None:
@@ -2205,10 +2486,13 @@ def compute_features(mint: str, creator: str | None = None,
                     # Do not mark done: retry when budget recovers.
                     if not _can_charge(1, ts):
                         return pending()
+                    if calls_used() >= TARGET_ENTRY_CALLS:
+                        log.warning(
+                            "young_trail_rugrisk dev history skipped budget"
+                        )
+                        prog["dev_done"] = True
                 else:
                     prog["dev_done"] = True
-        elif not creator:
-            prog["dev_done"] = True
         dev = prog.get("dev") or dev
 
         # Fresh-wallet share is diagnostic, not a skip rule. Reuse cache; do
@@ -2284,7 +2568,7 @@ def compute_features(mint: str, creator: str | None = None,
             "sniper_min_wallets": sniper_min_wallets(),
             "bundled": bundled["bundled"],
             "bundled_buys": bundled["bundled_buys"],
-            "dev_wallet": creator or (next(iter(creators), None)),
+            "dev_wallet": dev_wallet or (next(iter(creators), None)),
             "dev_prior_launches": dev.get("dev_prior_launches"),
             "dev_prior_rugs": dev.get("dev_prior_rugs"),
             "dev_initial_share": dev_share,
@@ -2325,7 +2609,19 @@ def compute_features(mint: str, creator: str | None = None,
         msg = safe_err(e)
         if "budget" in str(e).lower() or "budget" in msg.lower():
             return pending()
-        log.warning("young_trail_rugrisk features %s: %s", mint, safe_err(e))
+        log.warning("young_trail_rugrisk features %s: %s", mint, msg)
+        if _is_transient_rpc_error(e):
+            feat = pending()
+            extra = feat.get("features_json") or {}
+            retry_at = ts + RETRY_AFTER_SEC
+            extra["retry_after"] = retry_at
+            blob = extra.get("progress") if isinstance(extra.get("progress"), dict) else {}
+            blob["retry_after"] = retry_at
+            extra["progress"] = blob
+            extra["last_error"] = msg
+            extra["calls_used"] = calls_used()
+            feat["features_json"] = extra
+            return feat
         feat = _blank_features(STATUS_ERROR, creator, error=msg)
         feat["features_json"] = {"calls_used": calls_used()}
         return feat
@@ -2465,25 +2761,48 @@ def _progress_from_row(row) -> dict | None:
     return dict(prog) if isinstance(prog, dict) else None
 
 
-def _is_sniper_v2_row(row) -> bool:
+def _row_get(row, key, default=None):
     try:
-        src = row["source"]
+        if isinstance(row, dict):
+            return row.get(key, default)
+        return row[key]
     except Exception:
-        src = None
+        return default
+
+
+def _is_sniper_v2_row(row) -> bool:
+    src = _row_get(row, "source")
     if src == SOURCE_SNIPER_V2:
         return True
-    try:
-        extra = _parse_features_blob(row["features_json"])
-    except Exception:
-        extra = {}
+    extra = _parse_features_blob(_row_get(row, "features_json"))
     return extra.get("sniper_v2") == SNIPER_V2_NEEDS
+
+
+def _is_v1tx_row(row) -> bool:
+    return _row_get(row, "source") == SOURCE_V1TX
+
+
+def _is_overnight_backlog_row(row) -> bool:
+    return _is_sniper_v2_row(row) or _is_v1tx_row(row)
+
+
+def _row_retry_after(row) -> float | None:
+    extra = _parse_features_blob(_row_get(row, "features_json"))
+    raw = extra.get("retry_after")
+    if raw is None and isinstance(extra.get("progress"), dict):
+        raw = extra["progress"].get("retry_after")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int,
                         overnight: bool = False):
-    """Newest-first, ~half new-this-tick and ~half backlog so the queue drains.
+    """Newest-first. New entries first, then overnight backlog ≥ half of the rest.
 
-    sniper_v2 requeue rows are overnight-only and behind new entries.
+    sniper_v2 / v1tx rows are overnight-only (or catch-up) and sit behind new
+    entries. After new entries they take at least half of the remaining cap.
     """
     cap = max(0, int(cap))
     if cap <= 0:
@@ -2491,7 +2810,7 @@ def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int,
     pset = set(priority_tids or [])
     newest_new = []
     newest_old = []
-    sniper_v2 = []
+    backlog = []
     seen: set[str] = set()
     for row in rows:
         tid = row["tid"]
@@ -2500,26 +2819,71 @@ def _fair_share_pending(rows, priority_tids: list[str] | None, cap: int,
         seen.add(tid)
         if tid in pset:
             newest_new.append(row)
-        elif _is_sniper_v2_row(row):
+        elif _is_overnight_backlog_row(row):
             if overnight:
-                sniper_v2.append(row)
+                backlog.append(row)
         else:
             newest_old.append(row)
     take_new = min(len(newest_new), (cap + 1) // 2)
-    take_old = min(len(newest_old), cap - take_new)
-    leftover = cap - take_new - take_old
-    if leftover and len(newest_new) > take_new:
-        extra = min(leftover, len(newest_new) - take_new)
-        take_new += extra
+    remaining = cap - take_new
+    take_backlog = min(len(backlog), (remaining + 1) // 2) if overnight else 0
+    take_old = min(len(newest_old), remaining - take_backlog)
+    leftover = remaining - take_backlog - take_old
+    if leftover and overnight and len(backlog) > take_backlog:
+        extra = min(leftover, len(backlog) - take_backlog)
+        take_backlog += extra
         leftover -= extra
     if leftover and len(newest_old) > take_old:
         extra = min(leftover, len(newest_old) - take_old)
         take_old += extra
         leftover -= extra
-    take_v2 = min(len(sniper_v2), leftover) if overnight else 0
+    if leftover and len(newest_new) > take_new:
+        extra = min(leftover, len(newest_new) - take_new)
+        take_new += extra
     return (
-        newest_new[:take_new] + newest_old[:take_old] + sniper_v2[:take_v2]
+        newest_new[:take_new] + backlog[:take_backlog] + newest_old[:take_old]
     )
+
+
+def _backlog_catchup(now: float | None = None) -> bool:
+    """True when overnight has not run in 24h and >50% of the day cap is free."""
+    ts = current_time() if now is None else float(now)
+    raw = _meta_get(META_LAST_OVERNIGHT)
+    try:
+        last = float(raw) if raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        last = 0.0
+    if ts - last < 24 * 3600:
+        return False
+    cap = max(0, day_cap())
+    if cap <= 0:
+        return False
+    return _day_used(ts) < 0.5 * cap
+
+
+def _mark_overnight_run(now: float | None = None) -> None:
+    ts = current_time() if now is None else float(now)
+    _meta_set(META_LAST_OVERNIGHT, str(ts))
+
+
+def _log_backlog_hourly(now: float | None = None) -> None:
+    ts = current_time() if now is None else float(now)
+    if not is_overnight(ts):
+        return
+    hour_key = time.strftime("%Y-%m-%dT%H", time.gmtime(ts))
+    if _meta_get(META_BACKLOG_LOG_HOUR) == hour_key:
+        return
+    try:
+        rows = pending_rows()
+    except Exception:
+        rows = []
+    n_v2 = sum(1 for r in rows if _is_sniper_v2_row(r))
+    n_v1 = sum(1 for r in rows if _is_v1tx_row(r))
+    log.info(
+        "young_trail_rugrisk backlog sniper_v2=%d v1tx=%d pending",
+        n_v2, n_v1,
+    )
+    _meta_set(META_BACKLOG_LOG_HOUR, hour_key)
 
 
 def compute_pending(now: float | None = None, limit: int | None = None,
@@ -2538,13 +2902,24 @@ def compute_pending(now: float | None = None, limit: int | None = None,
                WHERE status = 'pending'
                ORDER BY entry_ts DESC""",
         ).fetchall()
+        ready = []
+        for row in rows:
+            retry_at = _row_retry_after(row)
+            if retry_at is not None and retry_at > ts:
+                continue
+            ready.append(row)
         cap = limit if limit is not None else tick_entry_cap(ts)
-        allow_v2 = is_overnight(ts) if include_sniper_v2 is None else bool(
-            include_sniper_v2
-        )
+        if include_sniper_v2 is None:
+            allow_backlog = is_overnight(ts) or _backlog_catchup(ts)
+        else:
+            allow_backlog = bool(include_sniper_v2)
         ordered = _fair_share_pending(
-            rows, priority_tids, cap, overnight=allow_v2,
+            ready, priority_tids, cap, overnight=allow_backlog,
         )
+        if not ordered:
+            return 0
+        if not _rpc_reachable(ts):
+            return 0
         for row in ordered:
             need = 1 if _progress_from_row(row) else START_CALLS
             if not _can_charge(need, ts):
@@ -2558,7 +2933,12 @@ def compute_pending(now: float | None = None, limit: int | None = None,
             )
             if feat.get("status") == STATUS_BUDGET:
                 break
-            _store_features(tid, feat, ts, source)
+            store_src = source
+            if feat.get("status") == STATUS_PENDING:
+                prev = _row_get(row, "source")
+                if prev in (SOURCE_SNIPER_V2, SOURCE_V1TX):
+                    store_src = prev
+            _store_features(tid, feat, ts, store_src)
             n += 1
     except Exception as e:
         log.warning("young_trail_rugrisk compute: %s", safe_err(e))
@@ -2638,6 +3018,8 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
         overnight = is_overnight(ts)
         if overnight:
             requeue_sniper_v2_rows(now=ts)
+            _mark_overnight_run(ts)
+            _log_backlog_hourly(ts)
         cap = tick_entry_cap(ts)
         src = "live"
         computed = compute_pending(

@@ -454,6 +454,36 @@ def test_cutoff_and_sizing_unchanged():
     assert size_factor_for(ans2) == 1.0
 
 
+def test_max_tx_version_is_one_on_all_three_methods():
+    for method in ("getTransaction", "getBlock", "getTransactionsForAddress"):
+        out = judge_inputs._with_max_tx_version(
+            method, ["addr", {"encoding": "jsonParsed"}],
+        )
+        assert out[1]["maxSupportedTransactionVersion"] == 1
+        bare = judge_inputs._with_max_tx_version(method, ["addr"])
+        assert bare[1]["maxSupportedTransactionVersion"] == 1
+    other = judge_inputs._with_max_tx_version("getTokenSupply", ["mint"])
+    assert other == ["mint"]
+
+
+def test_tx_version_error_retries_once_and_succeeds():
+    n = {"n": 0}
+    versions = []
+
+    def rpc(method, params, timeout):
+        n["n"] += 1
+        versions.append((params[1] or {}).get("maxSupportedTransactionVersion"))
+        if n["n"] == 1:
+            raise RuntimeError("Transaction version (1) is not supported")
+        return [{"signature": "s"}]
+
+    judge_inputs.set_rpc_fn(rpc)
+    got = judge_inputs._rpc("getTransaction", ["sig", {"encoding": "jsonParsed"}], 8)
+    assert got == [{"signature": "s"}]
+    assert n["n"] == 2
+    assert versions == [1, 1]
+
+
 def test_thresholds_and_questions_diff_empty():
     for name in ("thresholds.py", "questions.py"):
         r = subprocess.run(
