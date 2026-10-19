@@ -2139,3 +2139,148 @@ def test_fixup_dev_prior_mints_drops_wsol_and_same_slot(ytr):
     db.commit()
     again = {r["tid"]: r for r in rug.all_rows()}[TID]
     assert again["dev_prior_launches"] == 1
+
+
+def test_fixup_leaves_null_launches_unknown(ytr):
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = ?",
+        (rug.META_DEV_MINTS,),
+    )
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             sniper_share, bundled, skip_snipers, skip_bundled, skip_dev_rugs,
+             features_json
+           ) VALUES (?, 'RRK', 'solana', ?, 1.0, 'ok',
+                      0.55, 1, 1, 1, NULL, ?)""",
+        (TID, T0, json.dumps({"create_slot": CREATE_SLOT, "prior_mints": []})),
+    )
+    db.commit()
+    assert rug.recompute_dev_from_cached(rug.all_rows()[0]) is None
+    rug._fixup_dev_prior_mints(db)
+    db.commit()
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["dev_prior_launches"] is None
+    assert row["dev_prior_rugs"] is None
+    assert row["skip_dev_rugs"] is None
+    assert row["sniper_share"] == pytest.approx(0.55)
+    assert row["status"] == "ok"
+    assert rug.would_skip(row, "dev_prior_rugs") is None
+
+
+def test_restore_dev_unknown_only_matching_rows(ytr):
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = ?",
+        (rug.META_RESTORE_DEV_UNKNOWN,),
+    )
+    cutoff = rug.devhist_restart_ts()
+    blob_empty = json.dumps({"create_slot": CREATE_SLOT, "prior_mints": []})
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             sniper_share, bundled, skip_snipers, skip_bundled,
+             dev_prior_launches, dev_prior_rugs, skip_dev_rugs,
+             features_json, computed_ts, source
+           ) VALUES (?, 'LEG', 'solana', ?, 1.0, 'ok',
+                      0.40, 0, 0, 0, 0, 0, 0, ?, ?, 'live')""",
+        (TID, T0, blob_empty, cutoff - 3600),
+    )
+    after = "AfterRestartMint1111111111111111111:1399811149"
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             dev_prior_launches, dev_prior_rugs, skip_dev_rugs,
+             features_json, computed_ts, source
+           ) VALUES (?, 'NEW', 'solana', ?, 1.0, 'ok',
+                      0, 0, 0, ?, ?, 'live')""",
+        (after, T0, blob_empty, cutoff + 60),
+    )
+    evidence = "EvidenceMint11111111111111111111111:1399811149"
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             dev_prior_launches, dev_prior_rugs, skip_dev_rugs,
+             features_json, computed_ts, source
+           ) VALUES (?, 'EV', 'solana', ?, 1.0, 'ok',
+                      0, 0, 0, ?, ?, 'live')""",
+        (evidence, T0, json.dumps({
+            "create_slot": CREATE_SLOT, "prior_mints": [],
+            "dev": {"dev_prior_launches": 0, "dev_prior_rugs": 0},
+        }), cutoff - 3600),
+    )
+    db.commit()
+    rug._restore_dev_unknown(db)
+    db.commit()
+    rows = {r["tid"]: r for r in rug.all_rows()}
+    hit = rows[TID]
+    assert hit["dev_prior_launches"] is None
+    assert hit["dev_prior_rugs"] is None
+    assert hit["skip_dev_rugs"] is None
+    assert hit["status"] == "pending"
+    assert hit["source"] == "devhist"
+    assert hit["sniper_share"] == pytest.approx(0.40)
+    assert hit["bundled"] == 0
+    assert rows[after]["status"] == "ok"
+    assert rows[after]["dev_prior_launches"] == 0
+    assert rows[after]["source"] == "live"
+    assert rows[evidence]["status"] == "ok"
+    assert rows[evidence]["dev_prior_launches"] == 0
+    rug._restore_dev_unknown(db)
+    db.commit()
+    assert {r["tid"]: r for r in rug.all_rows()}[TID]["source"] == "devhist"
+
+
+def test_devhist_recompute_preserves_sniper_bundle(ytr):
+    yt, helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             sniper_share, sniper_wallets, bundled, bundled_buys,
+             skip_snipers, skip_bundled, skip_dev_rugs,
+             dev_wallet, features_json, source
+           ) VALUES (?, 'RRK', 'solana', ?, 1.0, 'pending',
+                      0.55, 4, 1, 3, 1, 1, NULL, ?, ?, 'devhist')""",
+        (TID, T0, DEV, json.dumps({
+            "create_slot": CREATE_SLOT, "prior_mints": [],
+            "supply": 1000.0, "buys": [
+                {"owner": S1, "delta": 200, "slot": CREATE_SLOT},
+            ],
+        })),
+    )
+    db.commit()
+    helius.note_creator(TID, DEV, now=T0)
+    rpc = _rpc_scripted()
+    rug.set_rpc_fn(rpc)
+    rug.set_overnight_fn(lambda _n: False)
+    rug._meta_set(rug.META_LAST_OVERNIGHT, str(T0))
+    rug.begin_cycle(T0)
+    n_calls = len(rpc.calls)
+    assert rug.compute_pending(now=T0, limit=8) == 0
+    assert len(rpc.calls) == n_calls
+    day = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert day["status"] == "pending"
+    assert day["sniper_share"] == pytest.approx(0.55)
+    assert day["bundled"] == 1
+    rug.set_overnight_fn(lambda _n: True)
+    rug.begin_cycle(T0)
+    n = rug.compute_pending(now=T0, limit=8)
+    assert n == 1
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["status"] == "ok"
+    assert row["dev_prior_launches"] == 1
+    assert row["dev_prior_rugs"] == 1
+    assert row["skip_dev_rugs"] == 1
+    assert row["sniper_share"] == pytest.approx(0.55)
+    assert row["sniper_wallets"] == 4
+    assert row["bundled"] == 1
+    assert row["bundled_buys"] == 3
+    assert row["skip_snipers"] == 1
+    assert row["skip_bundled"] == 1
+    methods = [c[0] for c in rpc.calls]
+    assert methods.count("getTokenSupply") == 0
+    assert methods.count("getTokenLargestAccounts") == 0
