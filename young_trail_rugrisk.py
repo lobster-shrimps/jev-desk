@@ -101,6 +101,7 @@ STATUS_UNAVAILABLE = "unavailable"
 STATUS_BUDGET = "budget"
 SOURCE_SNIPER_V2 = "sniper_v2"
 SOURCE_V1TX = "v1tx"
+SOURCE_DEVHIST = "devhist"
 SNIPER_V2_OK = "ok"
 SNIPER_V2_NEEDS = "needs_recompute"
 META_SNIPER_V2 = "sniper_v2_invalidate"
@@ -109,6 +110,7 @@ META_TRANSIENT = "requeue_transient_rpc_errors"
 META_LAST_OVERNIGHT = "last_overnight_ts"
 META_BACKLOG_LOG_HOUR = "backlog_log_hour"
 META_DEV_MINTS = "fixup_dev_prior_mints"
+META_RESTORE_DEV_UNKNOWN = "ytr_restore_dev_unknown"
 
 RULE_SNIPERS = "snipers_gt_30"
 RULE_BUNDLED = "bundled"
@@ -293,6 +295,8 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
                  lambda: _requeue_transient_rpc_errors(conn))
     _schema_step(conn, "ytr_fixup_dev_prior_mints",
                  lambda: _fixup_dev_prior_mints(conn))
+    _schema_step(conn, "ytr_restore_dev_unknown",
+                 lambda: _restore_dev_unknown(conn))
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -449,6 +453,8 @@ def _fixup_dev_prior_mints(conn: sqlite3.Connection) -> None:
     """One-time: drop wSOL / current mint / same-slot noise from stored prior_mints.
 
     No RPC. Recomputes dev_prior_launches, dev_prior_rugs, skip_dev_rugs.
+    Rows that never ran dev history (launches NULL) stay unknown — an empty
+    prior_mints placeholder is not evidence of 0.
     """
     row = conn.execute(
         "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
@@ -462,38 +468,21 @@ def _fixup_dev_prior_mints(conn: sqlite3.Connection) -> None:
         ).fetchall()
         for raw in rows:
             d = _row_dict(raw)
-            extra = _parse_features_blob(d.get("features_json"))
-            if "prior_mints" not in extra:
+            updated = recompute_dev_from_cached(d)
+            if not updated:
                 continue
-            mint, _net = parse_tid(d.get("tid"))
-            create_slot = extra.get("create_slot")
-            if create_slot is None:
-                create_slot = d.get("create_slot")
-            filtered = filter_stored_prior_mints(
-                extra.get("prior_mints"), mint, create_slot,
-            )
-            n_launch = len(filtered)
-            n_rug = sum(1 for p in filtered if p.get("rugged"))
-            flags = skip_flags({
-                "status": STATUS_OK,
-                "dev_prior_launches": n_launch,
-                "dev_prior_rugs": n_rug,
-                "sniper_share": d.get("sniper_share"),
-                "sniper_wallets": d.get("sniper_wallets"),
-                "sniper_min_wallets": d.get("sniper_min_wallets"),
-                "bundled": d.get("bundled"),
-            })
-            extra["prior_mints"] = filtered[:8]
-            extra_s = json.dumps(extra)
+            extra = updated.get("features_json")
+            extra_s = json.dumps(extra) if extra is not None else d.get("features_json")
+            skip = updated.get("skip_dev_rugs")
             conn.execute(
                 """UPDATE young_trail_rugrisk SET
                      dev_prior_launches = ?, dev_prior_rugs = ?,
                      skip_dev_rugs = ?, features_json = ?
                    WHERE tid = ?""",
                 (
-                    n_launch, n_rug,
-                    None if flags["skip_dev_rugs"] is None
-                    else int(bool(flags["skip_dev_rugs"])),
+                    updated.get("dev_prior_launches"),
+                    updated.get("dev_prior_rugs"),
+                    None if skip is None else int(bool(skip)),
                     extra_s, d["tid"],
                 ),
             )
@@ -505,6 +494,99 @@ def _fixup_dev_prior_mints(conn: sqlite3.Connection) -> None:
            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
         (META_DEV_MINTS, "1"),
     )
+
+
+def devhist_restart_ts() -> float:
+    """#79 restart: 2026-10-19 08:41:52 America/New_York. Computed, not a raw epoch."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/New_York")
+        return datetime(2026, 10, 19, 8, 41, 52, tzinfo=tz).timestamp()
+    except Exception:
+        # 2026-10-19 is EDT (UTC-4).
+        return float(calendar.timegm((2026, 10, 19, 12, 41, 52)))
+
+
+def _has_dev_lookup_evidence(extra: dict) -> bool:
+    """True when features_json shows a real _dev_history lookup, not a placeholder."""
+    if not isinstance(extra, dict):
+        return False
+    if extra.get("dev"):
+        return True
+    prog = extra.get("progress")
+    if isinstance(prog, dict):
+        if prog.get("dev_done") or prog.get("dev"):
+            return True
+    return False
+
+
+def _restore_dev_unknown(conn: sqlite3.Connection) -> None:
+    """One-time: undo 0/0 written onto rows that never ran dev history. No RPC.
+
+    Matching ok rows go back to unknown (NULL launches/rugs/skip) and are
+    queued overnight as source=devhist for a 2-call lookup.
+    """
+    row = conn.execute(
+        "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
+        (META_RESTORE_DEV_UNKNOWN,),
+    ).fetchone()
+    if row and str(row["value"]) == "1":
+        return
+    cutoff = devhist_restart_ts()
+    n = 0
+    try:
+        rows = conn.execute(
+            "SELECT * FROM young_trail_rugrisk WHERE status = 'ok'"
+        ).fetchall()
+        for raw in rows:
+            d = _row_dict(raw)
+            extra = _parse_features_blob(d.get("features_json"))
+            if not _row_is_false_dev_zero(d, extra, cutoff):
+                continue
+            conn.execute(
+                """UPDATE young_trail_rugrisk SET
+                     dev_prior_launches = NULL,
+                     dev_prior_rugs = NULL,
+                     skip_dev_rugs = NULL,
+                     status = 'pending',
+                     error = NULL,
+                     source = ?
+                   WHERE tid = ? AND status = 'ok'""",
+                (SOURCE_DEVHIST, d["tid"]),
+            )
+            n += 1
+    except Exception as e:
+        log.warning("young_trail_rugrisk restore dev unknown: %s", safe_err(e))
+        raise
+    conn.execute(
+        """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (META_RESTORE_DEV_UNKNOWN, "1"),
+    )
+    if n:
+        log.info("young_trail_rugrisk restore dev unknown n=%d paper=1", n)
+
+
+def _row_is_false_dev_zero(d: dict, extra: dict, cutoff: float) -> bool:
+    if (d.get("status") or "") != STATUS_OK:
+        return False
+    cts = _num(d.get("computed_ts"))
+    if cts is None or float(cts) >= float(cutoff):
+        return False
+    try:
+        if int(d.get("dev_prior_launches")) != 0:
+            return False
+        if int(d.get("dev_prior_rugs")) != 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    prior = extra.get("prior_mints") if isinstance(extra, dict) else None
+    if not isinstance(prior, list) or len(prior) != 0:
+        return False
+    if _has_dev_lookup_evidence(extra):
+        return False
+    return True
 
 
 def _connect() -> sqlite3.Connection:
@@ -2292,6 +2374,48 @@ def filter_stored_prior_mints(prior_mints, current_mint: str | None,
     return out
 
 
+def recompute_dev_from_cached(row: dict) -> dict | None:
+    """Rebuild launch/rug counts from stored prior_mints. No RPC.
+
+    Returns None when pre-fixup launches were unknown (NULL). An empty
+    prior_mints list is not evidence of 0.
+    """
+    if not row or row.get("status") not in (STATUS_OK, None):
+        if row and row.get("status") != STATUS_OK:
+            return None
+    if row.get("dev_prior_launches") is None:
+        return None
+    extra = _parse_features_blob(row.get("features_json"))
+    if "prior_mints" not in extra:
+        return None
+    mint, _net = parse_tid(row.get("tid"))
+    create_slot = extra.get("create_slot")
+    if create_slot is None:
+        create_slot = row.get("create_slot")
+    filtered = filter_stored_prior_mints(
+        extra.get("prior_mints"), mint, create_slot,
+    )
+    n_launch = len(filtered)
+    n_rug = sum(1 for p in filtered if p.get("rugged"))
+    out = dict(row)
+    out["dev_prior_launches"] = n_launch
+    out["dev_prior_rugs"] = n_rug
+    extra = dict(extra)
+    extra["prior_mints"] = filtered[:8]
+    out["features_json"] = extra
+    flags = skip_flags({
+        "status": STATUS_OK,
+        "dev_prior_launches": n_launch,
+        "dev_prior_rugs": n_rug,
+        "sniper_share": row.get("sniper_share"),
+        "sniper_wallets": row.get("sniper_wallets"),
+        "sniper_min_wallets": row.get("sniper_min_wallets"),
+        "bundled": row.get("bundled"),
+    })
+    out["skip_dev_rugs"] = flags["skip_dev_rugs"]
+    return out
+
+
 def _rec_dev_signed(rec: dict, dev_wallet: str | None) -> bool:
     if not dev_wallet:
         return False
@@ -2886,6 +3010,126 @@ def sync_entries(now: float | None = None) -> int:
     return n
 
 
+def compute_devhist_only(row, now: float | None = None) -> dict:
+    """Fill dev_prior_* from RPC (~2 calls). Does not recompute sniper/bundled."""
+    ts = current_time() if now is None else float(now)
+    d = _row_dict(row) if not isinstance(row, dict) else dict(row)
+    extra = _parse_features_blob(d.get("features_json"))
+    mint, _net = parse_tid(d.get("tid"))
+    creator = d.get("dev_wallet") or _lookup_creator(d.get("tid") or "")
+    if not creator:
+        creators = extra.get("creators") or []
+        if creators:
+            creator = str(creators[0])
+    unknown = {
+        "status": STATUS_OK,
+        "dev_wallet": creator,
+        "dev_prior_launches": None,
+        "dev_prior_rugs": None,
+        "prior_mints": [],
+        "skip_dev_rugs": None,
+        "features_json": extra,
+    }
+    if not creator or not mint:
+        return unknown
+    recs = None
+    sigs = None
+    prog = extra.get("progress")
+    if isinstance(prog, dict):
+        if prog.get("tx_recs"):
+            recs = prog.get("tx_recs")
+        if prog.get("creator_sigs") is not None:
+            sigs = prog.get("creator_sigs")
+    create_slot = extra.get("create_slot")
+    if create_slot is None:
+        create_slot = d.get("create_slot")
+    try:
+        dev = _dev_history(
+            creator, mint, now=ts, recs=recs, sigs=sigs, create_slot=create_slot,
+        )
+    except Exception as e:
+        msg = safe_err(e)
+        if "budget" in str(e).lower() or "budget" in msg.lower():
+            return {"status": STATUS_BUDGET, "features_json": extra}
+        if _is_transient_rpc_error(e):
+            extra = dict(extra)
+            extra["retry_after"] = ts + RETRY_AFTER_SEC
+            extra["last_error"] = msg
+            return {
+                "status": STATUS_PENDING,
+                "dev_wallet": creator,
+                "dev_prior_launches": None,
+                "dev_prior_rugs": None,
+                "skip_dev_rugs": None,
+                "features_json": extra,
+            }
+        log.warning("young_trail_rugrisk devhist %s: %s", (mint or "")[:12], msg)
+        return unknown
+    if dev.get("dev_prior_launches") is None:
+        extra = dict(extra)
+        return {
+            "status": STATUS_PENDING,
+            "dev_wallet": creator,
+            "dev_prior_launches": None,
+            "dev_prior_rugs": None,
+            "skip_dev_rugs": None,
+            "features_json": extra,
+        }
+    extra = dict(extra)
+    extra["prior_mints"] = (dev.get("prior_mints") or [])[:8]
+    flags = skip_flags({
+        "status": STATUS_OK,
+        "dev_prior_launches": dev.get("dev_prior_launches"),
+        "dev_prior_rugs": dev.get("dev_prior_rugs"),
+        "sniper_share": d.get("sniper_share"),
+        "sniper_wallets": d.get("sniper_wallets"),
+        "sniper_min_wallets": d.get("sniper_min_wallets"),
+        "bundled": d.get("bundled"),
+    })
+    return {
+        "status": STATUS_OK,
+        "dev_wallet": creator,
+        "dev_prior_launches": dev.get("dev_prior_launches"),
+        "dev_prior_rugs": dev.get("dev_prior_rugs"),
+        "prior_mints": extra["prior_mints"],
+        "skip_dev_rugs": flags["skip_dev_rugs"],
+        "features_json": extra,
+    }
+
+
+def _store_devhist(tid: str, feat: dict, now: float, source: str) -> None:
+    """Write only dev-history columns. Sniper / bundled fields stay as they are."""
+    extra = feat.get("features_json")
+    extra_s = json.dumps(extra) if extra is not None else None
+    skip = feat.get("skip_dev_rugs")
+    db = _connect()
+    db.execute(
+        """UPDATE young_trail_rugrisk SET
+             status = ?,
+             dev_wallet = ?,
+             dev_prior_launches = ?,
+             dev_prior_rugs = ?,
+             skip_dev_rugs = ?,
+             features_json = ?,
+             error = NULL,
+             source = ?,
+             computed_ts = ?
+           WHERE tid = ?""",
+        (
+            feat.get("status") or STATUS_OK,
+            feat.get("dev_wallet"),
+            feat.get("dev_prior_launches"),
+            feat.get("dev_prior_rugs"),
+            None if skip is None else int(bool(skip)),
+            extra_s,
+            source,
+            float(now),
+            tid,
+        ),
+    )
+    db.commit()
+
+
 def _store_features(tid: str, feat: dict, now: float, source: str) -> None:
     flags = skip_flags(feat)
     extra = feat.get("features_json")
@@ -2964,8 +3208,12 @@ def _is_v1tx_row(row) -> bool:
     return _row_get(row, "source") == SOURCE_V1TX
 
 
+def _is_devhist_row(row) -> bool:
+    return _row_get(row, "source") == SOURCE_DEVHIST
+
+
 def _is_overnight_backlog_row(row) -> bool:
-    return _is_sniper_v2_row(row) or _is_v1tx_row(row)
+    return _is_sniper_v2_row(row) or _is_v1tx_row(row) or _is_devhist_row(row)
 
 
 def _row_retry_after(row) -> float | None:
@@ -3103,10 +3351,20 @@ def compute_pending(now: float | None = None, limit: int | None = None,
         if not _rpc_reachable(ts):
             return 0
         for row in ordered:
+            tid = row["tid"]
+            if _is_devhist_row(row):
+                need = 2
+                if not _can_charge(need, ts):
+                    break
+                feat = compute_devhist_only(row, ts)
+                if feat.get("status") == STATUS_BUDGET:
+                    break
+                _store_devhist(tid, feat, ts, SOURCE_DEVHIST)
+                n += 1
+                continue
             need = 1 if _progress_from_row(row) else START_CALLS
             if not _can_charge(need, ts):
                 break
-            tid = row["tid"]
             mint, _net = parse_tid(tid)
             creator = _lookup_creator(tid)
             feat = compute_features(
@@ -3118,7 +3376,7 @@ def compute_pending(now: float | None = None, limit: int | None = None,
             store_src = source
             if feat.get("status") == STATUS_PENDING:
                 prev = _row_get(row, "source")
-                if prev in (SOURCE_SNIPER_V2, SOURCE_V1TX):
+                if prev in (SOURCE_SNIPER_V2, SOURCE_V1TX, SOURCE_DEVHIST):
                     store_src = prev
             _store_features(tid, feat, ts, store_src)
             n += 1
