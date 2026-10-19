@@ -51,8 +51,13 @@ def _tok(tid=TID, ticker="RRK", age=22.0, price=ENTRY, chain="solana",
     return row
 
 
-def _ix(kind, mint):
-    return {"parsed": {"type": kind, "info": {"mint": mint}}}
+def _ix(kind, mint, program_id=None, program=None):
+    out = {"parsed": {"type": kind, "info": {"mint": mint}}}
+    if program_id:
+        out["programId"] = program_id
+    if program:
+        out["program"] = program
+    return out
 
 
 def _tx(slot, mint, deltas, ixs=None, signer=None):
@@ -137,16 +142,17 @@ def _rpc_scripted(buys=None, supply=1000.0, holders=None, wallet_n=None,
         txs.update(extra_txs)
     sig_by_addr = dict(sig_by_addr or {})
 
-    creator_txs = creator_txs or [
-        ("devcreate", CREATE_SLOT - 50, PRIOR, "initializeMint",
-         [(DEV, 0, 1)]),
-        ("devrug", CREATE_SLOT - 10, PRIOR, "removeLiquidity",
-         [(DEV, 1, 0)]),
-    ]
+    if creator_txs is None:
+        creator_txs = [
+            ("devcreate", CREATE_SLOT - 50, PRIOR, "initializeMint",
+             [(DEV, 0, 1)]),
+            ("devrug", CREATE_SLOT - 10, PRIOR, "removeLiquidity",
+             [(DEV, 1, 0)]),
+        ]
     creator_sigs = []
     for sig, slot, mint, kind, deltas in creator_txs:
         creator_sigs.append({"signature": sig, "slot": slot, "err": None})
-        txs[sig] = _tx(slot, mint, deltas, ixs=[_ix(kind, mint)])
+        txs[sig] = _tx(slot, mint, deltas, ixs=[_ix(kind, mint)], signer=DEV)
 
     calls = []
 
@@ -1970,3 +1976,166 @@ def test_health_probe_skips_tick_when_unreachable(ytr):
     methods = [c[0] for c in rpc.calls]
     assert methods.count("getHealth") == 1
     assert "getTokenSupply" not in methods
+
+
+def _ata_create(mint):
+    return _ix(
+        "create", mint,
+        program_id="ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        program="spl-associated-token-account",
+    )
+
+
+def test_create_tx_wsol_and_ata_not_prior_launches():
+    import young_trail_rugrisk as r
+    wsol = r.WSOL_MINT
+    create_tx = _tx(
+        CREATE_SLOT, MINT,
+        [(DEV, 0, 50)],
+        ixs=[
+            _ix("create", MINT, program_id=r.PUMP_PROGRAM_ID),
+            _ata_create(wsol),
+            _ata_create(MINT),
+        ],
+        signer=DEV,
+    )
+    rec = r._tx_record("csig", create_tx, MINT)
+    assert wsol not in rec["created_mints"]
+    assert rec["created_mints"] == [MINT]
+    out = r._dev_from_recs(
+        {"csig": rec}, MINT, dev_wallet=DEV, create_slot=CREATE_SLOT,
+    )
+    assert out["dev_prior_launches"] == 0
+    assert out["dev_prior_rugs"] == 0
+    assert out["prior_mints"] == []
+
+
+def test_earlier_pump_create_by_fee_payer_counts_as_prior_launch():
+    import young_trail_rugrisk as r
+    wsol = r.WSOL_MINT
+    create_tx = _tx(
+        CREATE_SLOT, MINT, [(DEV, 0, 50)],
+        ixs=[
+            _ix("create", MINT, program_id=r.PUMP_PROGRAM_ID),
+            _ata_create(wsol),
+            _ata_create(MINT),
+        ],
+        signer=DEV,
+    )
+    prior_tx = _tx(
+        CREATE_SLOT - 50, PRIOR, [(DEV, 0, 1)],
+        ixs=[_ix("create", PRIOR, program_id=r.PUMP_PROGRAM_ID)],
+        signer=DEV,
+    )
+    recs = {
+        "csig": r._tx_record("csig", create_tx, MINT),
+        "psig": r._tx_record("psig", prior_tx, MINT),
+    }
+    out = r._dev_from_recs(
+        recs, MINT, dev_wallet=DEV, create_slot=CREATE_SLOT,
+    )
+    assert out["dev_prior_launches"] == 1
+    assert out["prior_mints"][0]["mint"] == PRIOR
+    assert out["prior_mints"][0]["slot"] == CREATE_SLOT - 50
+
+
+def test_create_tx_wsol_ata_compute_features_zero_then_one(ytr):
+    _yt, _helius, rug = ytr
+    wsol = rug.WSOL_MINT
+    rpc = _rpc_scripted(
+        tx_list=[
+            {
+                "signature": "asigcreate", "slot": CREATE_SLOT,
+                "deltas": [(DEV, 0, 50)],
+                "ixs": [
+                    _ix("create", MINT, program_id=rug.PUMP_PROGRAM_ID),
+                    _ata_create(wsol),
+                    _ata_create(MINT),
+                ],
+                "signer": DEV,
+            },
+        ],
+        creator_txs=[],
+        supply=1000.0,
+        wallet_n={DEV: 8, S1: 1, S2: 1, S3: 2, WHALE: 20},
+    )
+    rug.set_rpc_fn(rpc)
+    rug.begin_cycle(T0)
+    none = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert none["status"] == "ok"
+    assert none["dev_prior_launches"] == 0
+    assert none["dev_prior_rugs"] == 0
+    assert none["skip_dev_rugs"] is False
+
+    rpc2 = _rpc_scripted(
+        tx_list=[
+            {
+                "signature": "asigcreate", "slot": CREATE_SLOT,
+                "deltas": [(DEV, 0, 50)],
+                "ixs": [
+                    _ix("create", MINT, program_id=rug.PUMP_PROGRAM_ID),
+                    _ata_create(wsol),
+                    _ata_create(MINT),
+                ],
+                "signer": DEV,
+            },
+        ],
+        creator_txs=[
+            ("priorcreate", CREATE_SLOT - 50, PRIOR, "create", [(DEV, 0, 1)]),
+        ],
+        extra_txs={
+            "priorcreate": _tx(
+                CREATE_SLOT - 50, PRIOR, [(DEV, 0, 1)],
+                ixs=[_ix("create", PRIOR, program_id=rug.PUMP_PROGRAM_ID)],
+                signer=DEV,
+            ),
+        },
+        supply=1000.0,
+        wallet_n={DEV: 8, S1: 1, S2: 1, S3: 2, WHALE: 20},
+    )
+    rug.reset()
+    rug.set_time_fn(lambda: T0)
+    rug.set_rpc_fn(rpc2)
+    rug.begin_cycle(T0)
+    one = rug.compute_features(MINT, creator=DEV, now=T0)
+    assert one["status"] == "ok"
+    assert one["dev_prior_launches"] == 1
+    assert (one.get("features_json") or {}).get("prior_mints")[0]["mint"] == PRIOR
+
+
+def test_fixup_dev_prior_mints_drops_wsol_and_same_slot(ytr):
+    _yt, _helius, rug = ytr
+    db = rug._connect()
+    db.execute(
+        "DELETE FROM young_trail_rugrisk_meta WHERE key = ?",
+        (rug.META_DEV_MINTS,),
+    )
+    blob = {
+        "create_slot": CREATE_SLOT,
+        "prior_mints": [
+            {"mint": PRIOR, "slot": CREATE_SLOT, "rugged": False},
+            {"mint": rug.WSOL_MINT, "slot": CREATE_SLOT, "rugged": False},
+            {"mint": "EarlierMint1111111111111111111111111",
+             "slot": CREATE_SLOT - 80, "rugged": True},
+        ],
+    }
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, entry_price, status,
+             dev_prior_launches, dev_prior_rugs, skip_dev_rugs, features_json
+           ) VALUES (?, 'RRK', 'solana', ?, 1.0, 'ok', 3, 1, 1, ?)""",
+        (TID, T0, json.dumps(blob)),
+    )
+    db.commit()
+    rug._fixup_dev_prior_mints(db)
+    db.commit()
+    row = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert row["dev_prior_launches"] == 1
+    assert row["dev_prior_rugs"] == 1
+    assert row["skip_dev_rugs"] == 1
+    prior = _feat_json(row).get("prior_mints")
+    assert [p["mint"] for p in prior] == ["EarlierMint1111111111111111111111111"]
+    rug._fixup_dev_prior_mints(db)
+    db.commit()
+    again = {r["tid"]: r for r in rug.all_rows()}[TID]
+    assert again["dev_prior_launches"] == 1

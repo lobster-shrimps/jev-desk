@@ -84,6 +84,8 @@ TARGET_ENTRY_CALLS = 8
 DEFAULT_TICK_ENTRIES = 8
 START_CALLS = 4
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+ATA_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 BONDING_CURVE_SEED = b"bonding-curve"
 BONDING_CURVE_V2_SEED = b"bonding-curve-v2"
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -106,6 +108,7 @@ META_V1TX = "requeue_v1tx"
 META_TRANSIENT = "requeue_transient_rpc_errors"
 META_LAST_OVERNIGHT = "last_overnight_ts"
 META_BACKLOG_LOG_HOUR = "backlog_log_hour"
+META_DEV_MINTS = "fixup_dev_prior_mints"
 
 RULE_SNIPERS = "snipers_gt_30"
 RULE_BUNDLED = "bundled"
@@ -137,6 +140,12 @@ CREATE_IX = {
     "initializeMint", "initializeMint2", "InitializeMint", "InitializeMint2",
     "create", "Create", "create_v2", "CreateV2", "createMetadataAccountV3",
 }
+# Prior-launch instructions: pump.fun create or SPL initializeMint. ATA
+# `create` and metadata creates are not launches.
+SPL_MINT_IX = {
+    "initializeMint", "initializeMint2", "InitializeMint", "InitializeMint2",
+}
+PUMP_CREATE_IX = {"create", "Create", "create_v2", "CreateV2"}
 RUG_IX = {
     "removeLiquidity", "remove_liquidity", "withdraw", "withdrawAll",
     "closeAccount", "sell", "withdrawProtocolFee",
@@ -282,6 +291,8 @@ def init_schema(db: sqlite3.Connection | None = None) -> None:
                  lambda: _requeue_v1tx_rows(conn))
     _schema_step(conn, "ytr_requeue_transient_rpc_errors",
                  lambda: _requeue_transient_rpc_errors(conn))
+    _schema_step(conn, "ytr_fixup_dev_prior_mints",
+                 lambda: _fixup_dev_prior_mints(conn))
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -431,6 +442,68 @@ def _requeue_transient_rpc_errors(conn: sqlite3.Connection) -> None:
         """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
         (META_TRANSIENT, "1"),
+    )
+
+
+def _fixup_dev_prior_mints(conn: sqlite3.Connection) -> None:
+    """One-time: drop wSOL / current mint / same-slot noise from stored prior_mints.
+
+    No RPC. Recomputes dev_prior_launches, dev_prior_rugs, skip_dev_rugs.
+    """
+    row = conn.execute(
+        "SELECT value FROM young_trail_rugrisk_meta WHERE key = ?",
+        (META_DEV_MINTS,),
+    ).fetchone()
+    if row and str(row["value"]) == "1":
+        return
+    try:
+        rows = conn.execute(
+            "SELECT * FROM young_trail_rugrisk WHERE status = 'ok'"
+        ).fetchall()
+        for raw in rows:
+            d = _row_dict(raw)
+            extra = _parse_features_blob(d.get("features_json"))
+            if "prior_mints" not in extra:
+                continue
+            mint, _net = parse_tid(d.get("tid"))
+            create_slot = extra.get("create_slot")
+            if create_slot is None:
+                create_slot = d.get("create_slot")
+            filtered = filter_stored_prior_mints(
+                extra.get("prior_mints"), mint, create_slot,
+            )
+            n_launch = len(filtered)
+            n_rug = sum(1 for p in filtered if p.get("rugged"))
+            flags = skip_flags({
+                "status": STATUS_OK,
+                "dev_prior_launches": n_launch,
+                "dev_prior_rugs": n_rug,
+                "sniper_share": d.get("sniper_share"),
+                "sniper_wallets": d.get("sniper_wallets"),
+                "sniper_min_wallets": d.get("sniper_min_wallets"),
+                "bundled": d.get("bundled"),
+            })
+            extra["prior_mints"] = filtered[:8]
+            extra_s = json.dumps(extra)
+            conn.execute(
+                """UPDATE young_trail_rugrisk SET
+                     dev_prior_launches = ?, dev_prior_rugs = ?,
+                     skip_dev_rugs = ?, features_json = ?
+                   WHERE tid = ?""",
+                (
+                    n_launch, n_rug,
+                    None if flags["skip_dev_rugs"] is None
+                    else int(bool(flags["skip_dev_rugs"])),
+                    extra_s, d["tid"],
+                ),
+            )
+    except Exception as e:
+        log.warning("young_trail_rugrisk dev mints fixup: %s", safe_err(e))
+        raise
+    conn.execute(
+        """INSERT INTO young_trail_rugrisk_meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (META_DEV_MINTS, "1"),
     )
 
 
@@ -1928,7 +2001,7 @@ def _tx_has_create_ix(tx: dict, mint: str | None = None) -> bool:
         return False
     try:
         for ix in _iter_parsed_ix(tx):
-            if _ix_type(ix) not in CREATE_IX:
+            if not _ix_is_launch(ix):
                 continue
             ix_mint = _ix_mint(ix)
             if mint is None or not ix_mint or ix_mint == mint:
@@ -1939,19 +2012,26 @@ def _tx_has_create_ix(tx: dict, mint: str | None = None) -> bool:
 
 
 def _tx_record(sig: str, tx: dict | None, mint: str) -> dict:
-    """Compact resume record: buyers, signers, create/rug ixs. No raw RPC blob."""
+    """Compact resume record: buyers, signers, create/rug ixs. No raw RPC blob.
+
+    `created_mints` is only pump.fun create / SPL initializeMint, never wSOL
+    or ATA `create` mints from token-account setup.
+    """
     if not tx or not isinstance(tx, dict):
         return _empty_tx_record(sig)
     try:
         created, rugged = [], []
+        seen_c: set[str] = set()
+        seen_r: set[str] = set()
         for ix in _iter_parsed_ix(tx):
-            kind = _ix_type(ix)
             ix_mint = _ix_mint(ix)
-            if not ix_mint:
+            if not ix_mint or ix_mint == WSOL_MINT:
                 continue
-            if kind in CREATE_IX:
+            if _ix_is_launch(ix) and ix_mint not in seen_c:
+                seen_c.add(ix_mint)
                 created.append(str(ix_mint))
-            if kind in RUG_IX:
+            if _ix_type(ix) in RUG_IX and ix_mint not in seen_r:
+                seen_r.add(ix_mint)
                 rugged.append(str(ix_mint))
         return {
             "signature": sig,
@@ -2074,6 +2154,40 @@ def _ix_type(ix: dict) -> str:
     return ""
 
 
+def _ix_program_id(ix: dict) -> str:
+    if not isinstance(ix, dict):
+        return ""
+    return str(ix.get("programId") or "")
+
+
+def _ix_is_ata(ix: dict) -> bool:
+    if not isinstance(ix, dict):
+        return False
+    pid = _ix_program_id(ix)
+    if pid == ATA_PROGRAM_ID:
+        return True
+    prog = str(ix.get("program") or "").lower()
+    return "associated-token" in prog
+
+
+def _ix_is_launch(ix: dict) -> bool:
+    """True for a pump.fun create or SPL initializeMint/initializeMint2.
+
+    ATA `create` (same parsed type as pump create) is not a launch.
+    """
+    kind = _ix_type(ix)
+    if kind in SPL_MINT_IX:
+        return True
+    if kind not in PUMP_CREATE_IX:
+        return False
+    if _ix_is_ata(ix):
+        return False
+    pid = _ix_program_id(ix)
+    if pid and pid != PUMP_PROGRAM_ID:
+        return False
+    return True
+
+
 def _ix_mint(ix: dict) -> str | None:
     parsed = ix.get("parsed")
     if not isinstance(parsed, dict):
@@ -2146,30 +2260,90 @@ def _label_rugged(mint: str) -> bool | None:
         return None
 
 
-def _dev_from_recs(recs, current_mint: str) -> dict:
-    """Prior launches / rugs already sitting in compact tx recs. No RPC."""
+def filter_stored_prior_mints(prior_mints, current_mint: str | None,
+                              create_slot=None) -> list[dict]:
+    """Drop wSOL, the current mint, and same-slot (not-prior) entries. Pure."""
+    out = []
+    seen: set[str] = set()
+    cur = str(current_mint) if current_mint else ""
+    slot_now = None
+    if create_slot is not None:
+        try:
+            slot_now = int(create_slot)
+        except (TypeError, ValueError):
+            slot_now = None
+    for item in prior_mints or []:
+        if not isinstance(item, dict):
+            continue
+        mint = str(item.get("mint") or "")
+        if not mint or mint == WSOL_MINT or (cur and mint == cur):
+            continue
+        if mint in seen:
+            continue
+        slot = item.get("slot")
+        if slot_now is not None and slot is not None:
+            try:
+                if int(slot) == slot_now:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        seen.add(mint)
+        out.append(dict(item))
+    return out
+
+
+def _rec_dev_signed(rec: dict, dev_wallet: str | None) -> bool:
+    if not dev_wallet:
+        return False
+    signers = rec.get("signers") or []
+    return str(dev_wallet) in {str(s) for s in signers if s}
+
+
+def _dev_from_recs(recs, current_mint: str, dev_wallet: str | None = None,
+                   create_slot=None) -> dict:
+    """Prior launches / rugs already sitting in compact tx recs. No RPC.
+
+    A mint counts only when the rec has a pump/SPL create for it, the dev
+    wallet signed, the mint is not wSOL/current, and the tx is not in the
+    current mint's create slot.
+    """
     launches: dict[str, dict] = {}
+    rug_hits: list[tuple[str, object]] = []
     if isinstance(recs, dict):
         items = recs.values()
     else:
         items = recs or []
+    slot_now = None
+    if create_slot is not None:
+        try:
+            slot_now = int(create_slot)
+        except (TypeError, ValueError):
+            slot_now = None
     for rec in items:
         if not isinstance(rec, dict):
             continue
         slot = rec.get("slot")
+        if slot_now is not None and slot is not None:
+            try:
+                if int(slot) == slot_now:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        if dev_wallet and not _rec_dev_signed(rec, dev_wallet):
+            continue
         for mint in rec.get("created_mints") or []:
             mint = str(mint)
-            if not mint or mint == current_mint:
+            if not mint or mint == WSOL_MINT or mint == current_mint:
                 continue
             launches.setdefault(mint, {"mint": mint, "slot": slot, "rugged": False})
         for mint in rec.get("rugged_mints") or []:
             mint = str(mint)
-            if not mint or mint == current_mint:
+            if not mint or mint == WSOL_MINT or mint == current_mint:
                 continue
-            if mint in launches:
-                launches[mint]["rugged"] = True
-            else:
-                launches[mint] = {"mint": mint, "slot": slot, "rugged": True}
+            rug_hits.append((mint, slot))
+    for mint, slot in rug_hits:
+        if mint in launches:
+            launches[mint]["rugged"] = True
     for mint, rec in list(launches.items()):
         labeled = _label_rugged(mint)
         if labeled:
@@ -2192,7 +2366,8 @@ def _compact_dev(dev: dict) -> dict:
 
 
 def _dev_history(creator: str, current_mint: str,
-                 now: float | None = None, recs=None, sigs=None) -> dict:
+                 now: float | None = None, recs=None, sigs=None,
+                 create_slot=None) -> dict:
     """Prior launches by creator + cheap rug flags (LP pull / labels).
 
     Reuses creator-scan recs / cached history so a low remaining budget does
@@ -2207,7 +2382,9 @@ def _dev_history(creator: str, current_mint: str,
     if cached is not None:
         return dict(cached)
 
-    from_recs = _dev_from_recs(recs, current_mint)
+    from_recs = _dev_from_recs(
+        recs, current_mint, dev_wallet=creator, create_slot=create_slot,
+    )
     if from_recs["dev_prior_launches"] or from_recs["dev_prior_rugs"]:
         _dev_cache[creator] = _compact_dev(from_recs)
         log.info(
@@ -2273,7 +2450,9 @@ def _dev_history(creator: str, current_mint: str,
         for sig in need:
             rec_map[sig] = _tx_record(sig, fetched.get(sig), current_mint)
 
-    merged = _dev_from_recs(rec_map, current_mint)
+    merged = _dev_from_recs(
+        rec_map, current_mint, dev_wallet=creator, create_slot=create_slot,
+    )
     _dev_cache[creator] = _compact_dev(merged)
     log.info(
         "young_trail_rugrisk dev history src=rpc sigs=%d rpc_sigs=%s rpc_txs=%d "
@@ -2460,7 +2639,9 @@ def compute_features(mint: str, creator: str | None = None,
                 prog["dev"] = _compact_dev(dev)
                 prog["dev_done"] = True
             elif calls_used() >= TARGET_ENTRY_CALLS:
-                from_recs = _dev_from_recs(tx_recs, mint)
+                from_recs = _dev_from_recs(
+                    tx_recs, mint, dev_wallet=dev_wallet, create_slot=create_slot,
+                )
                 if from_recs["dev_prior_launches"] or from_recs["dev_prior_rugs"]:
                     dev = from_recs
                     prog["dev"] = _compact_dev(dev)
@@ -2476,6 +2657,7 @@ def compute_features(mint: str, creator: str | None = None,
                 dev = _dev_history(
                     dev_wallet, mint, now=ts,
                     recs=tx_recs, sigs=reuse_sigs,
+                    create_slot=create_slot,
                 )
                 prog["dev"] = _compact_dev(dev)
                 if dev.get("dev_prior_launches") is None:
