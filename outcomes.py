@@ -3,7 +3,7 @@ Forward-price outcomes for shadow/backtest analysis.
 
 Resolves a DexScreener pool, pulls GT 5m OHLCV, and simulates two exits.
 LOG/ANALYSIS ONLY: never called from filter, judge, pick, or order paths.
-Own GT pacing; never the cycle GT limiter. Fail open.
+Keyless GT uses the desk shared limiter (non-priority). Fail open.
 Bulk fetch in OUTCOMES_WINDOW (default 01:00-06:00 local); daytime trickle.
 Progress lives in outcomes.db (fetch_jobs) and resumes after timeout.
 Exceptions go through safe_err. Never logs secrets.
@@ -38,6 +38,8 @@ READY_AFTER_SEC = WINDOW_SEC + 10 * 60  # 6h10m
 CANDLE_SEC = 5 * 60
 GT_SPACING_SEC = 7.0
 GT_429_BACKOFF_SEC = 30.0
+PAUSE_SLEEP_SEC = 45.0  # in [30, 60] when the worker is paused
+PAUSE_LOG_INTERVAL_SEC = 60.0
 OHLCV_LIMIT = 80
 DEAD_NO_POOL_ATTEMPTS = 5
 TICKET_USD = 50.0
@@ -62,6 +64,9 @@ _pacing_loaded = False
 _trickle_mode = False
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
+_shared_limiter = None
+_last_pause_log = 0.0
+_outcomes_429_count = 0
 
 
 def set_get_fn(fn):
@@ -80,8 +85,28 @@ def set_time_fn(fn):
     _time_fn = time.time if fn is None else fn
 
 
+def set_shared_limiter(limiter) -> None:
+    """Inject the desk GTRateLimiter. None restores lazy main._gt_limiter."""
+    global _shared_limiter
+    _shared_limiter = limiter
+
+
 def current_time() -> float:
     return float(_time_fn())
+
+
+def pause_sleep_sec() -> float:
+    raw = os.environ.get("OUTCOMES_PAUSE_SLEEP_SEC")
+    if raw:
+        try:
+            return min(60.0, max(30.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+    return PAUSE_SLEEP_SEC
+
+
+def outcomes_429_count() -> int:
+    return int(_outcomes_429_count)
 
 
 def outbox_dir() -> pathlib.Path:
@@ -99,6 +124,7 @@ def reset() -> None:
     """Close the cached connection and clear pacing. Tests call this."""
     global _conn, _conn_path, _last_gt_call, _gt_backoff_until
     global _trickle_mode, _worker_thread, _pacing_loaded
+    global _shared_limiter, _last_pause_log, _outcomes_429_count
     if _conn is not None:
         try:
             _conn.close()
@@ -111,11 +137,21 @@ def reset() -> None:
         _gt_backoff_until = 0.0
     _pacing_loaded = False
     _trickle_mode = False
+    _shared_limiter = None
+    _last_pause_log = 0.0
+    _outcomes_429_count = 0
     with _worker_lock:
         _worker_thread = None
     try:
         gt_api.set_demo_capped_fn(demo_budget_capped)
         gt_api.reset()
+    except Exception:
+        pass
+    try:
+        import main as shift
+        lim = getattr(shift, "_gt_limiter", None)
+        if lim is not None and hasattr(lim, "reset_for_test"):
+            lim.reset_for_test()
     except Exception:
         pass
 
@@ -593,11 +629,111 @@ def _pace_gt(deadline: float | None) -> bool:
 
 
 def _note_gt_429() -> None:
-    global _gt_backoff_until
+    global _gt_backoff_until, _outcomes_429_count
+    _outcomes_429_count += 1
+    try:
+        gt_api.note_429("outcomes")
+    except Exception:
+        pass
     with _gt_lock:
         _gt_backoff_until = current_time() + GT_429_BACKOFF_SEC
     log.info("outcomes GT 429, backing off %.0fs", GT_429_BACKOFF_SEC)
     _sleep(GT_429_BACKOFF_SEC)
+
+
+def _desk_limiter():
+    if _shared_limiter is not None:
+        return _shared_limiter
+    try:
+        import main as shift
+        return getattr(shift, "_gt_limiter", None)
+    except Exception:
+        return None
+
+
+def _in_cycle_gt_phase(now: float | None = None) -> bool:
+    """True while the desk limiter still has a future cycle_deadline."""
+    now = current_time() if now is None else float(now)
+    lim = _desk_limiter()
+    if lim is None:
+        return False
+    deadline = getattr(lim, "cycle_deadline", None)
+    if deadline is None:
+        return False
+    try:
+        return float(deadline) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_keyless_gt_url(url: str | None) -> bool:
+    return bool(url) and str(url).startswith(gt_api.GT_FREE_BASE)
+
+
+def _retry_after_sec(resp) -> float | None:
+    headers = getattr(resp, "headers", None) or {}
+    raw = None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        raw = None
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _acquire_keyless_slot(deadline: float | None) -> bool:
+    """Non-priority desk slot for free-GT. False = skip. Fail open to own pace."""
+    if _in_cycle_gt_phase():
+        return False
+    lim = _desk_limiter()
+    if lim is None:
+        return _pace_gt(deadline)
+    old_time = getattr(lim, "time_fn", None)
+    old_sleep = getattr(lim, "sleep_fn", None)
+    try:
+        lim.time_fn = current_time
+        lim.sleep_fn = _sleep
+        if not lim.wait_if_needed(priority=False, deadline=deadline):
+            return False
+        if _in_cycle_gt_phase():
+            return False
+        if not lim.spend(1, priority=False):
+            return False
+        return True
+    except Exception as e:
+        log.warning("outcomes shared limiter: %s", safe_err(e))
+        return False
+    finally:
+        try:
+            lim.time_fn = old_time
+            lim.sleep_fn = old_sleep
+        except Exception:
+            pass
+
+
+def _log_fetch_paused() -> bool:
+    """Log the pause at most once per minute. True if a line was written."""
+    global _last_pause_log
+    now = current_time()
+    if _last_pause_log and (now - _last_pause_log) < PAUSE_LOG_INTERVAL_SEC:
+        return False
+    _last_pause_log = now
+    log.info("outcomes fetch paused (cycle GT 429)")
+    return True
+
+
+def _record_keyless_429(resp) -> None:
+    lim = _desk_limiter()
+    if lim is None:
+        return
+    try:
+        lim.record_429(_retry_after_sec(resp))
+    except Exception as e:
+        log.warning("outcomes record_429: %s", safe_err(e))
 
 
 def _highest_liq_pair(pairs) -> dict | None:
@@ -752,7 +888,7 @@ def demo_budget_capped(now: float | None = None) -> bool:
 
 
 def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None = None):
-    """GT / CoinGecko 5m OHLCV ending at entry+6h. Own limiter. None on 429/error."""
+    """GT / CoinGecko 5m OHLCV ending at entry+6h. Keyless uses the desk limiter."""
     net = chain
     url = gt_api.prefer_onchain_url(
         f"{GT_API}/networks/{net}/pools/{pool}/ohlcv/minute", purpose="outcomes",
@@ -765,8 +901,13 @@ def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None =
     }
     if deadline is not None and current_time() >= deadline:
         return None
-    if not _pace_gt(deadline):
-        return None
+    keyless = _is_keyless_gt_url(url)
+    if keyless:
+        if not _acquire_keyless_slot(deadline):
+            return None
+    else:
+        if not _pace_gt(deadline):
+            return None
     try:
         resp = _http_get(url, params=params, timeout=HTTP_TIMEOUT)
         status = getattr(resp, "status_code", None)
@@ -775,9 +916,14 @@ def fetch_ohlcv(chain: str, pool: str, entry_ts: float, deadline: float | None =
             if free:
                 gt_api.note_key_failed()
                 log.info("outcomes coingecko HTTP %s, falling back to free GT", status)
+                if not _acquire_keyless_slot(deadline):
+                    return None
                 resp = _http_get(free, params=params, timeout=HTTP_TIMEOUT)
                 status = getattr(resp, "status_code", None)
+                url = free
         if status == 429:
+            if _is_keyless_gt_url(url):
+                _record_keyless_429(resp)
             _note_gt_429()
             return None
         if status != 200:
@@ -1013,20 +1159,27 @@ def enqueue_from_history(*, days: int = 7, now: float | None = None) -> int:
 
 
 def cycle_gt_paused(now: float | None = None) -> bool:
-    """True when the desk cycle limiter is in a 429 backoff or saw a 429 this cycle."""
+    """True when the desk limiter backoff is still in the future.
+
+    Sticky stats_429_count is ignored — a past 429 must not pause after backoff.
+    """
     now = current_time() if now is None else float(now)
     try:
-        import main as shift
-        lim = getattr(shift, "_gt_limiter", None)
+        lim = _desk_limiter()
         if lim is None:
             return False
         if float(getattr(lim, "backoff_until", 0) or 0) > now:
             return True
-        if int(getattr(lim, "stats_429_count", 0) or 0) > 0:
-            return True
-    except Exception:
+    except Exception as e:
+        log.warning("outcomes cycle_gt_paused: %s", safe_err(e))
         return False
     return False
+
+
+def _outcomes_should_pause(now: float | None = None) -> bool:
+    """Backoff or desk cycle GT phase — do not fetch keyless GT either way."""
+    now = current_time() if now is None else float(now)
+    return cycle_gt_paused(now) or _in_cycle_gt_phase(now)
 
 
 def drain_jobs(*, now: float | None = None, deadline: float | None = None,
@@ -1051,9 +1204,9 @@ def drain_jobs(*, now: float | None = None, deadline: float | None = None,
         for job in jobs:
             if deadline is not None and current_time() >= deadline:
                 break
-            if cycle_gt_paused():
+            if _outcomes_should_pause():
                 paused = True
-                log.info("outcomes fetch paused (cycle GT 429)")
+                _log_fetch_paused()
                 break
             tid = job["tid"]
             entry_ts = float(job["entry_ts"])
@@ -1101,8 +1254,8 @@ def tick_fetch(*, now: float | None = None, days: int = 7,
     now = current_time() if now is None else float(now)
     try:
         enqueue_from_history(days=days, now=now)
-        if cycle_gt_paused(now):
-            log.info("outcomes fetch paused (cycle GT 429)")
+        if _outcomes_should_pause(now):
+            _log_fetch_paused()
             return {"fetched": 0, "complete": 0, "remaining": len(list_jobs("pending")),
                     "paused": True}
         if gt_api.in_outcomes_window(now):
@@ -1111,6 +1264,21 @@ def tick_fetch(*, now: float | None = None, days: int = 7,
     except Exception as e:
         log.warning("outcomes tick failed: %s", safe_err(e))
         return {"fetched": 0, "error": safe_err(e)}
+
+
+def worker_step() -> dict:
+    """One worker slice. Sleeps 30-60s when paused so the in-window loop cannot spin."""
+    now = current_time()
+    in_window = gt_api.in_outcomes_window(now)
+    if in_window:
+        result = tick_fetch(now=now, deadline=now + 60.0)
+    else:
+        result = tick_fetch(now=now, deadline=now + 30.0)
+    if result.get("paused"):
+        _sleep(pause_sleep_sec())
+    elif not in_window:
+        _sleep(gt_api.outcomes_spacing_sec(trickle=True))
+    return result
 
 
 def maybe_start_worker() -> threading.Thread | None:
@@ -1125,12 +1293,7 @@ def maybe_start_worker() -> threading.Thread | None:
         def _loop():
             while True:
                 try:
-                    now = current_time()
-                    if gt_api.in_outcomes_window(now):
-                        tick_fetch(now=now, deadline=now + 60.0)
-                    else:
-                        tick_fetch(now=now, deadline=now + 30.0)
-                        _sleep(gt_api.outcomes_spacing_sec(trickle=True))
+                    worker_step()
                 except Exception as e:
                     log.warning("outcomes worker: %s", safe_err(e))
                     _sleep(10.0)
