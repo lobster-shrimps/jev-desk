@@ -353,6 +353,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             shadow_ledger.mark_all_open_positions(fomo)
         except Exception as e:
             log.warning("shadow mark failed: %s", e)
+        try:
+            import pick_confirm_shadow
+            pick_confirm_shadow.mark_open(fomo, now=cycle_start)
+        except Exception as e:
+            log.warning("pick_confirm_shadow mark: %s", safe_err(e))
     
     if (h := book.held()):                       # RISK owns the desk right now
         _young_trail_hook(stats=None, tokens=None)  # MTM paper book even while held
@@ -996,6 +1001,12 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             )
         except Exception as e:
             log.warning("judge verdicts: %s", safe_err(e))
+
+    try:
+        import pick_confirm_shadow
+        pick_confirm_shadow.on_cycle(stats, survivors, now=cycle_start)
+    except Exception as e:
+        log.warning("pick_confirm_shadow: %s", safe_err(e))
 
     _history_hook("cycle", stats=stats, shadow=shadow)
     _young_trail_hook(stats=stats, tokens=shortlist_result)
