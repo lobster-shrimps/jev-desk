@@ -839,6 +839,8 @@ def on_soft_token(
     top_wallet_percent=None,
     developer_holding_percentage=None,
     holder_count=None,
+    holder_source=None,
+    _fomo_holders=None,
     soft_scores=None,
     ts=None,
     liquidity_usd=None,
@@ -849,7 +851,7 @@ def on_soft_token(
     """Buffer one soft-killed token. Flushed by on_cycle. Hook next to `soft tid=`."""
     cid = chain_id_of(tid=tid, net=net)
     market = {"liq": liq, "liquidity_usd": liquidity_usd, "mcap": mcap, "mcap_usd": mcap_usd}
-    _pending_soft.append({
+    row = {
         "ts": float(ts) if ts is not None else time.time(),
         "kind": "soft",
         "tid": tid,
@@ -865,8 +867,13 @@ def on_soft_token(
         "top_wallet_percent": _num(top_wallet_percent),
         "developer_holding_percentage": _num(developer_holding_percentage),
         "holder_count": _int(holder_count),
+        "holder_source": holder_source,
+        "_fomo_holders": _fomo_holders,
         "soft_scores": soft_scores or {},
-    })
+    }
+    if row.get("holder_source") not in HOLDER_SOURCES:
+        row["holder_source"] = assign_holder_source(row).get("holder_source")
+    _pending_soft.append(row)
 
 
 def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
@@ -986,13 +993,20 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
     return cycle_id
 
 
+def _gt_cache_key(row: dict) -> tuple[str | None, str | None]:
+    chain = row.get("chain")
+    if not chain:
+        chain = CHAIN_NAMES.get(row.get("net"))
+    addr = row.get("addr")
+    if not addr and row.get("tid") and ":" in str(row["tid"]):
+        addr = str(row["tid"]).split(":")[0]
+    return chain, addr
+
+
 def _gt_cached_holders(row: dict):
     try:
         import gt_info_cache
-        chain = row.get("chain")
-        addr = row.get("addr")
-        if not addr and row.get("tid") and ":" in str(row["tid"]):
-            addr = str(row["tid"]).split(":")[0]
+        chain, addr = _gt_cache_key(row)
         if not chain or not addr:
             return None
         cached = gt_info_cache.get(chain, addr)
@@ -1000,6 +1014,65 @@ def _gt_cached_holders(row: dict):
     except Exception as e:
         log.warning("holder_source gt cache: %s", safe_err(e))
         return None
+
+
+def gt_info_cache_hit(row: dict) -> bool:
+    """True when GT /info is already cached for this token. Fail open."""
+    try:
+        import gt_info_cache
+        chain, addr = _gt_cache_key(row)
+        if not chain or not addr:
+            return False
+        return gt_info_cache.get(chain, addr) is not None
+    except Exception as e:
+        log.warning("holder_source cache peek: %s", safe_err(e))
+        return False
+
+
+def tag_dossier_holder_source(d: dict, t: dict | None = None,
+                              *, cache_hit: bool | None = None) -> dict:
+    """Tag holder_source from the dossier snap-vs-GT pick. No count matching.
+
+    Mirrors collect._apply_gt_info_attributes: cache hit prefers the trade-stage
+    snapshot; a live fetch prefers GT holders, then the snapshot, then FOMO.
+    """
+    if not isinstance(d, dict):
+        return d
+    current = d.get("holder_source")
+    if current == "trade snapshot":
+        current = "trade_snapshot"
+        d["holder_source"] = current
+    if current in HOLDER_SOURCES:
+        return d
+    t = t if isinstance(t, dict) else {}
+    snap = t.get("_fomo_holders")
+    if snap is None:
+        snap = d.get("_fomo_holders")
+    if snap is None:
+        snap = t.get("holder_count")
+    snap = _int(snap)
+    peek = {**t, **{k: d[k] for k in ("addr", "tid", "chain", "net") if d.get(k) is not None}}
+    if cache_hit is None:
+        cache_hit = False
+    if cache_hit:
+        d["holder_source"] = "trade_snapshot" if snap is not None else "gt_info"
+        return d
+    gt = _gt_cached_holders(peek)
+    count = _int(d.get("holder_count"))
+    if gt is not None:
+        d["holder_source"] = "gt_info"
+        return d
+    if snap is not None and count is not None and count != snap:
+        d["holder_source"] = "gt_info"
+        return d
+    if snap is not None:
+        d["holder_source"] = "trade_snapshot"
+        return d
+    if count is not None:
+        d["holder_source"] = "gt_info"
+        return d
+    d["holder_source"] = "fomo"
+    return d
 
 
 def assign_holder_source(row: dict, *, dossiered: bool | None = None) -> dict:

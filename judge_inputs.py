@@ -312,12 +312,25 @@ def window_reached_launch(d: dict, sigs) -> bool:
     return True
 
 
+def _partial_window_note(pct: float) -> str:
+    return f"partial window: sold {_fmt_sold_pct(pct)}% of observed"
+
+
+def _sold_pct_from_balances(initial, last, sold) -> float | None:
+    if initial is None or initial <= 0:
+        return None
+    if sold <= 0:
+        sold = max(0, initial - (last if last is not None else initial))
+    return sold / initial * 100.0
+
+
 def _dev_sells_from_parsed(txs: list, mint: str, creator: str,
                            *, reached_launch: bool = True) -> str | None:
     """Compute sold-of-initial from parsed txs (oldest first).
 
     If the 20-sig window misses launch, or sold/observed > 100%, return a
     partial-window note instead of claiming '% of initial since launch'.
+    'none seen' / 0.0 only when the window reaches launch.
     """
     initial = None
     last = None
@@ -340,19 +353,22 @@ def _dev_sells_from_parsed(txs: list, mint: str, creator: str,
             last = post
         elif pre is not None:
             last = pre
+    if not reached_launch:
+        pct = _sold_pct_from_balances(initial, last, sold)
+        return _partial_window_note(0.0 if pct is None else pct)
     if not saw_mint:
         return "dev sells: none seen"
     if initial is None or initial <= 0:
         return None
     if sold <= 0 and (last is None or last >= initial):
         return "dev sells: none seen"
-    if sold <= 0:
-        sold = max(0, initial - (last if last is not None else initial))
-    if sold <= 0:
+    pct = _sold_pct_from_balances(initial, last, sold)
+    if pct is None:
+        return None
+    if pct <= 0:
         return "dev sells: none seen"
-    pct = sold / initial * 100.0
-    if (not reached_launch) or pct > 100.0:
-        return f"partial window: sold {_fmt_sold_pct(pct)} of observed"
+    if pct > 100.0:
+        return _partial_window_note(pct)
     return f"dev sold {_fmt_sold_pct(pct)}% of initial since launch"
 
 
