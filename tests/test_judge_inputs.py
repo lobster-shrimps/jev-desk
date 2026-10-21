@@ -256,8 +256,7 @@ def test_dev_sells_over_100_is_partial_window():
     d = {**SAMPLE_D, "creator": creator}
     judge_inputs.attach(d)
     assert d.get("dev_sold_pct") is None
-    assert d["dev_sells_note"].startswith("partial window")
-    assert "250" in d["dev_sells_note"]
+    assert d["dev_sells_note"] == "partial window: sold 250% of observed"
     assert "since launch" not in (d.get("dev_sells") or "")
     assert judge_inputs.cycle_lookups() == 1
 
@@ -280,7 +279,38 @@ def test_dev_sells_window_not_reaching_launch():
     assert d.get("dev_sold_pct") is None
     assert d["dev_sells_note"].startswith("partial window")
     assert "of observed" in d["dev_sells_note"]
+    assert "%" in d["dev_sells_note"]
     assert "since launch" not in (d.get("dev_sells") or "")
+    assert judge_inputs.cycle_lookups() == 1
+    judge_inputs.set_time_fn(None)
+
+
+def test_dev_sells_partial_window_before_none_seen_when_sigs_miss_token():
+    """Full 20-sig window newer than launch, none touch the mint → unknown, not 0.0."""
+    judge_inputs.reset_cycle()
+    mint, creator = "Addr0", "Dev111"
+    now = 1_700_100_000.0
+    judge_inputs.set_time_fn(lambda: now)
+    # 20 most recent sigs span ~18 min; token is 103 min old (PEPA live case).
+    sigs = [{"signature": f"s{i}", "blockTime": now - 60 - i * 55} for i in range(20)]
+    assert len(sigs) == 20
+    oldest = min(s["blockTime"] for s in sigs)
+    launch = now - 103 * 60.0
+    assert oldest > launch + 120
+
+    def rpc(method, params, timeout):
+        if method == "getSignaturesForAddress":
+            return sigs
+        return _parsed_tx("OtherMint", creator, 1000, 500)
+
+    judge_inputs.set_rpc_fn(rpc)
+    d = {**SAMPLE_D, "creator": creator, "age_minutes": 103}
+    judge_inputs.attach(d)
+    assert d.get("dev_sold_pct") is None
+    assert d["dev_sells_note"] == "partial window: sold 0% of observed"
+    assert "none seen" not in (d.get("dev_sells") or "")
+    assert "since launch" not in (d.get("dev_sells") or "")
+    assert judge_inputs.sold_pct_from_text(d["dev_sells"]) is None
     assert judge_inputs.cycle_lookups() == 1
     judge_inputs.set_time_fn(None)
 

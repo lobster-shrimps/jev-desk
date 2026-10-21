@@ -703,6 +703,12 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         # Ensure young tokens are removed from pending list on ANY exit path
         dossier_deadline = cycle_deadline - 60
         gt_limiter.cycle_deadline = dossier_deadline
+        cache_hit = False
+        try:
+            import cycle_history
+            cache_hit = cycle_history.gt_info_cache_hit(t)
+        except Exception as e:
+            log.warning("holder_source peek: %s", safe_err(e))
         try:
             d = None
             try:
@@ -820,6 +826,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 continue
             if t.get("_fomo_holders") is not None:
                 d["_fomo_holders"] = t["_fomo_holders"]
+            try:
+                import cycle_history
+                cycle_history.tag_dossier_holder_source(d, t, cache_hit=cache_hit)
+            except Exception as e:
+                log.warning("holder_source: %s", safe_err(e))
 
             try:
                 import young_trail_signals
@@ -919,6 +930,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                     top_wallet_percent=d.get("top_wallet_percent"),
                     developer_holding_percentage=d.get("developer_holding_percentage"),
                     holder_count=d.get("holder_count"),
+                    holder_source=d.get("holder_source"),
+                    _fomo_holders=d.get("_fomo_holders"),
                     soft_scores=soft_scores,
                     liquidity_usd=d.get("liquidity_usd"),
                     mcap_usd=d.get("mcap_usd"),

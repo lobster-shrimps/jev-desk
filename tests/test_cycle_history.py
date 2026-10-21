@@ -924,6 +924,114 @@ def test_assign_holder_source_fomo_snapshot_gt_unknown(hist, tmp_path, monkeypat
     gt_info_cache.reset()
 
 
+def test_tag_dossier_holder_source_uses_pick_not_count_match(hist, tmp_path, monkeypatch):
+    import gt_info_cache
+    monkeypatch.setenv("GT_INFO_CACHE_DB", str(tmp_path / "gt_info_cache.db"))
+    gt_info_cache.reset()
+    gt_info_cache.put("solana", "A", {"holders": {"count": 180}})
+
+    snap = {"addr": "A", "tid": "A:1399811149", "chain": "solana",
+            "holder_count": 744, "_fomo_holders": 744}
+    d_hit = {"addr": "A", "tid": "A:1399811149", "chain": "solana",
+             "holder_count": 744, "_fomo_holders": 744}
+    hist.tag_dossier_holder_source(d_hit, snap, cache_hit=True)
+    assert d_hit["holder_source"] == "trade_snapshot"
+
+    d_live = {"addr": "B", "tid": "B:1399811149", "chain": "solana",
+              "holder_count": 180, "_fomo_holders": 744}
+    hist.tag_dossier_holder_source(d_live, {"_fomo_holders": 744, "holder_count": 744},
+                                   cache_hit=False)
+    assert d_live["holder_source"] == "gt_info"
+
+    d_gt_only = {"addr": "C", "tid": "C:1399811149", "chain": "solana",
+                 "holder_count": 90}
+    hist.tag_dossier_holder_source(d_gt_only, {}, cache_hit=False)
+    assert d_gt_only["holder_source"] == "gt_info"
+    gt_info_cache.reset()
+
+
+def test_run_once_soft_row_carries_holder_source(hist, monkeypatch, tmp_path, caplog):
+    """Real cycle path: soft-judged row is tagged at dossier pick, not by count match."""
+    import book
+    import collect
+    import gt_info_cache
+    import main as shift
+
+    monkeypatch.setenv("GT_INFO_CACHE_DB", str(tmp_path / "gt_info_cache.db"))
+    gt_info_cache.reset()
+    gt_info_cache.put("solana", "SoftSnap", {"holders": {"count": 180}})
+
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+
+    tid = "SoftSnap:1399811149"
+    hooked = {}
+    orig_soft = hist.on_soft_token
+
+    def spy_soft(**kwargs):
+        hooked.update(kwargs)
+        return orig_soft(**kwargs)
+
+    monkeypatch.setattr(hist, "on_soft_token", spy_soft)
+
+    def fake_shortlist(fomo, id_list):
+        return [{
+            "addr": "SoftSnap", "net": 1399811149, "tid": tid, "ticker": "SNP",
+            "mcap_usd": 300_000, "liquidity_usd": 48_000, "volume_h24": 610_000,
+            "price_usd": 0.001, "holder_count": 744,
+            "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61},
+            "age_minutes": 42, "chain": "solana",
+        }]
+
+    def fake_judge(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": {
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.75},
+                "momentum_already_spent": {"type": "noul", "noul": 0.40},
+            }, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+
+    def fake_dossier(t, limiter=None):
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None, "net": 1399811149,
+                "holder_count": 744}
+
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([tid], {}))
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+        {"buys_h1": 540, "sells_h1": 120, "buys_h6": 900, "sells_h6": 400,
+         "trades_h24": 4000}, "ok"))
+    monkeypatch.setattr(shift, "dossier", fake_dossier)
+
+    class Desk:
+        def bank(self): return 1000.0
+        def read_x(self, h, tid=None, token=None): return None
+        def log_shadow(self, o, s, fomo_data=None): pass
+        def report(self, o, s): pass
+        def send_to_seats(self, o): pass
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(type("F", (), {"token": lambda self: None})(),
+                                      fake_judge, Desk(), 1000.0, shadow=True,
+                                      gt_dossier_reserve=3)
+    assert order is None
+    assert hooked.get("_fomo_holders") == 744
+    assert hooked.get("holder_source") == "trade_snapshot"
+    soft = [t for t in hist._tokens_since(0) if t["kind"] == "soft"]
+    assert len(soft) == 1
+    assert soft[0]["ticker"] == "SNP"
+    assert soft[0]["holder_count"] == 744
+    assert soft[0]["holder_source"] == "trade_snapshot"
+    gt_info_cache.reset()
+
+
 def test_cycle_record_persists_holder_source(hist):
     hist.on_cycle(
         {"seen": 1, "benched": 0, "judged": 1, "requeued": 0,
