@@ -511,6 +511,13 @@ def _outcomes(now: float) -> dict:
     return payload
 
 
+def _cache_hit_rate(hits: int, misses: int):
+    total = int(hits) + int(misses)
+    if total <= 0:
+        return None
+    return round(int(hits) / total, 4)
+
+
 def _budget(now: float) -> dict:
     payload = {
         "cg_plan": None,
@@ -523,6 +530,11 @@ def _budget(now: float) -> dict:
         "gt_calls_per_min": 5,
         "gt_429_24h": 0,
         "outcomes_spacing_s": 20.0,
+        "gt_429_by_source": {"desk": 0, "desk_cycle": 0, "outcomes": 0},
+        "gt_info_cache": {
+            "hits": 0, "misses": 0, "hit_rate": None,
+            "hits_24h": 0, "misses_24h": 0, "hit_rate_24h": None,
+        },
     }
     try:
         import gt_api
@@ -572,6 +584,65 @@ def _budget(now: float) -> dict:
         payload["gt_429_24h"] = int(row[0] or 0) if row else 0
     except Exception as e:
         log.warning("ops summary gt_429: %s", safe_err(e))
+    try:
+        desk_429 = int(payload.get("gt_429_24h") or 0)
+        desk_cycle = 0
+        try:
+            import main as shift
+            lim = getattr(shift, "_gt_limiter", None)
+            if lim is not None:
+                desk_cycle = int(getattr(lim, "stats_429_count", 0) or 0)
+        except Exception:
+            pass
+        outcomes_429 = 0
+        try:
+            import outcomes
+            outcomes_429 = int(outcomes.outcomes_429_count())
+        except Exception:
+            pass
+        try:
+            import gt_api
+            counted = gt_api.gt_429_by_source()
+            outcomes_429 = max(outcomes_429, int(counted.get("outcomes") or 0))
+        except Exception:
+            pass
+        payload["gt_429_by_source"] = {
+            "desk": desk_429, "desk_cycle": desk_cycle, "outcomes": outcomes_429,
+        }
+    except Exception as e:
+        log.warning("ops summary 429 by source: %s", safe_err(e))
+    try:
+        hits = misses = 0
+        try:
+            from collect import gt_info_cycle_stats
+            info = gt_info_cycle_stats()
+            hits = int(info.get("hits") or 0)
+            misses = int(info.get("misses") or 0)
+        except Exception:
+            pass
+        hits_24h = misses_24h = 0
+        try:
+            import cycle_history
+            row = cycle_history._connect().execute(
+                "SELECT COALESCE(SUM(gt_cache_hits), 0), "
+                "COALESCE(SUM(gt_cache_misses), 0) FROM cycles WHERE ts >= ?",
+                (now - 86400,),
+            ).fetchone()
+            if row:
+                hits_24h = int(row[0] or 0)
+                misses_24h = int(row[1] or 0)
+        except Exception as e:
+            log.warning("ops summary gt info cache 24h: %s", safe_err(e))
+        payload["gt_info_cache"] = {
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": _cache_hit_rate(hits, misses),
+            "hits_24h": hits_24h,
+            "misses_24h": misses_24h,
+            "hit_rate_24h": _cache_hit_rate(hits_24h, misses_24h),
+        }
+    except Exception as e:
+        log.warning("ops summary gt info cache: %s", safe_err(e))
     return payload
 
 
@@ -694,6 +765,11 @@ def _empty_payload(now: float, extra: dict | None = None) -> dict:
             "cg_month_calls": 0, "cg_month_cap": 9000,
             "cg_daily_cap": 0, "cg_today": 0, "demo_active": False,
             "gt_calls_per_min": 5, "gt_429_24h": 0, "outcomes_spacing_s": 20.0,
+            "gt_429_by_source": {"desk": 0, "desk_cycle": 0, "outcomes": 0},
+            "gt_info_cache": {
+                "hits": 0, "misses": 0, "hit_rate": None,
+                "hits_24h": 0, "misses_24h": 0, "hit_rate_24h": None,
+            },
         },
         "regime": {
             "tag": None, "ts_iso": None, "reason": None,

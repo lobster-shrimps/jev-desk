@@ -779,7 +779,7 @@ def test_drain_pauses_on_cycle_gt_429(hist, monkeypatch):
     now = ts(2026, 10, 12, 15)
     outcomes.set_time_fn(lambda: now)
     shift._gt_limiter.reset_for_test()
-    shift._gt_limiter.stats_429_count = 1
+    shift._gt_limiter.backoff_until = now + 30.0
     calls = []
     outcomes.set_get_fn(lambda *a, **k: calls.append(a) or Resp(500, {}))
     outcomes.enqueue_job("z:1399811149", now - 8 * 3600, now=now)

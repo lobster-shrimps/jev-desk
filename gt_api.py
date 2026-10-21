@@ -41,12 +41,32 @@ DEMO_MONTHLY_CAP = 9000
 
 _key_failed = False
 _demo_capped_fn = None
+_429_by_source: dict[str, int] = {"desk": 0, "outcomes": 0, "coingecko": 0}
 
 
 def reset() -> None:
     """Tests: clear the key-fallback latch."""
     global _key_failed
     _key_failed = False
+    _429_by_source.clear()
+    _429_by_source.update({"desk": 0, "outcomes": 0, "coingecko": 0})
+
+
+def note_429(source: str) -> None:
+    """Count a 429 by caller. Never logs URLs or keys."""
+    src = str(source or "unknown").strip() or "unknown"
+    try:
+        _429_by_source[src] = int(_429_by_source.get(src, 0) or 0) + 1
+    except Exception as e:
+        log.warning("gt 429 count: %s", safe_err(e))
+
+
+def gt_429_by_source() -> dict:
+    return {k: int(v) for k, v in _429_by_source.items()}
+
+
+def is_free_gt_url(url: str | None) -> bool:
+    return bool(url) and str(url).startswith(GT_FREE_BASE)
 
 
 def set_demo_capped_fn(fn) -> None:
