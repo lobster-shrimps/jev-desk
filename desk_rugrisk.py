@@ -354,6 +354,29 @@ def _loads(raw) -> dict:
         return {}
 
 
+def lookup_creator(tid: str) -> str | None:
+    """First creators[] entry on the newest desk_rugrisk row. No RPC."""
+    if not tid:
+        return None
+    try:
+        rows = _connect().execute(
+            """SELECT features_json FROM desk_rugrisk
+               WHERE tid = ? ORDER BY ts DESC""",
+            (tid,),
+        ).fetchall()
+        for row in rows:
+            blob = _loads(row["features_json"])
+            creators = blob.get("creators")
+            if isinstance(creators, list):
+                for item in creators:
+                    wallet = str(item or "").strip()
+                    if wallet:
+                        return wallet
+    except Exception as e:
+        log.warning("desk_rugrisk lookup_creator: %s", safe_err(e))
+    return None
+
+
 def enqueue(d, verdict, score, ts, ans=None) -> bool:
     """Insert one judged token. DB only, no RPC. Idempotent on (tid, ts)."""
     try:
