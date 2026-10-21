@@ -424,8 +424,16 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                   "crowd_prob", "dev_sold_pct", "holder_source", "creator"):
             if t.get(k) is not None:
                 row[k] = t.get(k)
-        if row.get("holder_count") is not None and row.get("holder_source") is None:
-            row["holder_source"] = "trade snapshot"
+        if t.get("_fomo_holders") is not None:
+            row["_fomo_holders"] = t.get("_fomo_holders")
+        try:
+            import cycle_history
+            cycle_history.assign_holder_source(row, dossiered=None)
+            src = row.get("holder_source")
+            if src == "trade snapshot":
+                row["holder_source"] = "trade_snapshot"
+        except Exception as e:
+            log.warning("holder_source: %s", safe_err(e))
         xa = t.get("x_account")
         if isinstance(xa, dict):
             row["x_present"] = 1
@@ -486,6 +494,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Tag tokens with their tier for priority sorting
     for t in shortlist_result:
         t["_tier"] = tid_tier.get(t["tid"], 2)  # Default to universe tier
+        if t.get("holder_count") is not None:
+            t["_fomo_holders"] = t["holder_count"]
     
     for tid in due:
         if tid not in shortlist_tids:
@@ -808,6 +818,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             # If we get here without a dossier, it was a non-retry exception path
             if d is None:
                 continue
+            if t.get("_fomo_holders") is not None:
+                d["_fomo_holders"] = t["_fomo_holders"]
 
             try:
                 import young_trail_signals

@@ -34,6 +34,12 @@ CHAIN_NAMES = {
 }
 SOLANA_ID = 1399811149
 
+HOLDER_SOURCES = ("trade_snapshot", "gt_info", "fomo")
+_PRE_DOSSIER_STAGES = frozenset({"free", "trade"})
+_PRE_DOSSIER_REASONS = frozenset({
+    "requeued", "requeued_after_retry", "requeued_429_backoff",
+    "requeued_dex_degraded", "deferred_for_young", "dossier_failed",
+})
 GT_DEFER_REASONS = frozenset({
     "requeued",
     "requeued_after_retry",
@@ -980,6 +986,62 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
     return cycle_id
 
 
+def _gt_cached_holders(row: dict):
+    try:
+        import gt_info_cache
+        chain = row.get("chain")
+        addr = row.get("addr")
+        if not addr and row.get("tid") and ":" in str(row["tid"]):
+            addr = str(row["tid"]).split(":")[0]
+        if not chain or not addr:
+            return None
+        cached = gt_info_cache.get(chain, addr)
+        return gt_info_cache.holder_count_of(cached)
+    except Exception as e:
+        log.warning("holder_source gt cache: %s", safe_err(e))
+        return None
+
+
+def assign_holder_source(row: dict, *, dossiered: bool | None = None) -> dict:
+    """Set holder_source to trade_snapshot | gt_info | fomo. No guess if unknown."""
+    if not isinstance(row, dict):
+        return row
+    current = row.get("holder_source")
+    if current == "trade snapshot":
+        current = "trade_snapshot"
+        row["holder_source"] = current
+    if current in HOLDER_SOURCES:
+        return row
+    count = _int(row.get("holder_count"))
+    if count is None:
+        return row
+    stage = row.get("stage") or row.get("kind")
+    reason = row.get("reason")
+    if dossiered is None:
+        dossiered = (
+            stage not in _PRE_DOSSIER_STAGES
+            and reason not in _PRE_DOSSIER_REASONS
+            and stage not in (None, "free", "trade")
+        )
+        if stage in ("judged", "soft", "judge_error"):
+            dossiered = True
+        elif stage in _PRE_DOSSIER_STAGES or reason in _PRE_DOSSIER_REASONS:
+            dossiered = False
+    if not dossiered:
+        row["holder_source"] = "fomo"
+        return row
+    fomo = _int(row.get("_fomo_holders") if row.get("_fomo_holders") is not None
+                else row.get("fomo_holder_count"))
+    if fomo is not None and fomo == count:
+        row["holder_source"] = "trade_snapshot"
+        return row
+    gt = _gt_cached_holders(row)
+    if gt is not None and gt == count:
+        row["holder_source"] = "gt_info"
+        return row
+    return row
+
+
 def _token_from_stats_row(row: dict, now: float, kind: str) -> dict:
     cid = chain_id_of(tid=row.get("tid"), net=row.get("net"))
     return {
@@ -998,7 +1060,7 @@ def _token_from_stats_row(row: dict, now: float, kind: str) -> dict:
         "top_wallet_percent": _num(row.get("top_wallet_percent")),
         "developer_holding_percentage": _num(row.get("developer_holding_percentage")),
         "holder_count": _int(row.get("holder_count")),
-        "holder_source": row.get("holder_source"),
+        "holder_source": assign_holder_source({**row, "kind": kind}).get("holder_source"),
         "dev_sold_pct": _num(row.get("dev_sold_pct")),
         "soft_scores": row.get("soft_scores") or {},
         "judge_verdict": row.get("judge_verdict"),

@@ -20,6 +20,7 @@ import os
 import pathlib
 import sqlite3
 import time
+from datetime import datetime
 
 import requests
 
@@ -268,6 +269,23 @@ def until_ts(now: float | None = None) -> float:
 def accepting_entries(now: float | None = None) -> bool:
     ts = current_time() if now is None else float(now)
     return enabled() and ts < until_ts(ts)
+
+
+def _format_until_et(ts: float) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromtimestamp(float(ts), tz=ZoneInfo("America/New_York"))
+        return dt.strftime("%b %d %I:%M %p ET").replace(" 0", " ")
+    except Exception:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts)))
+
+
+def ended_label(now: float | None = None) -> str:
+    """Derive the ops label from until_ts / accepting_entries. No hard-coded date."""
+    when = _format_until_et(until_ts(now))
+    if accepting_entries(now):
+        return f"Accepting entries until {when}"
+    return f"Stopped taking entries {when}"
 
 
 def pnl_usd(exit_price: float, entry_price: float, ticket: float = TICKET_USD) -> float:
@@ -921,7 +939,7 @@ def ops_payload() -> dict:
             "enabled": enabled(),
             "accepting_entries": accepting,
             "ended": ended,
-            "ended_label": "Stopped taking entries Oct 20 11:59 PM ET",
+            "ended_label": ended_label(now),
             "until_ts": until,
             "until_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until)) if until else None,
             "ticket_usd": TICKET_USD,

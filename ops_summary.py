@@ -450,8 +450,8 @@ def _cycle_health(now: float) -> tuple[dict | None, int, int, int, list[dict]]:
             holders = r["holder_count"] if "holder_count" in keys_r else None
             age_s = (now - float(r["ts"])) if r["ts"] is not None else None
             src = r["holder_source"] if "holder_source" in keys_r else None
-            if not src and holders is not None:
-                src = "trade snapshot"
+            if src == "trade snapshot":
+                src = "trade_snapshot"
             sold = r["dev_sold_pct"] if "dev_sold_pct" in keys_r else None
             judge_hi.append({
                 "ts_iso": _iso(r["ts"]),

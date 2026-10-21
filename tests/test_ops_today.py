@@ -45,7 +45,8 @@ def test_ops_html_renders_and_new_endpoints_exist():
     assert 'id="pc-err"' in html
     assert "shadow, does not gate picks" in html
     assert "1 row adjusted (bad price mark)" in html or "row adjusted (bad price mark)" in html
-    assert "Stopped taking entries Oct 20 11:59 PM ET" in html
+    assert "holders_source||'unknown'" in html or 'holders_source||"unknown"' in html
+    assert "Oct 20 11:59 PM ET" not in html
     assert "/ops/desk_rugrisk" in html
     assert "/ops/pick_confirm" in html
     assert "/ops/young_trail_variants" in html
@@ -74,8 +75,16 @@ def test_young_trail_ops_marks_ended_after_until(tmp_path, monkeypatch):
     young_trail.set_time_fn(lambda: 1_800_000_000.0)  # after 2026-10-20 23:59 ET
     payload = young_trail.ops_payload()
     assert payload["ended"] is True
-    assert "Oct 20" in payload["ended_label"]
+    assert payload["ended_label"].startswith("Stopped taking entries")
     assert payload["accepting_entries"] is False
+    young_trail.reset()
+    monkeypatch.setenv("YOUNG_TRAIL_UNTIL", "2026-12-01T00:00:00Z")
+    young_trail.set_time_fn(lambda: 1_760_000_000.0)
+    later = young_trail.ops_payload()
+    assert later["ended"] is False
+    assert later["ended_label"].startswith("Accepting entries until")
+    assert later["ended_label"] != payload["ended_label"]
+    assert "Nov 30" in later["ended_label"]
     young_trail.reset()
     young_trail.set_time_fn(None)
 
@@ -114,7 +123,7 @@ def test_judge_hi_includes_holders_and_dev_sold(tmp_path, monkeypatch):
          "tokens": [{
              "tid": "Horn:1399811149", "ticker": "HORN", "net": 1399811149,
              "chain": "solana", "stage": "judged", "holder_count": 744,
-             "holder_source": "trade snapshot", "dev_sold_pct": 12.0,
+             "holder_source": "trade_snapshot", "dev_sold_pct": 12.0,
              "judge_score": 0.72, "judge_confidence": 0.61, "judge_verdict": "pass",
          }]},
         now=now, source="live",
@@ -123,7 +132,20 @@ def test_judge_hi_includes_holders_and_dev_sold(tmp_path, monkeypatch):
     hi = payload["judge_hi"]
     horn = next(j for j in hi if j["ticker"] == "HORN")
     assert horn["holder_count"] == 744
-    assert horn["holders_source"] == "trade snapshot"
+    assert horn["holders_source"] == "trade_snapshot"
+    cycle_history.on_cycle(
+        {"seen": 1, "benched": 0, "judged": 1, "requeued": 0,
+         "tokens": [{
+             "tid": "Unk:1399811149", "ticker": "UNK", "net": 1399811149,
+             "chain": "solana", "stage": "judged", "holder_count": 10,
+             "judge_score": 0.70, "judge_verdict": "pass",
+         }]},
+        now=now + 10, source="live",
+    )
+    payload2 = ops_summary.summary_payload(now=now + 40, force=True)
+    unk = next(j for j in payload2["judge_hi"] if j["ticker"] == "UNK")
+    assert unk["holder_count"] == 10
+    assert not unk.get("holders_source")
     assert horn["dev_sold_pct"] == pytest.approx(12.0)
     cycle_history.reset()
     ops_summary.reset()

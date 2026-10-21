@@ -270,8 +270,55 @@ def _rpc(method: str, params, timeout: float):
         return _rpc_raw(method, retry_params, timeout)
 
 
-def _dev_sells_from_parsed(txs: list, mint: str, creator: str) -> str | None:
-    """Compute sold-of-initial from parsed txs (oldest first)."""
+LAUNCH_SLACK_SEC = 120.0
+
+
+def _oldest_block_time(sigs) -> float | None:
+    times = []
+    for s in sigs or []:
+        if not isinstance(s, dict):
+            continue
+        n = _num(s.get("blockTime") if s.get("blockTime") is not None else s.get("block_time"))
+        if n is not None:
+            times.append(n)
+    return min(times) if times else None
+
+
+def _launch_ts(d: dict) -> float | None:
+    age = _num(d.get("age_minutes"))
+    if age is not None:
+        return current_time() - age * 60.0
+    for key in ("created", "created_at", "createdAt"):
+        raw = _num(d.get(key))
+        if raw is None:
+            continue
+        if raw > 1e12:
+            raw = raw / 1000.0
+        return raw
+    return None
+
+
+def window_reached_launch(d: dict, sigs) -> bool:
+    """True when the 20-sig window includes the token launch. No extra RPC."""
+    n = len(sigs or [])
+    launch = _launch_ts(d) if isinstance(d, dict) else None
+    oldest = _oldest_block_time(sigs)
+    if n >= DEV_SELLS_SIG_LIMIT:
+        if launch is None or oldest is None:
+            return False
+        return oldest <= launch + LAUNCH_SLACK_SEC
+    if launch is not None and oldest is not None:
+        return oldest <= launch + LAUNCH_SLACK_SEC
+    return True
+
+
+def _dev_sells_from_parsed(txs: list, mint: str, creator: str,
+                           *, reached_launch: bool = True) -> str | None:
+    """Compute sold-of-initial from parsed txs (oldest first).
+
+    If the 20-sig window misses launch, or sold/observed > 100%, return a
+    partial-window note instead of claiming '% of initial since launch'.
+    """
     initial = None
     last = None
     sold = 0
@@ -304,6 +351,8 @@ def _dev_sells_from_parsed(txs: list, mint: str, creator: str) -> str | None:
     if sold <= 0:
         return "dev sells: none seen"
     pct = sold / initial * 100.0
+    if (not reached_launch) or pct > 100.0:
+        return f"partial window: sold {_fmt_sold_pct(pct)} of observed"
     return f"dev sold {_fmt_sold_pct(pct)}% of initial since launch"
 
 
@@ -370,6 +419,8 @@ def fill_creator(d: dict) -> dict:
 def sold_pct_from_text(text: str | None):
     if not text:
         return None
+    if str(text).startswith("partial window"):
+        return None
     if str(text).startswith("dev sells: none"):
         return 0.0
     m = re.search(r"dev sold ([0-9.]+)%", str(text))
@@ -430,7 +481,8 @@ def solana_dev_sells(d: dict) -> str | None:
                 parsed.append(tx)
         if not parsed:
             return None
-        return _dev_sells_from_parsed(parsed, mint, creator)
+        reached = window_reached_launch(d, sigs if isinstance(sigs, list) else [])
+        return _dev_sells_from_parsed(parsed, mint, creator, reached_launch=reached)
     except Exception as e:
         log.warning("dev sells lookup failed for %s: %s", ticker, safe_err(e))
         return None
@@ -489,10 +541,14 @@ def attach(d: dict, now: float | None = None) -> dict:
     try:
         sells = dev_sells_bit(d)
         if sells:
-            d["dev_sells"] = sells
-            pct = sold_pct_from_text(sells)
-            if pct is not None:
-                d["dev_sold_pct"] = pct
+            if str(sells).startswith("partial window"):
+                d["dev_sells_note"] = sells
+                d["dev_sells"] = sells
+            else:
+                d["dev_sells"] = sells
+                pct = sold_pct_from_text(sells)
+                if pct is not None:
+                    d["dev_sold_pct"] = pct
     except Exception as e:
         log.warning("dev sells bit failed: %s", safe_err(e))
     return d
