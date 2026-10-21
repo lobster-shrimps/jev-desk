@@ -307,11 +307,35 @@ def test_dev_sells_partial_window_before_none_seen_when_sigs_miss_token():
     d = {**SAMPLE_D, "creator": creator, "age_minutes": 103}
     judge_inputs.attach(d)
     assert d.get("dev_sold_pct") is None
-    assert d["dev_sells_note"] == "partial window: sold 0% of observed"
+    assert d["dev_sells_note"] == "partial window: token not in recent creator activity"
+    assert "sold 0%" not in (d.get("dev_sells") or "")
     assert "none seen" not in (d.get("dev_sells") or "")
     assert "since launch" not in (d.get("dev_sells") or "")
     assert judge_inputs.sold_pct_from_text(d["dev_sells"]) is None
     assert judge_inputs.cycle_lookups() == 1
+    judge_inputs.set_time_fn(None)
+
+
+def test_dev_sells_partial_window_sold_pct_only_when_txs_touch_token():
+    """Partial window still reports sold X% when observed txs touch the mint."""
+    judge_inputs.reset_cycle()
+    mint, creator = "Addr0", "Dev111"
+    now = 1_700_100_000.0
+    judge_inputs.set_time_fn(lambda: now)
+    sigs = [{"signature": f"s{i}", "blockTime": now - 60 - i * 55} for i in range(20)]
+
+    def rpc(method, params, timeout):
+        if method == "getSignaturesForAddress":
+            return sigs
+        return _parsed_tx(mint, creator, 1000, 1000)
+
+    judge_inputs.set_rpc_fn(rpc)
+    d = {**SAMPLE_D, "creator": creator, "age_minutes": 103}
+    judge_inputs.attach(d)
+    assert d.get("dev_sold_pct") is None
+    assert d["dev_sells_note"] == "partial window: sold 0% of observed"
+    assert "token not in recent creator activity" not in d["dev_sells_note"]
+    assert judge_inputs.sold_pct_from_text(d["dev_sells"]) is None
     judge_inputs.set_time_fn(None)
 
 

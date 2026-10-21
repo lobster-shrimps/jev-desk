@@ -330,7 +330,9 @@ def _dev_sells_from_parsed(txs: list, mint: str, creator: str,
 
     If the 20-sig window misses launch, or sold/observed > 100%, return a
     partial-window note instead of claiming '% of initial since launch'.
-    'none seen' / 0.0 only when the window reaches launch.
+    When the window misses launch and no observed tx touches the token, say
+    so instead of 'sold 0%'. 'none seen' / 0.0 only when the window reaches
+    launch.
     """
     initial = None
     last = None
@@ -354,6 +356,8 @@ def _dev_sells_from_parsed(txs: list, mint: str, creator: str,
         elif pre is not None:
             last = pre
     if not reached_launch:
+        if not saw_mint:
+            return "partial window: token not in recent creator activity"
         pct = _sold_pct_from_balances(initial, last, sold)
         return _partial_window_note(0.0 if pct is None else pct)
     if not saw_mint:
