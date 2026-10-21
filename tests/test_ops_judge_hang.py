@@ -33,7 +33,7 @@ def test_ops_and_api_handlers_are_sync_judge_stays_async():
     for name in (
         "ops_panel", "ops_summary", "ops_briefing", "ops_young_trail",
         "ops_young_trail_fast", "ops_young_trail_helius",
-        "ops_young_trail_rugrisk", "ops_young_trail_signals",
+        "ops_young_trail_rugrisk", "ops_pick_confirm", "ops_young_trail_signals",
         "ops_young_trail_variants", "ops_research_query",
         "ops_research_report", "ops_backtest", "api_state",
         "api_shadow_ledger", "api_fomo_status", "api_fomo_activate",

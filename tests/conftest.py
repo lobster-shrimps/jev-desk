@@ -33,8 +33,11 @@ def isolate_outcomes(tmp_path, monkeypatch):
     import gt_api
     import outcomes
     import backtest_signals
+    import pick_confirm_shadow
     gt_api.reset()
     outcomes.reset()
+    pick_confirm_shadow.reset()
+    pick_confirm_shadow.set_time_fn(None)
     outcomes.set_time_fn(None)
     outcomes.set_sleep_fn(lambda _d: None)
 
@@ -49,6 +52,8 @@ def isolate_outcomes(tmp_path, monkeypatch):
     outcomes.set_get_fn(None)
     outcomes.set_sleep_fn(None)
     outcomes.set_time_fn(None)
+    pick_confirm_shadow.reset()
+    pick_confirm_shadow.set_time_fn(None)
     backtest_signals.reset()
     backtest_signals.set_time_fn(None)
 

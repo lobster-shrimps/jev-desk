@@ -26,6 +26,7 @@ from stalling when outcomes.db is busy. Optional split if you want a hard wall:
   GET  /ops/young_trail_fast paper 60s-mark ledger vs per-cycle young_trail
   GET  /ops/young_trail_helius paper Helius rug-signal ledger vs fast/cycle
   GET  /ops/young_trail_rugrisk paper rug-risk skip-rule counterfactuals (no gating)
+  GET  /ops/pick_confirm paper two-cycle pick confirm (no gating)
   GET  /ops/young_trail_signals paper RugCheck/boosts/Birdeye skip-rule counterfactuals (no gating)
   GET  /ops/research/query?sql=  read-only SELECT on research.db (limit 500)
   GET  /ops/research/report?kind= rugs|runners|features
@@ -266,6 +267,25 @@ def ops_young_trail_rugrisk():
                 "would_skip_dev_rugs": 0,
             },
             "counterfactuals": [],
+            "entries": [],
+        })
+
+
+@app.get("/ops/pick_confirm")
+def ops_pick_confirm():
+    """Paper two-cycle pick confirm. Does not change the real pick or shadow ledger."""
+    try:
+        import pick_confirm_shadow
+        return JSONResponse(pick_confirm_shadow.ops_payload())
+    except Exception as e:
+        log.warning("ops pick_confirm: %s", safe_err(e))
+        return JSONResponse({
+            "paper": True,
+            "simulated": True,
+            "live_orders": False,
+            "gates_picks": False,
+            "error": "pick_confirm unavailable",
+            "counts": {"n": 0, "pending_confirm": 0, "confirmed": 0, "unconfirmed": 0},
             "entries": [],
         })
 
