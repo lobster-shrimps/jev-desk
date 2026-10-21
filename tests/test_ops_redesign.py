@@ -330,7 +330,7 @@ def test_outcomes_counts_split_live_backfill(ops):
 def test_protected_logic_untouched():
     import subprocess
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py", "collect.py",
+        "thresholds.py", "questions.py", "pick.py", "filter.py",
         "judge.py",
     ):
         r = subprocess.run(

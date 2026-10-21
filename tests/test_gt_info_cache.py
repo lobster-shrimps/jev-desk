@@ -114,7 +114,8 @@ def test_cache_hit_skips_gt_call_and_limiter_spend(fresh_stats):
         second = collect.dossier(_sol_token(), limiter=limiter)
 
     assert first["holder_count"] == 180
-    assert second["holder_count"] == 180
+    # Cache hit keeps static /info (handle) but holder_count comes from the snapshot.
+    assert second["holder_count"] == 200
     assert second["x_handle"] == "example"
     assert len(gt_info) == 1
     assert len(limiter.calls) == 1
@@ -122,6 +123,36 @@ def test_cache_hit_skips_gt_call_and_limiter_spend(fresh_stats):
     assert stats["attempts"] == 1
     assert stats["ok"] == 1
     assert stats["hits"] == 1
+    assert stats["misses"] == 1
+
+
+def test_holder_count_refreshes_across_cycles_static_info_cached(fresh_stats):
+    """FOMO/trade snapshot holders update on cache hits; handle stays cached."""
+    clock = FakeClock(5_000.0)
+    gt_info_cache.set_time_fn(clock.time)
+    limiter = GTRateLimiter(calls_per_min=8, time_fn=clock.time, sleep_fn=clock.sleep)
+    gt_info = []
+
+    def fake_get(url, **kwargs):
+        gt_info.append(url)
+        return _gt_info_ok(holder_count=647)
+
+    with patch("collect.requests.get", side_effect=fake_get):
+        first = collect.dossier(_sol_token(holder_count=647), limiter=limiter)
+        second = collect.dossier(_sol_token(holder_count=744), limiter=limiter)
+        third = collect.dossier(_sol_token(holder_count=1470), limiter=limiter)
+
+    assert first["holder_count"] == 647
+    assert second["holder_count"] == 744
+    assert third["holder_count"] == 1470
+    assert second["x_handle"] == "example"
+    assert third["x_handle"] == "example"
+    assert third["mint_authority"] is False
+    assert len(gt_info) == 1
+    assert len(limiter.calls) == 1
+    stats = collect.gt_info_cycle_stats()
+    assert stats["attempts"] == 1
+    assert stats["hits"] == 2
     assert stats["misses"] == 1
 
 

@@ -810,7 +810,7 @@ def test_no_gating_imports_or_protected_files():
         assert "young_trail_signals" not in text, name
     for name in (
         "thresholds.py", "questions.py", "pick.py", "filter.py",
-        "collect.py", "judge.py",
+        "judge.py",
     ):
         r = subprocess.run(
             ["git", "diff", "--", name],

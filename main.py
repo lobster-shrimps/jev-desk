@@ -475,6 +475,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     
     shortlist_result = list(shortlist(fomo, combined_ids))
     shortlist_tids = {t["tid"] for t in shortlist_result}
+    try:
+        import young_trail_helius
+        young_trail_helius.remember_creators(shortlist_result)
+    except Exception as e:
+        log.warning("remember creators: %s", safe_err(e))
     
     # Tag tokens with their tier for priority sorting
     for t in shortlist_result:
