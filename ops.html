@@ -46,6 +46,9 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
 .md h3{font-size:13px;margin:12px 0 4px}.md p,.md li{margin:2px 0;color:var(--mute)}
 .chips{display:flex;gap:6px;flex-wrap:wrap}.chip{font:11px var(--mono);border:1px solid var(--line);padding:2px 6px;border-radius:3px;color:var(--mute)}
 .err{color:var(--neg);font-size:12px}
+.ended-panel{opacity:.55}
+tr.pick td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+.adj{font:600 10px var(--mono);border:1px solid var(--warn);color:var(--warn);padding:0 5px;border-radius:3px;margin-left:6px;text-transform:uppercase;letter-spacing:.04em}
 @media(max-width:600px){section{padding:14px 12px}header.top{padding:10px 12px}.kv b{font-size:16px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -64,16 +67,32 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
 </header>
 <div id="fomo-auth-banner" class="err" hidden style="padding:8px 20px;background:color-mix(in srgb,var(--neg) 18%,var(--bg));border-bottom:1px solid var(--neg)"></div>
 <nav class="jump" aria-label="Sections">
-  <a href="#desk">Desk</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#yt-helius">Helius</a><a href="#yt-rugrisk">Rug-risk</a><a href="#yt-signals">Signals</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
+  <a href="#desk">Desk</a><a href="#desk-rug">Desk rug</a><a href="#pick-confirm">Confirm</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#yt-helius">Helius</a><a href="#yt-rugrisk">Rug-risk</a><a href="#yt-signals">Signals</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
 </nav>
 <main>
 <section id="desk" class="s6" aria-labelledby="desk-h">
   <h2 id="desk-h">Main desk <small id="desk-sub"></small></h2>
   <div class="kv" id="desk-kv"></div>
   <h2>Shadow picks &amp; fills</h2>
-  <div class="scroll"><table id="shadow-t"><thead><tr><th>Ticker</th><th>Status</th><th class="n">Entry</th><th class="n">Exit</th><th class="n">P&amp;L</th><th>Reason</th></tr></thead><tbody></tbody></table></div>
-  <h2 style="margin-top:16px">Judge scores ≥ 0.60 <small>cutoff 0.6 · conf 0.55</small></h2>
-  <div class="scroll"><table id="judge-t"><thead><tr><th>Time</th><th>Ticker</th><th class="n">Score</th><th class="n">Conf</th><th>Verdict</th></tr></thead><tbody></tbody></table></div>
+  <div class="scroll"><table id="shadow-t"><thead><tr><th>Ticker</th><th>Status</th><th>Confirm</th><th class="n">Sniper</th><th class="n">Entry</th><th class="n">Exit</th><th class="n">P&amp;L</th><th>Reason</th></tr></thead><tbody></tbody></table></div>
+  <h2 style="margin-top:16px">Judge scores ≥ 0.60 <small>cutoff 0.6 · conf 0.55 · holders from trade snapshot</small></h2>
+  <div class="scroll"><table id="judge-t"><thead><tr><th>Time</th><th>Ticker</th><th class="n">Score</th><th class="n">Conf</th><th>Verdict</th><th class="n">Holders</th><th>Source</th><th>Dev sold</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="desk-rug" class="s6" aria-labelledby="drr-h">
+  <h2 id="drr-h">Main-desk rug check <small>paper · does not gate picks</small></h2>
+  <div class="err" id="drr-err" hidden></div>
+  <div class="kv" id="drr-kv"></div>
+  <div class="note" id="drr-note"></div>
+  <div class="scroll"><table id="drr-t"><thead><tr><th>Ticker</th><th>Stage</th><th class="n">Score</th><th>Verdict</th><th class="n">Sniper</th><th>Bundled</th><th class="n">Dev rugs</th><th>&lt;100 fol</th><th>Sn≥0.5</th><th>Dev≥1%</th><th>Recyc≥0.2</th></tr></thead><tbody></tbody></table></div>
+  <h2 style="margin-top:16px">Flag vs outcome <small>counterfactual</small></h2>
+  <div class="scroll"><table id="drr-cf"><thead><tr><th>Flag</th><th class="n">Hit n</th><th class="n">Hit picks</th><th class="n">Hit P&amp;L</th><th class="n">Miss n</th><th class="n">Miss picks</th><th class="n">Miss P&amp;L</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="pick-confirm" class="s6" aria-labelledby="pc-h">
+  <h2 id="pc-h">Two-cycle confirm <small>shadow, does not gate picks</small></h2>
+  <div class="err" id="pc-err" hidden></div>
+  <div class="kv" id="pc-kv"></div>
+  <div class="note" id="pc-note">shadow, does not gate picks</div>
+  <div class="scroll"><table id="pc-t"><thead><tr><th>Ticker</th><th class="n">First</th><th>Next</th><th class="n">Confirm $</th><th class="n">Fwd P&amp;L</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="yt" class="s6" aria-labelledby="yt-h">
   <h2 id="yt-h">young_trail paper test <small id="yt-days"></small></h2>
@@ -81,11 +100,11 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
   <svg class="curve" id="yt-curve" role="img" aria-label="Cumulative realized P&L"></svg>
   <div class="note" id="yt-curve-note"></div>
 </section>
-<section class="s6" aria-label="young_trail open positions">
-  <h2>Open positions <small>last vs entry</small></h2>
+<section class="s6" data-yt-live aria-label="young_trail open positions">
+  <h2>Open positions <small>last vs entry · live test ended</small></h2>
   <div class="scroll"><table id="yt-open"><thead><tr><th>Ticker</th><th>Chain</th><th>Policy</th><th class="n">Age</th><th class="n">Last/entry</th><th class="n">Peak/entry</th><th class="n">Unrealized</th></tr></thead><tbody></tbody></table></div>
 </section>
-<section class="s6" aria-label="young_trail recent closes">
+<section class="s6" data-yt-live aria-label="young_trail recent closes">
   <h2>Recent closes</h2>
   <div class="scroll"><table id="yt-closed"><thead><tr><th>Closed</th><th>Ticker</th><th>Policy</th><th>Reason</th><th class="n">Held</th><th class="n">P&amp;L</th></tr></thead><tbody></tbody></table></div>
   <h2 style="margin-top:16px">tp50 vs legacy_base <small>new entries only</small></h2>
@@ -117,6 +136,8 @@ button:hover{border-color:var(--mute)}:focus-visible{outline:2px solid var(--acc
 </section>
 <section id="variants" aria-labelledby="var-h">
   <h2 id="var-h">Exit variants <small id="var-cav"></small></h2>
+  <div class="err" id="var-err" hidden></div>
+  <div class="note" id="var-note"></div>
   <div class="scroll"><table id="var-t"><thead><tr><th>#</th><th>Variant</th><th class="n">Closed</th><th class="n">Open</th><th class="n">Win rate</th><th class="n">Realized</th><th style="width:28%">vs baseline</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="research" class="s6" aria-labelledby="res-h">
@@ -179,6 +200,12 @@ const tLocal=ts=>{if(ts==null)return'—';const d=typeof ts==='number'?new Date(
 const ago=s=>s==null?'—':s<90?Math.round(s)+'s':s<5400?Math.round(s/60)+'m':(s/3600).toFixed(1)+'h';
 const kv=(el,pairs)=>{$(el).innerHTML=pairs.map(([k,v,c])=>`<div><span>${esc(k)}</span><b class="${c||''}">${v}</b></div>`).join('')};
 const rows=(el,html)=>{$(el).querySelector('tbody').innerHTML=html||'<tr><td colspan="9" class="stat">none</td></tr>'};
+const yn=v=>v===true?'yes':v===false?'no':'—';
+function softErr(id, data, label){
+  const el=$(id); if(!el) return !data || data.error;
+  if(!data || data.error){el.hidden=false;el.textContent=label||'unavailable';return true}
+  el.hidden=true;el.textContent='';return false;
+}
 async function J(p){try{const r=await fetch(p,{cache:'no-store'});if(!r.ok)throw new Error(r.status);return await r.json()}catch(e){console.warn(p,e);return null}}
 
 function curve(points){
@@ -201,7 +228,7 @@ async function load(){
   if(loadInflight)return;
   loadInflight=true;
   try{
-  const [S,YT,V,SL,B,YF,YH,YR,YX]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius'),J('/ops/young_trail_rugrisk'),J('/ops/young_trail_signals')]);
+  const [S,YT,V,SL,B,YF,YH,YR,YX,DR,PC]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius'),J('/ops/young_trail_rugrisk'),J('/ops/young_trail_signals'),J('/ops/desk_rugrisk'),J('/ops/pick_confirm')]);
   const now=Date.now()/1000;
   if(S){const h=S.health||{};
     $('h-mode').textContent=(h.mode||'shadow')+' · judge '+(h.judge_mode||'?');
@@ -218,16 +245,21 @@ async function load(){
     const ban=$('fomo-auth-banner');
     if(h.fomo_auth_down){ban.hidden=false;ban.textContent=`FOMO AUTH DOWN: ${h.fomo_consecutive_auth_failures||0} consecutive cycles failed; log into fomo.family in the FomoDesk Chrome (CDP 9222)`}
     else{ban.hidden=true;ban.textContent=''}
-    rows('judge-t',(S.judge_hi||[]).map(j=>`<tr><td>${tLocal(j.ts_iso)}</td><td>${esc(j.ticker)}</td><td class="n">${j.score.toFixed(2)}</td><td class="n">${j.confidence?.toFixed(2)??'—'}</td><td>${esc(j.verdict)}</td></tr>`).join(''));
+    rows('judge-t',(S.judge_hi||[]).map(j=>{
+      const src=j.holders_source||(j.holder_count!=null?'trade snapshot':'—');
+      const fresh=j.holders_age_s==null?'':(' · '+ago(j.holders_age_s)+' ago');
+      const sold=j.dev_sold_pct==null?'no creator':(j.dev_sold_pct+'%');
+      return `<tr><td>${tLocal(j.ts_iso)}</td><td>${esc(j.ticker)}</td><td class="n">${j.score.toFixed(2)}</td><td class="n">${j.confidence?.toFixed(2)??'—'}</td><td>${esc(j.verdict)}</td><td class="n">${j.holder_count??'—'}</td><td class="stat">${esc(src)}${esc(fresh)}</td><td>${esc(sold)}</td></tr>`;
+    }).join(''));
     const o=S.outcomes||{};const tot=(o.complete||0)+(o.pending_live||0)+(o.pending_backfill||0)+(o.dead||0);
-    kv('out-kv',[['Complete',o.complete,'ok'],['Pending live',o.pending_live],['Pending backfill',o.pending_backfill],['Dead',o.dead,'bad'],['Done 24h',o.complete_24h]]);
+    kv('out-kv',[['Complete',o.complete,'ok'],['Pending live',o.pending_live],['Pending backfill',o.pending_backfill],['Dead',o.dead,'bad'],['Done 24h',o.complete_24h],['Fetch',o.paused?'paused':'running',o.paused?'warn':'ok']]);
     $('out-bar').style.width=(tot?100*o.complete/tot:0)+'%';
     $('out-note').textContent=`Backfill drains ${o.window||'01:00–06:00'} only · ${o.paused?'paused (cycle 429)':o.trickle?'daytime trickle':'window fill'}`;
-    const b=S.budget||{};
-    kv('bud-kv',[['CoinGecko',b.cg_plan+(b.demo_active?' · on':' · off'),b.demo_active?'ok':'warn'],['Month',`${b.cg_month_calls}/${b.cg_month_cap}`],['Today',`${b.cg_today}/${b.cg_daily_cap}`],['GT pace',b.gt_calls_per_min+'/min'],['GT 429 24h',b.gt_429_24h,b.gt_429_24h>20?'warn':'']]);
+    const b=S.budget||{};const src429=b.gt_429_by_source||{};const cache=b.gt_info_cache||{};
+    kv('bud-kv',[['CoinGecko',b.cg_plan+(b.demo_active?' · on':' · off'),b.demo_active?'ok':'warn'],['Month',`${b.cg_month_calls}/${b.cg_month_cap}`],['Today',`${b.cg_today}/${b.cg_daily_cap}`],['GT pace',b.gt_calls_per_min+'/min'],['GT 429 desk 24h',src429.desk??b.gt_429_24h??0, (src429.desk||0)>20?'warn':''],['GT 429 outcomes 24h',src429.outcomes??0,(src429.outcomes||0)>20?'warn':''],['/info hit rate',cache.hit_rate_24h==null?'—':pct(cache.hit_rate_24h)]]);
     $('bud-bar').style.width=Math.min(100,100*b.cg_month_calls/(b.cg_month_cap||1))+'%';
     $('bud-bar').className=b.cg_month_calls>=b.cg_month_cap?'neg':'';
-    $('bud-note').textContent=b.demo_active?'Outcomes use CoinGecko Demo; desk uses free GeckoTerminal.':'Demo cap reached — outcomes on free GeckoTerminal until month rollover.';
+    $('bud-note').textContent=`GeckoTerminal 429s by source (24h): desk ${src429.desk??0} · outcomes ${src429.outcomes??0}. /info cache ${cache.hits_24h??0}/${(cache.hits_24h||0)+(cache.misses_24h||0)} hits. Outcomes fetch ${o.paused?'paused':'running'}. `+(b.demo_active?'Outcomes use CoinGecko Demo; desk uses free GeckoTerminal.':'Demo cap reached — outcomes on free GeckoTerminal until month rollover.');
     const r=S.regime||{};
     kv('mood-kv',[['Regime',r.tag||'—',r.tag==='risk_on'?'ok':r.tag==='long_flush'||r.tag==='risk_off'?'bad':''],['Long liq',fmtUsd(r.long_liq_usd).replace('.00','')],['Short liq',fmtUsd(r.short_liq_usd).replace('.00','')],['Meme funding',r.memes_funding!=null?(r.memes_funding*100).toFixed(3)+'%':'—'],['OI Δ',pct(r.oi_change)]]);
     $('mood-hist').innerHTML=(r.history||[]).map(([t,g])=>`<span class="chip" title="${esc(t)}">${tLocal(t).split(', ').pop()} ${esc(g)}</span>`).join('');
@@ -235,12 +267,43 @@ async function load(){
     curve(S.young_trail_curve);
     load.cache=S.young_trail_curve;
   }
+  const pcByTick={}; (PC&&PC.entries||[]).forEach(e=>{if(e.ticker)pcByTick[String(e.ticker).toUpperCase()]=e});
+  const rugByTick={}; (DR&&DR.entries||[]).forEach(e=>{if(e.ticker)rugByTick[String(e.ticker).toUpperCase()]=e});
   if(SL){const all=[...(SL.open_positions||[]).map(p=>({...p,_s:'open'})),...(SL.closed_positions||[]).map(p=>({...p,_s:'closed'}))];
-    rows('shadow-t',all.slice(-10).reverse().map(p=>`<tr><td>${esc(p.ticker)}</td><td>${p._s}</td><td class="n">${fmtPx(p.entry_price_usd)}</td><td class="n">${fmtPx(p.exit_price_usd)}</td><td class="n ${cls(p.realized_pnl_usd)}">${fmtUsd(p.realized_pnl_usd)}</td><td class="stat">${esc(p.reason||'')}</td></tr>`).join(''));
+    rows('shadow-t',all.slice(-10).reverse().map(p=>{
+      const key=String(p.ticker||'').toUpperCase();
+      const conf=pcByTick[key]; const rug=rugByTick[key];
+      const st=conf?conf.status:(p._s==='open'?'real pick':'real pick');
+      const sn=rug&&rug.sniper_share!=null?(+rug.sniper_share).toFixed(2):'—';
+      return `<tr><td>${esc(p.ticker)}</td><td>${p._s}</td><td class="stat">${esc(st)}</td><td class="n">${sn}</td><td class="n">${fmtPx(p.entry_price_usd)}</td><td class="n">${fmtPx(p.exit_price_usd)}</td><td class="n ${cls(p.realized_pnl_usd)}">${fmtUsd(p.realized_pnl_usd)}</td><td class="stat">${esc(p.reason||'')}</td></tr>`;
+    }).join(''));
     $('desk-sub').textContent=`shadow closed ${SL.summary?.closed_trades_count??0}`;}
-  if(YT){const s=YT.summary||{};const by=s.by_exit_policy||{};const tp=by.tp50||{};const lg=by.legacy||{};const lb=YT.legacy_base||{};const left=YT.until_ts?(YT.until_ts-now)/86400:null;
-    $('yt-days').textContent=left!=null?`${Math.max(0,left).toFixed(1)} days left · ends ${tLocal(YT.until_ts)} · new ${esc(YT.exit_policy||'tp50')}`:'';
-    kv('yt-kv',[['Combined',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Closed',s.closed_count],['Open',s.open_count],['tp50 P&L',fmtUsd(tp.realized_pnl_usd),cls(tp.realized_pnl_usd)],['tp50 closed',tp.closed_count],['legacy P&L',fmtUsd(lg.realized_pnl_usd),cls(lg.realized_pnl_usd)],['legacy closed',lg.closed_count],['legacy_base shadow',fmtUsd(lb.realized_pnl_usd),cls(lb.realized_pnl_usd)]]);
+  if(!softErr('drr-err', DR, 'desk_rugrisk unavailable')){
+    const c=DR.counts||{}, bud=DR.budget||{};
+    kv('drr-kv',[['Budget ET',`${bud.day_used??0}/${bud.day_cap??600}`],['ok',c.ok||0,'ok'],['pending',c.pending||0],['error',c.error||0,'bad'],['picks',c.picks||0,'warn']]);
+    $('drr-note').textContent=DR.caveat||'Paper rug-risk log. Does not gate picks.';
+    rows('drr-t',(DR.entries||[]).slice(0,24).map(r=>{
+      const g=r.shadow_guards||{};
+      return `<tr class="${r.is_pick?'pick':''}"><td>${esc(r.ticker)}</td><td>${esc(r.stage||'')}</td><td class="n">${r.judge_score==null?'—':(+r.judge_score).toFixed(2)}</td><td>${esc(r.verdict||'')}</td><td class="n">${r.sniper_share==null?'—':(+r.sniper_share).toFixed(2)}</td><td>${r.bundled==1||r.bundled===true?'yes':r.bundled==0||r.bundled===false?'no':'—'}</td><td class="n">${r.dev_prior_rugs??'—'}</td><td>${yn(r.followers_lt_100??g.followers_lt_100)}</td><td>${yn(r.sniper_share_ge_50??g.sniper_share_ge_50)}</td><td>${yn(r.dev_holding_ge_1pct??g.dev_holding_ge_1pct)}</td><td>${yn(r.recycled_account_ge_02??g.recycled_account_ge_02)}</td></tr>`;
+    }).join(''));
+    rows('drr-cf',(DR.counterfactuals||[]).map(f=>{
+      const h=f.hit||{}, m=f.miss||{};
+      return `<tr><td>${esc(f.label||f.id)}</td><td class="n">${h.n??0}</td><td class="n">${h.picks??0}</td><td class="n ${cls(h.pick_pnl)}">${fmtUsd(h.pick_pnl)}</td><td class="n">${m.n??0}</td><td class="n">${m.picks??0}</td><td class="n ${cls(m.pick_pnl)}">${fmtUsd(m.pick_pnl)}</td></tr>`;
+    }).join(''));
+  }
+  if(!softErr('pc-err', PC, 'pick_confirm unavailable')){
+    const c=PC.counts||{}, rp=PC.real_picks||{};
+    kv('pc-kv',[['Pending',c.pending_confirm||0],['Confirmed',c.confirmed||0,'ok'],['Unconfirmed',c.unconfirmed||0],['Confirmed P&L',fmtUsd(PC.confirmed_pnl),cls(PC.confirmed_pnl)],['Real picks P&L',fmtUsd(rp.pnl),cls(rp.pnl)],['Real closed',rp.closed||0]]);
+    $('pc-note').textContent=PC.label||PC.caveat||'shadow, does not gate picks';
+    rows('pc-t',(PC.entries||[]).slice(0,24).map(r=>{
+      const next=r.status==='confirmed'?('confirmed'+(r.confirm_score!=null?' '+Number(r.confirm_score).toFixed(2):'')):r.status==='unconfirmed'?('unconfirmed '+(r.unconfirm_reason||'')):r.status||'pending';
+      return `<tr><td>${esc(r.ticker)}</td><td class="n">${r.first_score==null?'—':(+r.first_score).toFixed(2)}</td><td class="stat">${esc(next)}</td><td class="n">${fmtPx(r.confirm_price)}</td><td class="n ${cls(r.pnl_usd)}">${fmtUsd(r.pnl_usd)}</td></tr>`;
+    }).join(''));
+  }
+  if(YT){const s=YT.summary||{};const by=s.by_exit_policy||{};const tp=by.tp50||{};const lg=by.legacy||{};const lb=YT.legacy_base||{};const ended=!!(YT.ended||YT.accepting_entries===false);
+    document.querySelectorAll('[data-yt-live]').forEach(el=>el.classList.toggle('ended-panel', ended));
+    $('yt-days').textContent=ended?(YT.ended_label||'Stopped taking entries Oct 20 11:59 PM ET')+(s.closed_count!=null?` · final ${s.closed_count} closes`:'') : (YT.until_ts?`${Math.max(0,(YT.until_ts-now)/86400).toFixed(1)} days left · ends ${tLocal(YT.until_ts)} · new ${esc(YT.exit_policy||'tp50')}`:'');
+    kv('yt-kv',[['Final combined',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Closed',s.closed_count],['Open',s.open_count],['tp50 P&L',fmtUsd(tp.realized_pnl_usd),cls(tp.realized_pnl_usd)],['tp50 closed',tp.closed_count],['legacy P&L',fmtUsd(lg.realized_pnl_usd),cls(lg.realized_pnl_usd)],['legacy closed',lg.closed_count],['legacy_base shadow',fmtUsd(lb.realized_pnl_usd),cls(lb.realized_pnl_usd)]]);
     rows('yt-open',(YT.open_positions||[]).map(p=>{const r=p.last_price/p.entry_price;return `<tr><td>${esc(p.ticker)}</td><td>${esc(p.chain)}</td><td>${esc(p.exit_policy||'legacy')}</td><td class="n">${ago(now-p.entry_ts)}</td><td class="n ${cls(r-1)}">${x(r)}</td><td class="n">${x(p.peak/p.entry_price)}</td><td class="n ${cls(r-1)}">${fmtUsd((YT.ticket_usd||50)*(r-1))}</td></tr>`}).join(''));
     rows('yt-closed',(YT.closed_trades||[]).slice(0,12).map(c=>`<tr><td>${tLocal(c.exit_ts)}</td><td>${esc(c.ticker)}</td><td>${esc(c.exit_policy||'legacy')}</td><td>${esc(c.exit_reason)}</td><td class="n">${ago(c.exit_ts-c.entry_ts)}</td><td class="n ${cls(c.pnl_usd)}">${fmtUsd(c.pnl_usd)}</td></tr>`).join(''));
     rows('yt-cmp',(YT.comparison||[]).slice(0,12).map(r=>`<tr><td>${esc(r.ticker||'')}</td><td>${esc(r.live_exit_reason||'open')}</td><td class="n ${cls(r.live_pnl_usd)}">${fmtUsd(r.live_pnl_usd)}</td><td>${esc(r.legacy_base_exit_reason||'open')}</td><td class="n ${cls(r.legacy_base_pnl_usd)}">${fmtUsd(r.legacy_base_pnl_usd)}</td></tr>`).join(''));}
@@ -260,10 +323,13 @@ async function load(){
     kv('yts-kv',[['Entries',s.n||0],['ok',s.ok||0],['Pending',s.pending||0],['Error',s.error||0],['Would skip danger',s.would_skip_danger||0],['Would skip LP',s.would_skip_lp||0],['Would skip auth',s.would_skip_authority||0],['Would skip score',s.would_skip_score||0],['Would skip promo',s.would_skip_promo||0],['Would skip momentum',s.would_skip_momentum||0]]);
     $('yts-note').textContent=YX.caveat||'Paper only · skip rules do not gate entries, picks, or the judge';
     rows('yts-t',(YX.counterfactuals||[]).map(r=>{const sk=r.skipped||{},kp=r.kept||{};return `<tr><td>${esc(r.label||r.id||'')}</td><td class="n">${sk.n??0}</td><td class="n ${cls(sk.young_trail_pnl)}">${fmtUsd(sk.young_trail_pnl)}</td><td class="n ${cls(sk.fast_baseline_pnl)}">${fmtUsd(sk.fast_baseline_pnl)}</td><td class="n ${cls(sk.fast_tp50_pnl)}">${fmtUsd(sk.fast_tp50_pnl)}</td><td class="n">${kp.n??0}</td><td class="n ${cls(kp.young_trail_pnl)}">${fmtUsd(kp.young_trail_pnl)}</td><td class="n ${cls(kp.fast_baseline_pnl)}">${fmtUsd(kp.fast_baseline_pnl)}</td><td class="n ${cls(kp.fast_tp50_pnl)}">${fmtUsd(kp.fast_tp50_pnl)}</td></tr>`}).join(''));}
-  if(V){const rk=[...(V.ranking||[])].sort((a,b)=>b.realized_pnl_usd-a.realized_pnl_usd);const base=rk.find(r=>r.variant==='baseline')?.realized_pnl_usd??0;
+  if(softErr('var-err', V, 'young_trail_variants unavailable')){}
+  else if(V){const rk=[...(V.ranking||[])].sort((a,b)=>b.realized_pnl_usd-a.realized_pnl_usd);const base=rk.find(r=>r.variant==='baseline')?.realized_pnl_usd??0;
     const span=Math.max(1,...rk.map(r=>Math.abs(r.realized_pnl_usd-base)));
     $('var-cav').textContent=V.caveat||'';
-    rows('var-t',rk.map((r,i)=>{const d=r.realized_pnl_usd-base;const w=50*Math.abs(d)/span;return `<tr><td class="n">${i+1}</td><td>${esc(r.label)}</td><td class="n">${r.n}</td><td class="n">${r.open}</td><td class="n">${pct(r.win_rate)}</td><td class="n ${cls(r.realized_pnl_usd)}">${fmtUsd(r.realized_pnl_usd)}</td><td><div style="position:relative;height:10px"><span style="position:absolute;left:50%;top:0;bottom:0;border-left:1px solid var(--line)"></span><i style="position:absolute;top:2px;height:6px;${d>=0?'left:50%':'right:50%'};width:${w}%;background:${d>=0?'var(--pos)':'var(--neg)'}"></i></div><span class="stat">${r.variant==='baseline'?'baseline':(d>=0?'+':'−')+fmtUsd(Math.abs(d)).slice(d<0?1:0)}</span></td></tr>`}).join(''));}
+    const adjN=V.adjusted_rows||0;
+    $('var-note').textContent=adjN?`${adjN} row adjusted (bad price mark)`:'Corrected totals · no rows adjusted';
+    rows('var-t',rk.map((r,i)=>{const d=r.realized_pnl_usd-base;const w=50*Math.abs(d)/span;const badge=r.adjusted_rows?`<span class="adj">adjusted</span>`:'';return `<tr><td class="n">${i+1}</td><td>${esc(r.label)}${badge}</td><td class="n">${r.n}</td><td class="n">${r.open}</td><td class="n">${pct(r.win_rate)}</td><td class="n ${cls(r.realized_pnl_usd)}">${fmtUsd(r.realized_pnl_usd)}</td><td><div style="position:relative;height:10px"><span style="position:absolute;left:50%;top:0;bottom:0;border-left:1px solid var(--line)"></span><i style="position:absolute;top:2px;height:6px;${d>=0?'left:50%':'right:50%'};width:${w}%;background:${d>=0?'var(--pos)':'var(--neg)'}"></i></div><span class="stat">${r.variant==='baseline'?'baseline':(d>=0?'+':'−')+fmtUsd(Math.abs(d)).slice(d<0?1:0)}</span></td></tr>`}).join(''));}
   if(B){$('br-date').textContent=B.date_local||'';$('br-md').innerHTML=md((B.morning&&B.morning.markdown)||B.markdown||'');}
   }finally{loadInflight=false;}
 }

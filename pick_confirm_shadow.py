@@ -427,6 +427,7 @@ def ops_payload() -> dict:
             "counts": c,
             "confirmed_pnl": c["confirmed_pnl"],
             "real_picks": _real_picks_pnl(),
+            "label": "shadow, does not gate picks",
             "entries": all_rows()[:80],
         }
     except Exception as e:
