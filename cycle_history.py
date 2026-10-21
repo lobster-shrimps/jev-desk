@@ -269,6 +269,8 @@ def _init_schema(db: sqlite3.Connection) -> None:
         ("judge_confidence", "REAL"),
         ("liquidity_usd", "REAL"),
         ("mcap_usd", "REAL"),
+        ("dev_sold_pct", "REAL"),
+        ("holder_source", "TEXT"),
     ):
         if name not in token_cols:
             db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {decl}")
@@ -996,6 +998,8 @@ def _token_from_stats_row(row: dict, now: float, kind: str) -> dict:
         "top_wallet_percent": _num(row.get("top_wallet_percent")),
         "developer_holding_percentage": _num(row.get("developer_holding_percentage")),
         "holder_count": _int(row.get("holder_count")),
+        "holder_source": row.get("holder_source"),
+        "dev_sold_pct": _num(row.get("dev_sold_pct")),
         "soft_scores": row.get("soft_scores") or {},
         "judge_verdict": row.get("judge_verdict"),
         "judge_reason": row.get("judge_reason"),
@@ -1011,8 +1015,9 @@ def _insert_token(db: sqlite3.Connection, cycle_id: int, row: dict) -> None:
              cycle_id, ts, kind, tid, chain_id, chain, ticker, reason, noul,
              age_minutes, liquidity_usd, mcap_usd, top_10_percent, top_wallet_percent,
              developer_holding_percentage, holder_count, soft_scores_json,
-             judge_verdict, judge_reason, judge_score, judge_confidence
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             judge_verdict, judge_reason, judge_score, judge_confidence,
+             dev_sold_pct, holder_source
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             cycle_id, row.get("ts"), row.get("kind"), row.get("tid"),
             row.get("chain_id"), row.get("chain"), row.get("ticker"),
@@ -1023,6 +1028,7 @@ def _insert_token(db: sqlite3.Connection, cycle_id: int, row: dict) -> None:
             _json(scores),
             row.get("judge_verdict"), row.get("judge_reason"),
             _num(row.get("judge_score")), _num(row.get("judge_confidence")),
+            _num(row.get("dev_sold_pct")), row.get("holder_source"),
         ),
     )
 
@@ -1258,6 +1264,8 @@ def _token_dict(r: sqlite3.Row) -> dict:
         "judge_reason": r["judge_reason"] if "judge_reason" in r.keys() else None,
         "judge_score": r["judge_score"] if "judge_score" in r.keys() else None,
         "judge_confidence": r["judge_confidence"] if "judge_confidence" in r.keys() else None,
+        "dev_sold_pct": r["dev_sold_pct"] if "dev_sold_pct" in r.keys() else None,
+        "holder_source": r["holder_source"] if "holder_source" in r.keys() else None,
     }
 
 

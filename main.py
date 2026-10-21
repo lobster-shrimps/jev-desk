@@ -421,9 +421,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             row["judge_confidence"] = judge_confidence
         for k in ("net", "top_10_percent", "top_wallet_percent",
                   "developer_holding_percentage", "holder_count",
-                  "crowd_prob"):
+                  "crowd_prob", "dev_sold_pct", "holder_source", "creator"):
             if t.get(k) is not None:
                 row[k] = t.get(k)
+        if row.get("holder_count") is not None and row.get("holder_source") is None:
+            row["holder_source"] = "trade snapshot"
         xa = t.get("x_account")
         if isinstance(xa, dict):
             row["x_present"] = 1

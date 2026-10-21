@@ -911,13 +911,17 @@ def ops_payload() -> dict:
     try:
         now = current_time()
         until = until_ts(now) if enabled() else None
+        accepting = accepting_entries(now)
+        ended = not accepting
         sm = summary()
         return {
             "paper": True,
             "simulated": True,
             "live_orders": False,
             "enabled": enabled(),
-            "accepting_entries": accepting_entries(now),
+            "accepting_entries": accepting,
+            "ended": ended,
+            "ended_label": "Stopped taking entries Oct 20 11:59 PM ET",
             "until_ts": until,
             "until_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until)) if until else None,
             "ticket_usd": TICKET_USD,

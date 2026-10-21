@@ -430,8 +430,15 @@ def _cycle_health(now: float) -> tuple[dict | None, int, int, int, list[dict]]:
                 log.warning("ops summary shadow_24h: %s", safe_err(e))
         no_trade_24h = max(0, cycles_24h - shadow_24h)
         since7 = now - JUDGE_HI_DAYS * 86400
+        keys = {row[1] for row in db.execute("PRAGMA table_info(tokens)")}
+        extra = ""
+        if "dev_sold_pct" in keys:
+            extra += ", dev_sold_pct"
+        if "holder_source" in keys:
+            extra += ", holder_source"
         rows = db.execute(
-            """SELECT ts, ticker, chain, judge_score, judge_confidence, judge_verdict
+            f"""SELECT ts, ticker, chain, tid, judge_score, judge_confidence, judge_verdict,
+                       holder_count{extra}
                FROM tokens
                WHERE judge_score IS NOT NULL AND judge_score >= ?
                  AND ts >= ?
@@ -439,13 +446,25 @@ def _cycle_health(now: float) -> tuple[dict | None, int, int, int, list[dict]]:
             (JUDGE_HI_MIN, since7, JUDGE_HI_MAX),
         ).fetchall()
         for r in rows:
+            keys_r = r.keys()
+            holders = r["holder_count"] if "holder_count" in keys_r else None
+            age_s = (now - float(r["ts"])) if r["ts"] is not None else None
+            src = r["holder_source"] if "holder_source" in keys_r else None
+            if not src and holders is not None:
+                src = "trade snapshot"
+            sold = r["dev_sold_pct"] if "dev_sold_pct" in keys_r else None
             judge_hi.append({
                 "ts_iso": _iso(r["ts"]),
                 "ticker": r["ticker"],
                 "chain": r["chain"],
+                "tid": r["tid"] if "tid" in keys_r else None,
                 "score": float(r["judge_score"]),
                 "confidence": _num(r["judge_confidence"]),
                 "verdict": r["judge_verdict"] or "",
+                "holder_count": holders,
+                "holders_source": src,
+                "holders_age_s": age_s,
+                "dev_sold_pct": _num(sold),
             })
     except Exception as e:
         log.warning("ops summary cycles: %s", safe_err(e))

@@ -732,6 +732,19 @@ def counterfactuals(rows: list[dict] | None = None) -> list[dict]:
         return []
 
 
+def _ops_entry(row: dict) -> dict:
+    d = dict(row)
+    blob = _loads(d.get("features_json"))
+    guards = blob.get("shadow_guards") or {}
+    d["shadow_guards"] = guards
+    d["followers_lt_100"] = guards.get(FLAG_FOLLOWERS)
+    d["sniper_share_ge_50"] = guards.get(FLAG_SNIPER)
+    d["dev_holding_ge_1pct"] = guards.get(FLAG_DEV)
+    d["recycled_account_ge_02"] = guards.get(FLAG_RECYCLED)
+    d["is_pick"] = _is_pick(d)
+    return d
+
+
 def ops_payload() -> dict:
     """JSON for GET /ops/desk_rugrisk. Paper only; no gating."""
     try:
@@ -752,7 +765,7 @@ def ops_payload() -> dict:
             "counts": counts(),
             "flags": list(SHADOW_FLAGS),
             "counterfactuals": counterfactuals(rows),
-            "entries": rows[:80],
+            "entries": [_ops_entry(r) for r in rows[:80]],
         }
     except Exception as e:
         log.warning("desk_rugrisk ops: %s", safe_err(e))
