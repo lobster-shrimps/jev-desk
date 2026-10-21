@@ -1061,8 +1061,25 @@ def apply_wallet_concentration(t: dict) -> dict:
     return t
 
 
-def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict) -> dict:
-    """Merge a GT /info attributes object onto the token. Used for live and cache."""
+def _helius_creator(tid: str | None) -> str | None:
+    if not tid:
+        return None
+    try:
+        import young_trail_helius
+        return young_trail_helius.lookup_creator(tid)
+    except Exception as e:
+        log.warning("helius creator lookup: %s", safe_err(e))
+        return None
+
+
+def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict,
+                              *, from_cache: bool = False) -> dict:
+    """Merge a GT /info attributes object onto the token. Used for live and cache.
+
+    Cache hits keep static metadata (authority, honeypot, handle) but take
+    holder_count from the trade-stage snapshot when it is present, so a 90-min
+    /info cache cannot freeze judged holder counts.
+    """
     mint_auth_normalized, mint_auth_raw = _normalize_authority(a.get("mint_authority"))
     freeze_auth_normalized, freeze_auth_raw = _normalize_authority(a.get("freeze_authority"))
 
@@ -1072,9 +1089,14 @@ def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict) -> dict:
     preserved_top_10 = d.get("top_10_percent")
     gt_creator = (a.get("creator") or a.get("creator_address") or a.get("creatorAddress")
                   or a.get("deployer") or a.get("deployer_address") or a.get("createdBy"))
+    gt_holders = holders.get("count")
+    snap_holders = t.get("holder_count") if t.get("holder_count") is not None else d.get("holder_count")
+    if from_cache:
+        holder_count = snap_holders if snap_holders is not None else gt_holders
+    else:
+        holder_count = gt_holders if gt_holders is not None else snap_holders
     d = {**d, "chain": net,
-         # GT first, FOMO as the fallback. On Robinhood GT is null and FOMO is all you get.
-         "holder_count": holders.get("count") or t.get("holder_count"),
+         "holder_count": holder_count,
          "top_10_percent": (holders.get("distribution_percentage") or {}).get("top_10"),
          "developer_holding_percentage": a.get("developer_holding_percentage"),
          "gt_score_details": a.get("gt_score_details"),
@@ -1085,7 +1107,7 @@ def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict) -> dict:
          "freeze_authority_raw": freeze_auth_raw,
          "description": a.get("description"),
          "x_handle": clean_handle(a.get("twitter_handle")),
-         "creator": gt_creator or t.get("creator") or d.get("creator")}
+         "creator": gt_creator or t.get("creator") or d.get("creator") or _helius_creator(t.get("tid") or d.get("tid"))}
     if preserved_top_wallet is not None:
         d["top_wallet_percent"] = preserved_top_wallet
     if preserved_top_10 is not None:
@@ -1099,7 +1121,8 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
 
     Cheap Solana RPC / EVM holder checks run before any GT spend so a top_wallet
     (or EVM unverified / pending) kill does not burn a rate-limit slot.
-    holder_count, authority and honeypot still come from GT /info (or its cache).
+    authority and honeypot still come from GT /info (or its cache). holder_count
+    on a cache hit prefers the trade-stage snapshot so judged counts are not frozen.
 
     A fresh cache hit skips the GT call and the limiter spend. Entries older than
     GT_INFO_CACHE_TTL_MIN are treated as a miss so filter fields are not stale.
@@ -1118,7 +1141,7 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
     cached = gt_info_cache.get(net, t["addr"])
     if cached is not None:
         _gt_info_cycle["hits"] += 1
-        return _apply_gt_info_attributes(d, t, net, cached)
+        return _apply_gt_info_attributes(d, t, net, cached, from_cache=True)
 
     _gt_info_cycle["misses"] += 1
 

@@ -246,7 +246,35 @@ def test_dev_sells_omitted_without_creator():
     d = {**SAMPLE_D}
     judge_inputs.attach(d)
     assert "dev_sells" not in d
+    assert d.get("dev_sold_pct") is None
     assert judge_inputs.cycle_lookups() == 0
+
+
+def test_creator_from_helius_computes_dev_sold_pct():
+    import young_trail_helius
+    young_trail_helius.reset()
+    young_trail_helius.note_creator(SAMPLE_D["tid"], "DevFromHelius")
+    mint, creator = SAMPLE_D["addr"], "DevFromHelius"
+    txs = {
+        "old": _parsed_tx(mint, creator, 1000, 1000),
+        "new": _parsed_tx(mint, creator, 1000, 880),
+    }
+
+    def rpc(method, params, timeout):
+        if method == "getSignaturesForAddress":
+            assert params[0] == creator
+            return [{"signature": "old"}, {"signature": "new"}]
+        return txs[params[0]]
+
+    judge_inputs.set_rpc_fn(rpc)
+    d = {**SAMPLE_D}
+    assert "creator" not in d or d.get("creator") != creator
+    d.pop("creator", None)
+    judge_inputs.attach(d)
+    assert d["creator"] == creator
+    assert d["dev_sells"] == "dev sold 12% of initial since launch"
+    assert d["dev_sold_pct"] == pytest.approx(12.0)
+    young_trail_helius.reset()
 
 
 def test_rpc_failure_omitted_and_logged_via_safe_err(monkeypatch, caplog):
