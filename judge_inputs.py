@@ -307,9 +307,46 @@ def _dev_sells_from_parsed(txs: list, mint: str, creator: str) -> str | None:
     return f"dev sold {_fmt_sold_pct(pct)}% of initial since launch"
 
 
+def fill_creator(d: dict) -> dict:
+    """Copy an already-fetched creator onto d. No extra RPC. Fail open."""
+    if not isinstance(d, dict):
+        return d
+    creator = (
+        d.get("creator") or d.get("creatorAddress") or d.get("creator_address")
+        or d.get("creatorWallet") or d.get("deployer") or d.get("deployerAddress")
+    )
+    if not creator:
+        try:
+            import young_trail_helius
+            creator = young_trail_helius.lookup_creator(d.get("tid"))
+        except Exception as e:
+            log.warning("creator lookup: %s", safe_err(e))
+            creator = None
+    if creator:
+        wallet = str(creator).strip()
+        if wallet:
+            d["creator"] = wallet
+    return d
+
+
+def sold_pct_from_text(text: str | None):
+    if not text:
+        return None
+    if str(text).startswith("dev sells: none"):
+        return 0.0
+    m = re.search(r"dev sold ([0-9.]+)%", str(text))
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 def solana_dev_sells(d: dict) -> str | None:
     """Keyless Solana creator sell trail. Cap 5/cycle, 8s each. Fail open."""
     global _lookups_this_cycle
+    fill_creator(d)
     creator = d.get("creator")
     mint = d.get("addr")
     if not creator or not mint:
@@ -367,6 +404,7 @@ def evm_dev_sells(d: dict) -> str | None:
     Without a sell trail we cannot invent a percentage, so the field is omitted
     unless the already-fetched holder row itself shows a sell vs initial.
     """
+    fill_creator(d)
     if not d.get("creator"):
         return None
     initial = _num(d.get("creator_initial_balance") or d.get("dev_initial_balance"))
@@ -395,6 +433,10 @@ def attach(d: dict, now: float | None = None) -> dict:
     if not isinstance(d, dict):
         return d
     try:
+        fill_creator(d)
+    except Exception as e:
+        log.warning("fill creator: %s", safe_err(e))
+    try:
         flow = format_flow(d)
         if flow:
             d["flow"] = flow
@@ -410,6 +452,9 @@ def attach(d: dict, now: float | None = None) -> dict:
         sells = dev_sells_bit(d)
         if sells:
             d["dev_sells"] = sells
+            pct = sold_pct_from_text(sells)
+            if pct is not None:
+                d["dev_sold_pct"] = pct
     except Exception as e:
         log.warning("dev sells bit failed: %s", safe_err(e))
     return d
