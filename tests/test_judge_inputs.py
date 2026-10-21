@@ -239,6 +239,52 @@ def test_dev_sells_sold_percent_and_none_seen():
     assert d2["dev_sells"] == "dev sells: none seen"
 
 
+def test_dev_sells_over_100_is_partial_window():
+    judge_inputs.reset_cycle()
+    mint, creator = "Addr0", "Dev111"
+    txs = {
+        "old": _parsed_tx(mint, creator, 100, 100),
+        "new": _parsed_tx(mint, creator, 400, 150),
+    }
+
+    def rpc(method, params, timeout):
+        if method == "getSignaturesForAddress":
+            return [{"signature": "new"}, {"signature": "old"}]
+        return txs[params[0]]
+
+    judge_inputs.set_rpc_fn(rpc)
+    d = {**SAMPLE_D, "creator": creator}
+    judge_inputs.attach(d)
+    assert d.get("dev_sold_pct") is None
+    assert d["dev_sells_note"].startswith("partial window")
+    assert "250" in d["dev_sells_note"]
+    assert "since launch" not in (d.get("dev_sells") or "")
+    assert judge_inputs.cycle_lookups() == 1
+
+
+def test_dev_sells_window_not_reaching_launch():
+    judge_inputs.reset_cycle()
+    mint, creator = "Addr0", "Dev111"
+    now = 1_700_100_000.0
+    judge_inputs.set_time_fn(lambda: now)
+    sigs = [{"signature": f"s{i}", "blockTime": now - 30} for i in range(20)]
+
+    def rpc(method, params, timeout):
+        if method == "getSignaturesForAddress":
+            return sigs
+        return _parsed_tx(mint, creator, 1000, 880)
+
+    judge_inputs.set_rpc_fn(rpc)
+    d = {**SAMPLE_D, "creator": creator, "age_minutes": 240}
+    judge_inputs.attach(d)
+    assert d.get("dev_sold_pct") is None
+    assert d["dev_sells_note"].startswith("partial window")
+    assert "of observed" in d["dev_sells_note"]
+    assert "since launch" not in (d.get("dev_sells") or "")
+    assert judge_inputs.cycle_lookups() == 1
+    judge_inputs.set_time_fn(None)
+
+
 def test_dev_sells_omitted_without_creator():
     def boom(*a, **k):
         raise AssertionError("RPC must not run without a creator")

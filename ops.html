@@ -75,7 +75,7 @@ tr.pick td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
   <div class="kv" id="desk-kv"></div>
   <h2>Shadow picks &amp; fills</h2>
   <div class="scroll"><table id="shadow-t"><thead><tr><th>Ticker</th><th>Status</th><th>Confirm</th><th class="n">Sniper</th><th class="n">Entry</th><th class="n">Exit</th><th class="n">P&amp;L</th><th>Reason</th></tr></thead><tbody></tbody></table></div>
-  <h2 style="margin-top:16px">Judge scores ≥ 0.60 <small>cutoff 0.6 · conf 0.55 · holders from trade snapshot</small></h2>
+  <h2 style="margin-top:16px">Judge scores ≥ 0.60 <small>cutoff 0.6 · conf 0.55</small></h2>
   <div class="scroll"><table id="judge-t"><thead><tr><th>Time</th><th>Ticker</th><th class="n">Score</th><th class="n">Conf</th><th>Verdict</th><th class="n">Holders</th><th>Source</th><th>Dev sold</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="desk-rug" class="s6" aria-labelledby="drr-h">
@@ -246,7 +246,7 @@ async function load(){
     if(h.fomo_auth_down){ban.hidden=false;ban.textContent=`FOMO AUTH DOWN: ${h.fomo_consecutive_auth_failures||0} consecutive cycles failed; log into fomo.family in the FomoDesk Chrome (CDP 9222)`}
     else{ban.hidden=true;ban.textContent=''}
     rows('judge-t',(S.judge_hi||[]).map(j=>{
-      const src=j.holders_source||(j.holder_count!=null?'trade snapshot':'—');
+      const src=j.holders_source||'unknown';
       const fresh=j.holders_age_s==null?'':(' · '+ago(j.holders_age_s)+' ago');
       const sold=j.dev_sold_pct==null?'no creator':(j.dev_sold_pct+'%');
       return `<tr><td>${tLocal(j.ts_iso)}</td><td>${esc(j.ticker)}</td><td class="n">${j.score.toFixed(2)}</td><td class="n">${j.confidence?.toFixed(2)??'—'}</td><td>${esc(j.verdict)}</td><td class="n">${j.holder_count??'—'}</td><td class="stat">${esc(src)}${esc(fresh)}</td><td>${esc(sold)}</td></tr>`;
@@ -302,7 +302,7 @@ async function load(){
   }
   if(YT){const s=YT.summary||{};const by=s.by_exit_policy||{};const tp=by.tp50||{};const lg=by.legacy||{};const lb=YT.legacy_base||{};const ended=!!(YT.ended||YT.accepting_entries===false);
     document.querySelectorAll('[data-yt-live]').forEach(el=>el.classList.toggle('ended-panel', ended));
-    $('yt-days').textContent=ended?(YT.ended_label||'Stopped taking entries Oct 20 11:59 PM ET')+(s.closed_count!=null?` · final ${s.closed_count} closes`:'') : (YT.until_ts?`${Math.max(0,(YT.until_ts-now)/86400).toFixed(1)} days left · ends ${tLocal(YT.until_ts)} · new ${esc(YT.exit_policy||'tp50')}`:'');
+    $('yt-days').textContent=ended?(YT.ended_label||('Stopped taking entries '+(YT.until_ts?tLocal(YT.until_ts):'')))+(s.closed_count!=null?` · final ${s.closed_count} closes`:'') : (YT.ended_label||(YT.until_ts?`${Math.max(0,(YT.until_ts-now)/86400).toFixed(1)} days left · ends ${tLocal(YT.until_ts)} · new ${esc(YT.exit_policy||'tp50')}`:''));
     kv('yt-kv',[['Final combined',fmtUsd(s.realized_pnl_usd),cls(s.realized_pnl_usd)],['Closed',s.closed_count],['Open',s.open_count],['tp50 P&L',fmtUsd(tp.realized_pnl_usd),cls(tp.realized_pnl_usd)],['tp50 closed',tp.closed_count],['legacy P&L',fmtUsd(lg.realized_pnl_usd),cls(lg.realized_pnl_usd)],['legacy closed',lg.closed_count],['legacy_base shadow',fmtUsd(lb.realized_pnl_usd),cls(lb.realized_pnl_usd)]]);
     rows('yt-open',(YT.open_positions||[]).map(p=>{const r=p.last_price/p.entry_price;return `<tr><td>${esc(p.ticker)}</td><td>${esc(p.chain)}</td><td>${esc(p.exit_policy||'legacy')}</td><td class="n">${ago(now-p.entry_ts)}</td><td class="n ${cls(r-1)}">${x(r)}</td><td class="n">${x(p.peak/p.entry_price)}</td><td class="n ${cls(r-1)}">${fmtUsd((YT.ticket_usd||50)*(r-1))}</td></tr>`}).join(''));
     rows('yt-closed',(YT.closed_trades||[]).slice(0,12).map(c=>`<tr><td>${tLocal(c.exit_ts)}</td><td>${esc(c.ticker)}</td><td>${esc(c.exit_policy||'legacy')}</td><td>${esc(c.exit_reason)}</td><td class="n">${ago(c.exit_ts-c.entry_ts)}</td><td class="n ${cls(c.pnl_usd)}">${fmtUsd(c.pnl_usd)}</td></tr>`).join(''));

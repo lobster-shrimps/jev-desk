@@ -895,3 +895,54 @@ def test_trends_flags_after_three_prior_days(hist):
     assert trends["history_days"] == 3
     by_metric = {f["metric"]: f for f in trends["flags"]}
     assert by_metric["judged_per_day"]["notable"] is True
+
+
+def test_assign_holder_source_fomo_snapshot_gt_unknown(hist, tmp_path, monkeypatch):
+    import gt_info_cache
+    monkeypatch.setenv("GT_INFO_CACHE_DB", str(tmp_path / "gt_info_cache.db"))
+    gt_info_cache.reset()
+    fomo = {"tid": "A:1399811149", "addr": "A", "chain": "solana",
+            "holder_count": 100, "stage": "free"}
+    hist.assign_holder_source(fomo)
+    assert fomo["holder_source"] == "fomo"
+
+    snap = {"tid": "A:1399811149", "addr": "A", "chain": "solana",
+            "holder_count": 744, "_fomo_holders": 744, "stage": "judged"}
+    hist.assign_holder_source(snap)
+    assert snap["holder_source"] == "trade_snapshot"
+
+    gt_info_cache.put("solana", "B", {"holders": {"count": 180}})
+    gt = {"tid": "B:1399811149", "addr": "B", "chain": "solana",
+          "holder_count": 180, "_fomo_holders": 200, "stage": "judged"}
+    hist.assign_holder_source(gt)
+    assert gt["holder_source"] == "gt_info"
+
+    unknown = {"tid": "C:1399811149", "addr": "C", "chain": "solana",
+               "holder_count": 50, "stage": "judged"}
+    hist.assign_holder_source(unknown)
+    assert unknown.get("holder_source") not in hist.HOLDER_SOURCES
+    gt_info_cache.reset()
+
+
+def test_cycle_record_persists_holder_source(hist):
+    hist.on_cycle(
+        {"seen": 1, "benched": 0, "judged": 1, "requeued": 0,
+         "tokens": [{
+             "tid": "H:1399811149", "ticker": "HORN", "net": 1399811149,
+             "chain": "solana", "stage": "judged", "holder_count": 744,
+             "_fomo_holders": 744, "judge_score": 0.7, "judge_verdict": "pass",
+         }]},
+        now=ts(2026, 10, 21, 12), source="live",
+    )
+    rows = hist._tokens_since(0)
+    horn = next(r for r in rows if r["ticker"] == "HORN")
+    assert horn["holder_source"] == "trade_snapshot"
+    empty = {"tid": "X:1399811149", "ticker": "X", "net": 1399811149,
+             "chain": "solana", "stage": "judged", "holder_count": 10,
+             "judge_score": 0.65, "judge_verdict": "pass"}
+    hist.on_cycle(
+        {"seen": 1, "benched": 0, "judged": 1, "requeued": 0, "tokens": [empty]},
+        now=ts(2026, 10, 21, 13), source="live",
+    )
+    x = next(r for r in hist._tokens_since(0) if r["ticker"] == "X")
+    assert not x.get("holder_source")
