@@ -277,6 +277,78 @@ def test_creator_from_helius_computes_dev_sold_pct():
     young_trail_helius.reset()
 
 
+def _sold_rpc(mint, creator):
+    txs = {
+        "old": _parsed_tx(mint, creator, 1000, 1000),
+        "new": _parsed_tx(mint, creator, 1000, 880),
+    }
+
+    def rpc(method, params, timeout):
+        if method == "getSignaturesForAddress":
+            assert params[0] == creator
+            return [{"signature": "old"}, {"signature": "new"}]
+        return txs[params[0]]
+
+    return rpc
+
+
+def test_creator_from_young_trail_rugrisk_dev_wallet():
+    import young_trail_helius
+    import young_trail_rugrisk
+    young_trail_helius.reset()
+    young_trail_rugrisk.reset()
+    creator = "DevFromYTR"
+    db = young_trail_rugrisk._connect()
+    db.execute(
+        """INSERT INTO young_trail_rugrisk
+           (tid, ticker, chain, entry_ts, status, dev_wallet)
+           VALUES (?, 'T0', 'solana', 1.0, 'ok', ?)""",
+        (SAMPLE_D["tid"], creator),
+    )
+    db.commit()
+    judge_inputs.set_rpc_fn(_sold_rpc(SAMPLE_D["addr"], creator))
+    d = {k: v for k, v in SAMPLE_D.items() if k != "creator"}
+    judge_inputs.attach(d)
+    assert d["creator"] == creator
+    assert d["dev_sold_pct"] == pytest.approx(12.0)
+    assert young_trail_helius.lookup_creator(SAMPLE_D["tid"]) == creator
+    row = young_trail_helius._connect().execute(
+        "SELECT source FROM young_trail_helius_creators WHERE tid = ?",
+        (SAMPLE_D["tid"],),
+    ).fetchone()
+    assert row["source"] == "rugrisk"
+    young_trail_helius.reset()
+    young_trail_rugrisk.reset()
+
+
+def test_creator_from_desk_rugrisk_creators_array():
+    import json
+    import desk_rugrisk
+    import young_trail_helius
+    import young_trail_rugrisk
+    young_trail_helius.reset()
+    young_trail_rugrisk.reset()
+    desk_rugrisk.reset()
+    creator = "DevFromDesk"
+    db = desk_rugrisk._connect()
+    db.execute(
+        """INSERT INTO desk_rugrisk
+           (tid, ticker, ts, stage, status, features_json)
+           VALUES (?, 'T0', 1.0, 'judged', 'ok', ?)""",
+        (SAMPLE_D["tid"], json.dumps({"creators": [creator, "OtherWallet"]})),
+    )
+    db.commit()
+    judge_inputs.set_rpc_fn(_sold_rpc(SAMPLE_D["addr"], creator))
+    d = {k: v for k, v in SAMPLE_D.items() if k != "creator"}
+    judge_inputs.attach(d)
+    assert d["creator"] == creator
+    assert d["dev_sold_pct"] == pytest.approx(12.0)
+    assert young_trail_helius.lookup_creator(SAMPLE_D["tid"]) == creator
+    young_trail_helius.reset()
+    desk_rugrisk.reset()
+    young_trail_rugrisk.reset()
+
+
 def test_rpc_failure_omitted_and_logged_via_safe_err(monkeypatch, caplog):
     secret = "https://secret-rpc.example/?api-key=LEAKME"
     monkeypatch.setenv("SOLANA_RPC_URL", secret)

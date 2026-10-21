@@ -2311,6 +2311,25 @@ def _buyers_from_tx(tx: dict, mint: str) -> list[dict]:
         return []
 
 
+def lookup_dev_wallet(tid: str) -> str | None:
+    """Read-only stored creator for this tid. Cycle-thread only. No RPC."""
+    if not tid:
+        return None
+    try:
+        row = _connect().execute(
+            """SELECT dev_wallet FROM young_trail_rugrisk
+               WHERE tid = ? AND dev_wallet IS NOT NULL
+                 AND TRIM(dev_wallet) != ''""",
+            (tid,),
+        ).fetchone()
+        if row and row["dev_wallet"]:
+            wallet = str(row["dev_wallet"]).strip()
+            return wallet or None
+    except Exception as e:
+        log.warning("young_trail_rugrisk lookup_dev_wallet: %s", safe_err(e))
+    return None
+
+
 def _lookup_creator(tid: str) -> str | None:
     if not tid:
         return None

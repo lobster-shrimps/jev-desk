@@ -307,6 +307,37 @@ def _dev_sells_from_parsed(txs: list, mint: str, creator: str) -> str | None:
     return f"dev sold {_fmt_sold_pct(pct)}% of initial since launch"
 
 
+def _remember_rugrisk_creator(tid: str | None, wallet: str) -> None:
+    if not tid or not wallet:
+        return
+    try:
+        import young_trail_helius
+        young_trail_helius.note_creator(tid, wallet, source="rugrisk")
+    except Exception as e:
+        log.warning("note rugrisk creator: %s", safe_err(e))
+
+
+def _creator_from_rugrisk(tid: str | None) -> str | None:
+    """Read-only DB fallback. Cycle thread only. No RPC."""
+    if not tid:
+        return None
+    try:
+        import young_trail_rugrisk
+        wallet = young_trail_rugrisk.lookup_dev_wallet(tid)
+        if wallet:
+            return wallet
+    except Exception as e:
+        log.warning("rugrisk creator lookup: %s", safe_err(e))
+    try:
+        import desk_rugrisk
+        wallet = desk_rugrisk.lookup_creator(tid)
+        if wallet:
+            return wallet
+    except Exception as e:
+        log.warning("desk_rugrisk creator lookup: %s", safe_err(e))
+    return None
+
+
 def fill_creator(d: dict) -> dict:
     """Copy an already-fetched creator onto d. No extra RPC. Fail open."""
     if not isinstance(d, dict):
@@ -315,17 +346,24 @@ def fill_creator(d: dict) -> dict:
         d.get("creator") or d.get("creatorAddress") or d.get("creator_address")
         or d.get("creatorWallet") or d.get("deployer") or d.get("deployerAddress")
     )
+    tid = d.get("tid")
+    from_rugrisk = False
     if not creator:
         try:
             import young_trail_helius
-            creator = young_trail_helius.lookup_creator(d.get("tid"))
+            creator = young_trail_helius.lookup_creator(tid)
         except Exception as e:
             log.warning("creator lookup: %s", safe_err(e))
             creator = None
+    if not creator:
+        creator = _creator_from_rugrisk(tid)
+        from_rugrisk = bool(creator)
     if creator:
         wallet = str(creator).strip()
         if wallet:
             d["creator"] = wallet
+            if from_rugrisk:
+                _remember_rugrisk_creator(tid, wallet)
     return d
 
 
