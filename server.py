@@ -26,6 +26,7 @@ from stalling when outcomes.db is busy. Optional split if you want a hard wall:
   GET  /ops/young_trail_fast paper 60s-mark ledger vs per-cycle young_trail
   GET  /ops/young_trail_helius paper Helius rug-signal ledger vs fast/cycle
   GET  /ops/young_trail_rugrisk paper rug-risk skip-rule counterfactuals (no gating)
+  GET  /ops/desk_rugrisk paper judged-token rug-risk log + shadow-guard counters (no gating)
   GET  /ops/young_trail_signals paper RugCheck/boosts/Birdeye skip-rule counterfactuals (no gating)
   GET  /ops/research/query?sql=  read-only SELECT on research.db (limit 500)
   GET  /ops/research/report?kind= rugs|runners|features
@@ -265,6 +266,28 @@ def ops_young_trail_rugrisk():
                 "would_skip_snipers": 0, "would_skip_bundled": 0,
                 "would_skip_dev_rugs": 0,
             },
+            "counterfactuals": [],
+            "entries": [],
+        })
+
+
+@app.get("/ops/desk_rugrisk")
+def ops_desk_rugrisk():
+    """Paper judged-token rug-risk log + shadow-guard counters. No gating."""
+    try:
+        import desk_rugrisk
+        return JSONResponse(desk_rugrisk.ops_payload())
+    except Exception as e:
+        log.warning("ops desk_rugrisk: %s", safe_err(e))
+        return JSONResponse({
+            "paper": True,
+            "simulated": True,
+            "live_orders": False,
+            "gates_entries": False,
+            "gates_picks": False,
+            "error": "desk_rugrisk unavailable",
+            "budget": {"day_used": 0, "day_cap": 600, "day_left": 600},
+            "counts": {"n": 0, "pending": 0, "ok": 0, "picks": 0, "judged": 0},
             "counterfactuals": [],
             "entries": [],
         })

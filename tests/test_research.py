@@ -666,12 +666,14 @@ def test_sqlite_connections_are_per_thread(rs):
     import young_trail_helius
     import young_trail_rugrisk
     import young_trail_signals
+    import desk_rugrisk
 
     for name in (
         "cycle_history.py", "research.py",
         "young_trail_fast.py", "young_trail_helius.py",
         "young_trail_rugrisk.py",
         "young_trail_signals.py",
+        "desk_rugrisk.py",
     ):
         src = (ROOT / name).read_text()
         assert "check_same_thread=False" not in src, name
@@ -692,6 +694,7 @@ def test_sqlite_connections_are_per_thread(rs):
         ("young_trail_helius", young_trail_helius),
         ("young_trail_rugrisk", young_trail_rugrisk),
         ("young_trail_signals", young_trail_signals),
+        ("desk_rugrisk", desk_rugrisk),
     ):
         t = threading.Thread(target=worker, args=(mod, key))
         t.start()
