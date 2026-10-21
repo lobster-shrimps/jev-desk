@@ -312,6 +312,16 @@ def _apply_judge_verdicts(stats, survivors, order, pick_answers, pick_error):
             tid=tid, ticker=ticker, verdict=verdict,
             score=score, confidence=confidence, reason=reason,
         )
+        try:
+            import desk_rugrisk
+            payload = dict(d) if isinstance(d, dict) else {}
+            if not payload.get("tid"):
+                payload["tid"] = tid
+            if not payload.get("ticker") and ticker:
+                payload["ticker"] = ticker
+            desk_rugrisk.enqueue(payload, verdict, score, desk_rugrisk.current_time(), ans=ans)
+        except Exception as e:
+            log.warning("desk_rugrisk enqueue: %s", safe_err(e))
 
 
 def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE, 

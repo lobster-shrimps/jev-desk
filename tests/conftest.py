@@ -33,8 +33,11 @@ def isolate_outcomes(tmp_path, monkeypatch):
     import gt_api
     import outcomes
     import backtest_signals
+    import desk_rugrisk
     gt_api.reset()
     outcomes.reset()
+    desk_rugrisk.reset()
+    desk_rugrisk.set_time_fn(None)
     outcomes.set_time_fn(None)
     outcomes.set_sleep_fn(lambda _d: None)
 
@@ -49,6 +52,8 @@ def isolate_outcomes(tmp_path, monkeypatch):
     outcomes.set_get_fn(None)
     outcomes.set_sleep_fn(None)
     outcomes.set_time_fn(None)
+    desk_rugrisk.reset()
+    desk_rugrisk.set_time_fn(None)
     backtest_signals.reset()
     backtest_signals.set_time_fn(None)
 
