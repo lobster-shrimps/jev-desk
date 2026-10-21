@@ -108,6 +108,169 @@ def pnl_usd(exit_price: float, entry_price: float, ticket: float = TICKET_USD) -
     return float(ticket) * (float(exit_price) / float(entry_price) - 1.0)
 
 
+def _row_map(row) -> dict:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    return {k: row[k] for k in row.keys()}
+
+
+def _parent_meta(db, tid: str) -> dict:
+    try:
+        row = db.execute(
+            """SELECT entry_ts, entry_price, exit_reason, exit_price, peak
+               FROM young_trail WHERE tid = ?""",
+            (tid,),
+        ).fetchone()
+    except Exception:
+        return {}
+    return _row_map(row)
+
+
+def _accepted_marks(db, tid: str, entry_price: float) -> list[tuple[float, float]]:
+    """Replay stored marks, dropping spikes. SELECT only."""
+    try:
+        rows = db.execute(
+            "SELECT ts, price FROM young_trail_marks WHERE tid = ? ORDER BY ts",
+            (tid,),
+        ).fetchall()
+    except Exception:
+        return []
+    import price_guard
+    out: list[tuple[float, float]] = []
+    prev = _f(entry_price)
+    for raw in rows:
+        ts = _f(raw["ts"])
+        px = _f(raw["price"])
+        if ts is None or px is None or px < 0:
+            continue
+        if price_guard.is_spike(px, entry=entry_price, prev=prev):
+            continue
+        out.append((float(ts), float(px)))
+        prev = float(px)
+    return out
+
+
+def _replay_variant(rule: dict, entry_price: float, entry_ts: float,
+                    marks: list[tuple[float, float]]) -> dict:
+    """In-memory walk of accepted marks. No DB writes."""
+    peak = float(entry_price)
+    last = float(entry_price)
+    rem = 1.0
+    partial = 0.0
+    be = False
+    last_ts = float(entry_ts)
+    decision = None
+    state = {
+        "peak": peak, "remaining_frac": rem, "partial_pnl": partial,
+        "be_armed": be, "last_price": last,
+    }
+    for ts, px in marks:
+        last_ts = float(ts)
+        decision, state = decide_variant_tick(
+            rule,
+            entry_price=float(entry_price),
+            peak=peak,
+            price=px,
+            entry_ts=float(entry_ts),
+            now=float(ts),
+            last_price=last,
+            remaining_frac=rem,
+            partial_pnl=partial,
+            be_armed=be,
+        )
+        peak = float(state.get("peak") or peak)
+        last = _f(state.get("last_price"), last) or last
+        rem = float(state.get("remaining_frac") or rem)
+        partial = float(state.get("partial_pnl") or partial)
+        be = bool(state.get("be_armed"))
+        if decision:
+            break
+    if not decision:
+        window = float(rule.get("window_sec") or 6 * 3600)
+        now = max(last_ts, float(entry_ts) + window)
+        decision, state = decide_variant_tick(
+            rule,
+            entry_price=float(entry_price),
+            peak=peak,
+            price=last,
+            entry_ts=float(entry_ts),
+            now=now,
+            last_price=last,
+            remaining_frac=rem,
+            partial_pnl=partial,
+            be_armed=be,
+        )
+        peak = float(state.get("peak") or peak)
+        last_ts = now
+    if not decision:
+        return {
+            "exit_ts": None, "exit_price": None, "exit_reason": None,
+            "pnl_usd": None, "peak": peak, "adjusted": True,
+        }
+    reason, exit_px = decision
+    rest = float(state.get("remaining_frac") or 1.0)
+    partial = float(state.get("partial_pnl") or 0.0)
+    pnl = partial + pnl_usd(exit_px, entry_price, TICKET_USD * rest)
+    return {
+        "exit_ts": float(last_ts),
+        "exit_price": float(exit_px),
+        "exit_reason": reason,
+        "pnl_usd": pnl,
+        "peak": float(state.get("peak") or peak),
+        "adjusted": True,
+    }
+
+
+def _needs_sanitize(exit_price, entry_price, parent_exit_reason) -> bool:
+    if (parent_exit_reason or "") == "bad_mark":
+        return True
+    px = _f(exit_price)
+    ep = _f(entry_price)
+    if px is None or ep is None or ep <= 0:
+        return False
+    try:
+        import price_guard
+        return bool(price_guard.is_spike(px, entry=ep))
+    except Exception:
+        return False
+
+
+def _sanitized(row, entry_price, parent_exit_reason) -> dict:
+    """Display-only. Replay marks when the parent is bad_mark or the exit spiked.
+
+    Never writes. Returns a dict with an `adjusted` flag.
+    """
+    d = _row_map(row)
+    d.setdefault("adjusted", False)
+    ep = _f(entry_price)
+    if ep is None or ep <= 0:
+        return d
+    if not _needs_sanitize(d.get("exit_price"), ep, parent_exit_reason):
+        return d
+    tid = d.get("tid")
+    vid = d.get("variant")
+    rule = VARIANT_BY_ID.get(vid) if vid else None
+    if not tid or not rule:
+        return d
+    try:
+        db = _db()
+        parent = _parent_meta(db, tid)
+        entry_ts = _f(parent.get("entry_ts"), d.get("entry_ts"))
+        if entry_ts is None:
+            return d
+        marks = _accepted_marks(db, tid, ep)
+        replayed = _replay_variant(rule, ep, float(entry_ts), marks)
+        out = dict(d)
+        out.update(replayed)
+        out["adjusted"] = True
+        return out
+    except Exception as e:
+        log.warning("young_trail variants sanitize: %s", safe_err(e))
+        return d
+
+
 def decide_variant_tick(
     rule: dict,
     *,
@@ -375,19 +538,33 @@ def get_variant(tid: str, variant: str) -> dict | None:
 
 
 def ranking() -> list[dict]:
-    """Closed-only. Rank by realized P&L, then win rate, then n."""
+    """Closed-only. Rank by realized P&L, then win rate, then n.
+
+    Display-side: bad_mark / spike exits are recomputed from accepted marks.
+    """
     try:
         db = _db()
-        init_schema(db)
         out = []
         for rule in VARIANTS:
             vid = rule["id"]
             rows = db.execute(
-                """SELECT pnl_usd FROM young_trail_variants
-                   WHERE variant = ? AND exit_ts IS NOT NULL""",
+                """SELECT v.tid, v.variant, v.exit_ts, v.exit_price, v.exit_reason,
+                          v.pnl_usd, t.entry_price, t.exit_reason AS parent_exit_reason
+                   FROM young_trail_variants v
+                   LEFT JOIN young_trail t ON t.tid = v.tid
+                   WHERE v.variant = ? AND v.exit_ts IS NOT NULL""",
                 (vid,),
             ).fetchall()
-            pnls = [_f(r["pnl_usd"], 0.0) or 0.0 for r in rows]
+            pnls = []
+            adjusted = 0
+            for raw in rows:
+                d = _row_map(raw)
+                clean = _sanitized(
+                    d, d.get("entry_price"), d.get("parent_exit_reason"),
+                )
+                if clean.get("adjusted"):
+                    adjusted += 1
+                pnls.append(_f(clean.get("pnl_usd"), 0.0) or 0.0)
             n = len(pnls)
             wins = sum(1 for p in pnls if p > 0)
             open_n = db.execute(
@@ -404,6 +581,7 @@ def ranking() -> list[dict]:
                 "winning_trades": wins,
                 "win_rate": (wins / n) if n else 0.0,
                 "realized_pnl_usd": realized,
+                "adjusted_rows": adjusted,
             })
         out.sort(key=lambda r: (-r["realized_pnl_usd"], -r["win_rate"], -r["n"], r["variant"]))
         return out
@@ -415,28 +593,49 @@ def ranking() -> list[dict]:
 def entry_stats(limit: int | None = 50) -> list[dict]:
     try:
         db = _db()
-        init_schema(db)
         sql = """SELECT s.tid, s.peak, s.peak_ts, s.peak_multiple, s.time_to_peak_sec,
-                        t.entry_ts, t.entry_price, t.ticker, t.chain
+                        t.entry_ts, t.entry_price, t.ticker, t.chain,
+                        t.exit_reason AS parent_exit_reason
                  FROM young_trail_entry_stats s
                  LEFT JOIN young_trail t ON t.tid = s.tid
                  ORDER BY s.peak_multiple DESC"""
-        args: tuple = ()
+        rows = db.execute(sql).fetchall()
+        out = []
+        for r in rows:
+            d = _row_map(r)
+            ep = _f(d.get("entry_price"))
+            peak = _f(d.get("peak"))
+            adjusted = False
+            if ep and _needs_sanitize(peak, ep, d.get("parent_exit_reason")):
+                marks = _accepted_marks(db, d["tid"], ep)
+                if marks:
+                    peak_px = max(px for _ts, px in marks)
+                    peak_ts = max(ts for ts, px in marks if px == peak_px)
+                    d["peak"] = peak_px
+                    d["peak_ts"] = peak_ts
+                    d["peak_multiple"] = peak_px / ep
+                    d["time_to_peak_sec"] = max(
+                        0.0, float(peak_ts) - float(d.get("entry_ts") or peak_ts),
+                    )
+                    adjusted = True
+            out.append({
+                "tid": d["tid"],
+                "ticker": d.get("ticker"),
+                "chain": d.get("chain"),
+                "entry_ts": d.get("entry_ts"),
+                "entry_price": d.get("entry_price"),
+                "peak": d.get("peak"),
+                "peak_ts": d.get("peak_ts"),
+                "peak_multiple": d.get("peak_multiple"),
+                "time_to_peak_sec": d.get("time_to_peak_sec"),
+                "adjusted": adjusted,
+            })
+        out.sort(
+            key=lambda x: (-(_f(x.get("peak_multiple"), 0.0) or 0.0), x.get("tid") or ""),
+        )
         if limit is not None:
-            sql += " LIMIT ?"
-            args = (int(limit),)
-        rows = db.execute(sql, args).fetchall()
-        return [{
-            "tid": r["tid"],
-            "ticker": r["ticker"],
-            "chain": r["chain"],
-            "entry_ts": r["entry_ts"],
-            "entry_price": r["entry_price"],
-            "peak": r["peak"],
-            "peak_ts": r["peak_ts"],
-            "peak_multiple": r["peak_multiple"],
-            "time_to_peak_sec": r["time_to_peak_sec"],
-        } for r in rows]
+            out = out[: max(0, int(limit))]
+        return out
     except Exception as e:
         log.warning("young_trail variants entry_stats: %s", safe_err(e))
         return []
@@ -445,21 +644,31 @@ def entry_stats(limit: int | None = 50) -> list[dict]:
 def closed_rows(limit: int | None = 100) -> list[dict]:
     try:
         db = _db()
-        init_schema(db)
-        sql = """SELECT tid, variant, exit_ts, exit_price, exit_reason, pnl_usd
-                 FROM young_trail_variants
-                 WHERE exit_ts IS NOT NULL
-                 ORDER BY exit_ts DESC"""
-        args: tuple = ()
+        sql = """SELECT v.tid, v.variant, v.exit_ts, v.exit_price, v.exit_reason,
+                        v.pnl_usd, t.entry_price, t.exit_reason AS parent_exit_reason
+                 FROM young_trail_variants v
+                 LEFT JOIN young_trail t ON t.tid = v.tid
+                 WHERE v.exit_ts IS NOT NULL
+                 ORDER BY v.exit_ts DESC"""
+        rows = db.execute(sql).fetchall()
+        out = []
+        for raw in rows:
+            d = _row_map(raw)
+            clean = _sanitized(
+                d, d.get("entry_price"), d.get("parent_exit_reason"),
+            )
+            out.append({
+                "tid": clean.get("tid"),
+                "variant": clean.get("variant"),
+                "exit_ts": clean.get("exit_ts"),
+                "exit_price": clean.get("exit_price"),
+                "exit_reason": clean.get("exit_reason"),
+                "pnl_usd": clean.get("pnl_usd"),
+                "adjusted": bool(clean.get("adjusted")),
+            })
         if limit is not None:
-            sql += " LIMIT ?"
-            args = (int(limit),)
-        rows = db.execute(sql, args).fetchall()
-        return [{
-            "tid": r["tid"], "variant": r["variant"], "exit_ts": r["exit_ts"],
-            "exit_price": r["exit_price"], "exit_reason": r["exit_reason"],
-            "pnl_usd": r["pnl_usd"],
-        } for r in rows]
+            out = out[: max(0, int(limit))]
+        return out
     except Exception as e:
         log.warning("young_trail variants closed: %s", safe_err(e))
         return []
@@ -482,6 +691,9 @@ def ops_payload() -> dict:
     try:
         rank = ranking()
         top = [r for r in rank if r["n"] > 0][:3]
+        closed = closed_rows(limit=100)
+        stats = entry_stats(limit=50)
+        adjusted = sum(int(r.get("adjusted_rows") or 0) for r in rank)
         return {
             "paper": True,
             "simulated": True,
@@ -491,8 +703,9 @@ def ops_payload() -> dict:
             "variant_defs": list(VARIANTS),
             "ranking": rank,
             "top3": top,
-            "closed_trades": closed_rows(limit=100),
-            "entry_stats": entry_stats(limit=50),
+            "closed_trades": closed,
+            "entry_stats": stats,
+            "adjusted_rows": adjusted,
         }
     except Exception as e:
         log.warning("young_trail variants ops: %s", safe_err(e))
@@ -506,4 +719,5 @@ def ops_payload() -> dict:
             "top3": [],
             "closed_trades": [],
             "entry_stats": [],
+            "adjusted_rows": 0,
         }

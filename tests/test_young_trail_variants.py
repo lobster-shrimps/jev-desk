@@ -219,7 +219,8 @@ def test_live_decide_exit_unchanged(yt):
 
 
 def test_protected_modules_untouched():
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py"):
+    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py",
+                 "collect.py", "judge.py"):
         r = subprocess.run(
             ["git", "diff", "--", name],
             cwd=str(ROOT), capture_output=True, text=True, check=True,
@@ -229,3 +230,125 @@ def test_protected_modules_untouched():
     for banned in ("from filter", "from pick", "from questions", "from thresholds",
                    "geckoterminal", "send_to_seats", "book.take"):
         assert banned not in src
+
+
+CATNIP_TID = "61q3T4MD8UtFxyRgV1CYzgjJfpJNAb11kBgttW7incM:1399811149"
+CATNIP_ENTRY = 9.24e-07
+CATNIP_GOOD = 1.184e-06
+CATNIP_BAD = 0.009226
+CATNIP_PNL = 50.0 * (CATNIP_GOOD / CATNIP_ENTRY - 1.0)
+
+
+def _seed_catnip(yt, *, also_normal=True):
+    """Historical Catnip: good mark then a 10,000× print. Parent is bad_mark."""
+    import young_trail_variants as ytv
+    db = yt._connect()
+    ytv.init_schema(db)
+    entry_ts = T0
+    good_ts = T0 + 60
+    bad_ts = T0 + 5 * 3600 + 10 * 60
+    huge = ytv.pnl_usd(CATNIP_BAD, CATNIP_ENTRY)
+    db.execute(
+        """INSERT INTO young_trail (
+             tid, ticker, chain, entry_ts, entry_price, peak, last_price,
+             last_mark_ts, exit_ts, exit_price, exit_reason, pnl_usd
+           ) VALUES (?, 'Catnip', 'solana', ?, ?, ?, ?, ?, ?, ?, 'bad_mark', ?)""",
+        (CATNIP_TID, entry_ts, CATNIP_ENTRY, CATNIP_BAD, CATNIP_BAD,
+         bad_ts, bad_ts, CATNIP_BAD, huge),
+    )
+    for ts, px in ((entry_ts, CATNIP_ENTRY), (good_ts, CATNIP_GOOD), (bad_ts, CATNIP_BAD)):
+        db.execute(
+            "INSERT INTO young_trail_marks (tid, ts, price) VALUES (?, ?, ?)",
+            (CATNIP_TID, ts, px),
+        )
+    db.execute(
+        """INSERT INTO young_trail_entry_stats
+           (tid, peak, peak_ts, peak_multiple, time_to_peak_sec)
+           VALUES (?, ?, ?, ?, ?)""",
+        (CATNIP_TID, CATNIP_BAD, bad_ts, CATNIP_BAD / CATNIP_ENTRY, bad_ts - entry_ts),
+    )
+    for rule in ytv.VARIANTS:
+        db.execute(
+            """INSERT INTO young_trail_variants
+               (tid, variant, exit_ts, exit_price, exit_reason, pnl_usd, peak, last_price)
+               VALUES (?, ?, ?, ?, 'tp', ?, ?, ?)""",
+            (CATNIP_TID, rule["id"], bad_ts, CATNIP_BAD, huge, CATNIP_BAD, CATNIP_BAD),
+        )
+    if also_normal:
+        yt.consider_entries([_tok()], now=T0)
+        yt.mark_open({TID: 0.70}, now=T0 + 60)
+    db.commit()
+    return huge
+
+
+def test_catnip_bad_mark_sanitized_to_time_exit(yt):
+    """Catnip fixture -> every variant +$14.08 time exit at 1.184e-06."""
+    import young_trail_variants as ytv
+    _seed_catnip(yt, also_normal=False)
+    assert CATNIP_PNL == pytest.approx(14.08, abs=0.02)
+    for rule in ytv.VARIANTS:
+        raw = ytv.get_variant(CATNIP_TID, rule["id"])
+        clean = ytv._sanitized(raw, CATNIP_ENTRY, "bad_mark")
+        assert clean["adjusted"] is True
+        assert clean["exit_reason"] == "time"
+        assert clean["exit_price"] == pytest.approx(CATNIP_GOOD)
+        assert clean["pnl_usd"] == pytest.approx(CATNIP_PNL, abs=0.02)
+    closed = {r["variant"]: r for r in ytv.closed_rows(limit=None)
+              if r["tid"] == CATNIP_TID}
+    assert len(closed) == len(ytv.VARIANTS)
+    assert all(r["adjusted"] for r in closed.values())
+    assert all(r["exit_reason"] == "time" for r in closed.values())
+    rank = {r["variant"]: r for r in ytv.ranking()}
+    assert rank["tp_50"]["realized_pnl_usd"] == pytest.approx(CATNIP_PNL, abs=0.02)
+    assert rank["tp_50"]["n"] == 1
+    stats = {r["tid"]: r for r in ytv.entry_stats(limit=None)}
+    assert stats[CATNIP_TID]["adjusted"] is True
+    assert stats[CATNIP_TID]["peak"] == pytest.approx(CATNIP_GOOD)
+    assert stats[CATNIP_TID]["peak_multiple"] == pytest.approx(CATNIP_GOOD / CATNIP_ENTRY)
+    payload = ytv.ops_payload()
+    assert payload["adjusted_rows"] >= 1
+
+
+def test_sanitizer_leaves_normal_rows_unchanged(yt):
+    import young_trail_variants as ytv
+    _seed_catnip(yt, also_normal=True)
+    live = yt.closed_rows()
+    normal = [r for r in live if r["tid"] == TID]
+    assert normal and normal[0]["exit_reason"] == "sl"
+    assert normal[0]["pnl_usd"] == pytest.approx(-15.0)
+    closed = {r["variant"]: r for r in ytv.closed_rows(limit=None) if r["tid"] == TID}
+    assert closed["baseline"]["adjusted"] is False
+    assert closed["baseline"]["exit_reason"] == "sl"
+    assert closed["baseline"]["pnl_usd"] == pytest.approx(-15.0)
+    rank = {r["variant"]: r for r in ytv.ranking()}
+    # Catnip +14.08 beats the -15 SL, so baseline is mixed: +14.08 + -15.
+    assert rank["baseline"]["n"] == 2
+    assert rank["baseline"]["realized_pnl_usd"] == pytest.approx(CATNIP_PNL - 15.0, abs=0.02)
+    assert rank["tp_50"]["realized_pnl_usd"] == pytest.approx(CATNIP_PNL - 15.0, abs=0.02)
+    # Higher P&L ranks first; both closed variants share the same corrected total
+    # but n/win_rate keep a stable order.
+    ordered = ytv.ranking()
+    assert ordered[0]["realized_pnl_usd"] >= ordered[-1]["realized_pnl_usd"]
+
+
+def test_sanitizer_is_display_only_no_update(yt):
+    import young_trail_variants as ytv
+    _seed_catnip(yt, also_normal=False)
+    db = yt._connect()
+    writes = []
+
+    def tracer(sql):
+        head = str(sql).lstrip().split(None, 1)[0].upper()
+        if head in ("UPDATE", "INSERT", "DELETE", "REPLACE"):
+            writes.append(sql)
+
+    db.set_trace_callback(tracer)
+    ytv.ranking()
+    ytv.closed_rows(limit=None)
+    ytv.entry_stats(limit=None)
+    ytv.ops_payload()
+    db.set_trace_callback(None)
+    assert writes == []
+    raw = ytv.get_variant(CATNIP_TID, "tp_50")
+    assert raw["exit_price"] == pytest.approx(CATNIP_BAD)
+    assert raw["pnl_usd"] == pytest.approx(ytv.pnl_usd(CATNIP_BAD, CATNIP_ENTRY))
