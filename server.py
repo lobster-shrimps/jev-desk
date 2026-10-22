@@ -28,6 +28,7 @@ from stalling when outcomes.db is busy. Optional split if you want a hard wall:
   GET  /ops/young_trail_rugrisk paper rug-risk skip-rule counterfactuals (no gating)
   GET  /ops/desk_rugrisk paper judged-token rug-risk log + shadow-guard counters (no gating)
   GET  /ops/pick_confirm paper two-cycle pick confirm (no gating)
+  GET  /ops/rug_veto paper rug-veto would_skip log (no gating)
   GET  /ops/young_trail_signals paper RugCheck/boosts/Birdeye skip-rule counterfactuals (no gating)
   GET  /ops/research/query?sql=  read-only SELECT on research.db (limit 500)
   GET  /ops/research/report?kind= rugs|runners|features
@@ -290,6 +291,25 @@ def ops_desk_rugrisk():
             "budget": {"day_used": 0, "day_cap": 600, "day_left": 600},
             "counts": {"n": 0, "pending": 0, "ok": 0, "picks": 0, "judged": 0},
             "counterfactuals": [],
+            "entries": [],
+        })
+
+
+@app.get("/ops/rug_veto")
+def ops_rug_veto():
+    """Paper rug-veto would_skip log. Does not gate picks."""
+    try:
+        import rug_veto_shadow
+        return JSONResponse(rug_veto_shadow.ops_payload())
+    except Exception as e:
+        log.warning("ops rug_veto: %s", safe_err(e))
+        return JSONResponse({
+            "paper": True,
+            "simulated": True,
+            "live_orders": False,
+            "gates_picks": False,
+            "error": "rug_veto unavailable",
+            "counts": {"n": 0, "would_skip": 0, "would_keep": 0},
             "entries": [],
         })
 
