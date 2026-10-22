@@ -326,7 +326,7 @@ def ops_pick_confirm():
             "paper": True,
             "simulated": True,
             "live_orders": False,
-            "gates_picks": False,
+            "gates_picks": True,
             "error": "pick_confirm unavailable",
             "counts": {"n": 0, "pending_confirm": 0, "confirmed": 0, "unconfirmed": 0},
             "entries": [],

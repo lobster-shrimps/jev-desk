@@ -95,11 +95,11 @@ tr.pick td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
   <div class="scroll"><table id="rv-t"><thead><tr><th>Ticker</th><th class="n">Score</th><th class="n">Sniper</th><th>Bundled</th><th class="n">Followers</th><th>Skip</th><th>Reasons</th><th>Pick</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="pick-confirm" class="s6" aria-labelledby="pc-h">
-  <h2 id="pc-h">Two-cycle confirm <small>shadow, does not gate picks</small></h2>
+  <h2 id="pc-h">Two-cycle confirm <small>required for shadow fills</small></h2>
   <div class="err" id="pc-err" hidden></div>
   <div class="kv" id="pc-kv"></div>
-  <div class="note" id="pc-note">shadow, does not gate picks</div>
-  <div class="scroll"><table id="pc-t"><thead><tr><th>Ticker</th><th class="n">First</th><th>Next</th><th class="n">Confirm $</th><th class="n">Fwd P&amp;L</th></tr></thead><tbody></tbody></table></div>
+  <div class="note" id="pc-note">required for shadow fills · no live orders</div>
+  <div class="scroll"><table id="pc-t"><thead><tr><th>Ticker</th><th class="n">First</th><th>Outcome</th><th class="n">Confirm $</th><th class="n">Fwd P&amp;L</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="yt" class="s6" aria-labelledby="yt-h">
   <h2 id="yt-h">young_trail paper test <small id="yt-days"></small></h2>
@@ -309,10 +309,10 @@ async function load(){
   }
   if(!softErr('pc-err', PC, 'pick_confirm unavailable')){
     const c=PC.counts||{}, rp=PC.real_picks||{};
-    kv('pc-kv',[['Pending',c.pending_confirm||0],['Confirmed',c.confirmed||0,'ok'],['Unconfirmed',c.unconfirmed||0],['Confirmed P&L',fmtUsd(PC.confirmed_pnl),cls(PC.confirmed_pnl)],['Real picks P&L',fmtUsd(rp.pnl),cls(rp.pnl)],['Real closed',rp.closed||0]]);
-    $('pc-note').textContent=PC.label||PC.caveat||'shadow, does not gate picks';
+    kv('pc-kv',[['Pending',c.pending_confirm||0],['Confirmed',c.confirmed||0,'ok'],['Dropped',c.dropped||0],['Expired',c.expired||0],['Confirmed P&L',fmtUsd(PC.confirmed_pnl),cls(PC.confirmed_pnl)],['Real picks P&L',fmtUsd(rp.pnl),cls(rp.pnl)]]);
+    $('pc-note').textContent=PC.label||PC.caveat||'required for shadow fills · no live orders';
     rows('pc-t',(PC.entries||[]).slice(0,24).map(r=>{
-      const next=r.status==='confirmed'?('confirmed'+(r.confirm_score!=null?' '+Number(r.confirm_score).toFixed(2):'')):r.status==='unconfirmed'?('unconfirmed '+(r.unconfirm_reason||'')):r.status||'pending';
+      const next=r.outcome||(r.status==='confirmed'?'confirmed_pick':r.status==='unconfirmed'?('dropped '+(r.unconfirm_reason||'')):r.status||'pending');
       return `<tr><td>${esc(r.ticker)}</td><td class="n">${r.first_score==null?'—':(+r.first_score).toFixed(2)}</td><td class="stat">${esc(next)}</td><td class="n">${fmtPx(r.confirm_price)}</td><td class="n ${cls(r.pnl_usd)}">${fmtUsd(r.pnl_usd)}</td></tr>`;
     }).join(''));
   }

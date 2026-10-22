@@ -1,4 +1,4 @@
-"""Two-cycle pick confirm. Paper only. Does not change pick or shadow_ledger."""
+"""Two-cycle pick confirm. Required for shadow fills. No live orders."""
 from __future__ import annotations
 
 import logging
@@ -54,6 +54,7 @@ def test_confirm_path(pcs):
     assert out["confirmed"] == 1
     row = pcs.all_rows()[0]
     assert row["status"] == "confirmed"
+    assert row["outcome"] == "confirmed_pick"
     assert row["confirm_price"] == pytest.approx(0.0024)
     assert row["entry_price"] == pytest.approx(0.0024)
     assert row["exit_ts"] is None
@@ -65,6 +66,7 @@ def test_fail_judge_path(pcs):
     pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.51)]}, now=T0 + 600)
     row = pcs.all_rows()[0]
     assert row["status"] == "unconfirmed"
+    assert row["outcome"] == "dropped_unconfirmed"
     assert "0.51" in (row["unconfirm_reason"] or "")
 
 
@@ -77,17 +79,23 @@ def test_fail_soft_kill_path(pcs):
     }]}, now=T0 + 600)
     row = pcs.all_rows()[0]
     assert row["status"] == "unconfirmed"
+    assert row["outcome"] == "dropped_unconfirmed"
     assert "soft" in (row["unconfirm_reason"] or "")
     assert "shape" in (row["unconfirm_reason"] or "")
 
 
-def test_not_seen_path(pcs):
+def test_not_seen_expires_after_two_cycles(pcs):
     tid = "Tok:1399811149"
     pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.77)]}, now=T0)
     pcs.on_cycle({"tokens": [_judged("Other:1399811149", "OTH", 0.9)]}, now=T0 + 600)
     row = [r for r in pcs.all_rows() if r["tid"] == tid][0]
+    assert row["status"] == "pending_confirm"
+    assert int(row.get("missed_cycles") or 0) == 1
+    pcs.on_cycle({"tokens": [_judged("Other:1399811149", "OTH", 0.9)]}, now=T0 + 1200)
+    row = [r for r in pcs.all_rows() if r["tid"] == tid][0]
     assert row["status"] == "unconfirmed"
-    assert row["unconfirm_reason"] == "not_seen"
+    assert row["outcome"] == "expired"
+    assert row["unconfirm_reason"] == "expired"
 
 
 def test_horn_and_prowler_unconfirmed_from_history(pcs):
@@ -106,8 +114,10 @@ def test_horn_and_prowler_unconfirmed_from_history(pcs):
     ]}, now=T0 + 700)
     by = {r["ticker"]: r for r in pcs.all_rows()}
     assert by["HORN"]["status"] == "unconfirmed"
+    assert by["HORN"]["outcome"] == "dropped_unconfirmed"
     assert "0.51" in (by["HORN"]["unconfirm_reason"] or "")
     assert by["PROWLER"]["status"] == "unconfirmed"
+    assert by["PROWLER"]["outcome"] == "dropped_unconfirmed"
     assert "shape" in (by["PROWLER"]["unconfirm_reason"] or "")
 
 
@@ -187,13 +197,46 @@ def test_mark_uses_shadow_exits_not_ledger(pcs, tmp_path, monkeypatch):
 def test_ops_payload_and_route(pcs):
     pcs.on_cycle({"tokens": [_judged("A:1399811149", "A", 0.9)]}, now=T0)
     payload = pcs.ops_payload()
-    assert payload["gates_picks"] is False
+    assert payload["gates_picks"] is True
+    assert payload["live_orders"] is False
     assert payload["counts"]["pending_confirm"] == 1
     from fastapi.testclient import TestClient
     import server
     resp = TestClient(server.app).get("/ops/pick_confirm")
     assert resp.status_code == 200
     assert resp.json()["paper"] is True
+
+
+def test_first_pass_no_fill_second_pass_fills(pcs):
+    tid = "Tok:1399811149"
+    order = {"token": {"ticker": "TOK", "address": "Tok", "network_id": 1399811149}}
+    d = {"tid": tid, "ticker": "TOK", "price_usd": 0.002}
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.72, 0.002)]}, [(d, {})], now=T0)
+    assert pcs.all_rows()[0]["status"] == "pending_confirm"
+    assert pcs.fill_allowed(order) is False
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.68, 0.0024)]}, [(d, {})], now=T0 + 600)
+    assert pcs.all_rows()[0]["outcome"] == "confirmed_pick"
+    assert pcs.fill_allowed(order) is True
+
+
+def test_soft_kill_between_cycles_drops_fill(pcs):
+    tid = "Tok:1399811149"
+    order = {"token": {"ticker": "TOK", "address": "Tok"}}
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.8)]}, now=T0)
+    pcs.on_cycle({"tokens": [{
+        "tid": tid, "ticker": "TOK", "stage": "soft", "reason": "shape_is_wrong",
+    }]}, now=T0 + 600)
+    assert pcs.all_rows()[0]["outcome"] == "dropped_unconfirmed"
+    assert pcs.fill_allowed(order) is False
+
+
+def test_historical_replay_drops_horn_prowler_pepa(pcs):
+    out = pcs.replay_historical()
+    assert out["HORN"]["outcome"] == "dropped_unconfirmed"
+    assert out["PROWLER"]["outcome"] == "dropped_unconfirmed"
+    assert out["PEPA"]["outcome"] == "dropped_unconfirmed"
+    assert out["CHILL"]["status"] == "pending_confirm"
+    assert out["CHILL"]["outcome"] in (None, "")
 
 
 def test_no_protected_file_mentions():
