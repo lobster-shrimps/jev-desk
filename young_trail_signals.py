@@ -1164,9 +1164,9 @@ def lookup_boost(chain: str | None, mint: str | None) -> dict:
         return {"amount": None, "total": None, "boosted": None}
     rec = _boosts.get((str(chain).lower(), str(mint).lower()))
     if rec is None:
-        if not _boosts_ok:
-            return {"amount": None, "total": None, "boosted": None}
-        return {"amount": 0.0, "total": 0.0, "boosted": False}
+        # Token absent from the boosts list is "source did not return a
+        # value", not a real 0.00. Only a listed row is a measured boost.
+        return {"amount": None, "total": None, "boosted": None}
     amt = _num(rec.get("amount"), 0.0) or 0.0
     tot = _num(rec.get("total"), 0.0) or 0.0
     return {"amount": amt, "total": tot, "boosted": amt > 0 or tot > 0}

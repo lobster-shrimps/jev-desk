@@ -9,10 +9,12 @@ Shadow fills only. Never live orders. Fail open. safe_err only.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import pathlib
 import sqlite3
+import tempfile
 import threading
 import time
 
@@ -514,49 +516,82 @@ def ops_payload() -> dict:
         }
 
 
-def replay_historical() -> dict:
-    """HORN / PROWLER / PEPA drop; CHILL stays pending without a second look."""
-    reset()
+def replay_historical(*, live_db: bool = False) -> dict:
+    """HORN / PROWLER / PEPA drop; CHILL stays pending without a second look.
+
+    Writes a throwaway temp DB unless live_db=True (--live-db-i-mean-it).
+    The default path never resets or writes the live pick_confirm table.
+    """
+    prev = os.environ.get("OUTCOMES_DB")
+    tmp_path = None
+    if not live_db:
+        fd, tmp_path = tempfile.mkstemp(prefix="pick_confirm_replay_", suffix=".db")
+        os.close(fd)
+        os.environ["OUTCOMES_DB"] = tmp_path
+        reset()
+    else:
+        reset()
     set_time_fn(lambda: 1_700_000_000.0)
     t0 = 1_700_000_000.0
-    on_cycle({"tokens": [
-        {"tid": HORN, "ticker": "HORN", "stage": "judged",
-         "judge_score": 0.72, "judge_verdict": "pass", "price_usd": 0.0004},
-        {"tid": PROWLER, "ticker": "PROWLER", "stage": "judged",
-         "judge_score": 0.81, "judge_verdict": "pass", "price_usd": 0.0009},
-        {"tid": PEPA, "ticker": "PEPA", "stage": "judged",
-         "judge_score": 0.72, "judge_verdict": "pick", "price_usd": 0.0002},
-        {"tid": CHILL, "ticker": "CHILL", "stage": "judged",
-         "judge_score": 0.64, "judge_verdict": "pick", "price_usd": 0.001},
-    ]}, now=t0)
-    on_cycle({"tokens": [
-        {"tid": HORN, "ticker": "HORN", "stage": "judged",
-         "judge_score": 0.51, "judge_verdict": "pass", "price_usd": 0.00035},
-        {"tid": PROWLER, "ticker": "PROWLER", "stage": "soft",
-         "reason": "shape_is_wrong"},
-        {"tid": PEPA, "ticker": "PEPA", "stage": "judged",
-         "judge_score": 0.48, "judge_verdict": "pass", "price_usd": 0.00015},
-    ]}, now=t0 + 900)
-    by = {r["ticker"]: r for r in all_rows()}
-    set_time_fn(None)
-    return {
-        "HORN": {"outcome": by.get("HORN", {}).get("outcome"),
-                 "status": by.get("HORN", {}).get("status"),
-                 "reason": by.get("HORN", {}).get("unconfirm_reason")},
-        "PROWLER": {"outcome": by.get("PROWLER", {}).get("outcome"),
-                    "status": by.get("PROWLER", {}).get("status"),
-                    "reason": by.get("PROWLER", {}).get("unconfirm_reason")},
-        "PEPA": {"outcome": by.get("PEPA", {}).get("outcome"),
-                 "status": by.get("PEPA", {}).get("status"),
-                 "reason": by.get("PEPA", {}).get("unconfirm_reason")},
-        "CHILL": {"outcome": by.get("CHILL", {}).get("outcome"),
-                  "status": by.get("CHILL", {}).get("status"),
-                  "reason": by.get("CHILL", {}).get("unconfirm_reason")},
-    }
+    try:
+        on_cycle({"tokens": [
+            {"tid": HORN, "ticker": "HORN", "stage": "judged",
+             "judge_score": 0.72, "judge_verdict": "pass", "price_usd": 0.0004},
+            {"tid": PROWLER, "ticker": "PROWLER", "stage": "judged",
+             "judge_score": 0.81, "judge_verdict": "pass", "price_usd": 0.0009},
+            {"tid": PEPA, "ticker": "PEPA", "stage": "judged",
+             "judge_score": 0.72, "judge_verdict": "pick", "price_usd": 0.0002},
+            {"tid": CHILL, "ticker": "CHILL", "stage": "judged",
+             "judge_score": 0.64, "judge_verdict": "pick", "price_usd": 0.001},
+        ]}, now=t0)
+        on_cycle({"tokens": [
+            {"tid": HORN, "ticker": "HORN", "stage": "judged",
+             "judge_score": 0.51, "judge_verdict": "pass", "price_usd": 0.00035},
+            {"tid": PROWLER, "ticker": "PROWLER", "stage": "soft",
+             "reason": "shape_is_wrong"},
+            {"tid": PEPA, "ticker": "PEPA", "stage": "judged",
+             "judge_score": 0.48, "judge_verdict": "pass", "price_usd": 0.00015},
+        ]}, now=t0 + 900)
+        by = {r["ticker"]: r for r in all_rows()}
+        return {
+            "HORN": {"outcome": by.get("HORN", {}).get("outcome"),
+                     "status": by.get("HORN", {}).get("status"),
+                     "reason": by.get("HORN", {}).get("unconfirm_reason")},
+            "PROWLER": {"outcome": by.get("PROWLER", {}).get("outcome"),
+                        "status": by.get("PROWLER", {}).get("status"),
+                        "reason": by.get("PROWLER", {}).get("unconfirm_reason")},
+            "PEPA": {"outcome": by.get("PEPA", {}).get("outcome"),
+                     "status": by.get("PEPA", {}).get("status"),
+                     "reason": by.get("PEPA", {}).get("unconfirm_reason")},
+            "CHILL": {"outcome": by.get("CHILL", {}).get("outcome"),
+                      "status": by.get("CHILL", {}).get("status"),
+                      "reason": by.get("CHILL", {}).get("unconfirm_reason")},
+        }
+    finally:
+        set_time_fn(None)
+        if not live_db:
+            reset()
+            if prev is None:
+                os.environ.pop("OUTCOMES_DB", None)
+            else:
+                os.environ["OUTCOMES_DB"] = prev
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            reset()
 
 
-def main() -> None:
-    payload = replay_historical()
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--live-db-i-mean-it",
+        action="store_true",
+        help="Allow replay_historical to write the live pick_confirm table",
+    )
+    args = p.parse_args(argv)
+    payload = replay_historical(live_db=args.live_db_i_mean_it)
     print("pick_confirm_required replay")
     for name, rec in payload.items():
         print(f"  {name}: status={rec.get('status')} outcome={rec.get('outcome')} "

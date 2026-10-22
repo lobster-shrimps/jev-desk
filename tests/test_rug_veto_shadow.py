@@ -63,6 +63,7 @@ def test_record_and_ops_do_not_gate(rvs):
     d = {
         "tid": "A:1399811149", "ticker": "PEPA", "chain": "solana",
         "x_followers": 40, "addr": "A", "net": 1399811149,
+        "x_account": {"handle": "PEPA", "followers": 40},
         "_rug_veto": {"sniper_share": 0.12, "bundled": 0, "sniper_wallets": 2,
                       "followers": 40, "status": "ok"},
     }
@@ -170,3 +171,73 @@ def test_replay_script_runs(rvs, capsys):
     assert "PEPA" in out
     assert "PROWLER" in out
     assert "would_skip=True" in out
+
+
+def test_replay_reads_desk_rugrisk_and_cycle_history(rvs, tmp_path, monkeypatch):
+    """hellop/CHILL/HORN resolve real sniper/bundled/followers, not placeholders."""
+    import json
+    import desk_rugrisk
+    import cycle_history
+
+    monkeypatch.setenv("CYCLE_HISTORY_DB", str(tmp_path / "cycle_history.db"))
+    cycle_history.reset()
+    ch = cycle_history._connect()
+    ch.execute(
+        """INSERT INTO tokens (ts, kind, tid, chain, ticker, judge_score,
+                               soft_scores_json)
+           VALUES (?, 'judged', ?, 'solana', 'hellop', 0.70, ?)""",
+        (T0, "RealHelloMint111111111111111111111111:1399811149",
+         json.dumps({"account_is_the_project": {"noul": 0.82}})),
+    )
+    try:
+        ch.execute(
+            """INSERT INTO shadow_kills (ts, tid, ticker, chain, stage, reason,
+                                        x_followers)
+               VALUES (?, ?, 'hellop', 'solana', 'judged', 'ok', 240)""",
+            (T0, "RealHelloMint111111111111111111111111:1399811149"),
+        )
+    except Exception:
+        pass
+    ch.commit()
+
+    desk_rugrisk.enqueue({
+        "tid": "RealHelloMint111111111111111111111111:1399811149",
+        "ticker": "hellop", "chain": "solana", "net": 1399811149,
+        "x_followers": 240,
+        "x_account": {"handle": "hellop", "followers": 240},
+    }, "judged", 0.70, T0)
+    db = desk_rugrisk._connect()
+    db.execute(
+        """UPDATE desk_rugrisk SET status = 'ok', sniper_share = 0.22,
+             bundled = 0, sniper_wallets = 5
+           WHERE ticker = 'hellop'"""
+    )
+    db.commit()
+
+    payload = rvs.replay()
+    by = {r["ticker"]: r for r in payload["historical"]}
+    hellop = by["hellop"]
+    assert hellop["sniper_share"] == pytest.approx(0.22)
+    assert hellop["bundled"] in (0, False)
+    assert hellop["followers"] == pytest.approx(240)
+    assert hellop["would_skip"] is False
+    assert "followers_unknown" not in (hellop.get("reasons") or [])
+
+
+def test_borrowed_followers_do_not_skip(rvs):
+    rec = rvs.replay_row({
+        "ticker": "FOD", "tid": "FodMint:1399811149",
+        "sniper_share": 0.1, "followers": 4_400_000,
+        "x_account": {"handle": "elonmusk", "followers": 4_400_000},
+        "account_is_the_project": {"noul": 0.11},
+    })
+    assert rec["followers"] is None
+    assert rec["would_skip"] is False
+    assert "followers_lt_100" not in rec["reasons"]
+    pepa = rvs.replay_row({
+        "ticker": "PEPA", "tid": "PepaMint:1399811149",
+        "followers": 40,
+        "x_account": {"handle": "PEPA", "followers": 40},
+    })
+    assert pepa["would_skip"] is True
+    assert "followers_lt_100" in pepa["reasons"]

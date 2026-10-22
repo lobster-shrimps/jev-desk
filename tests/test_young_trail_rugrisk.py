@@ -281,9 +281,19 @@ def test_pure_sniper_share_and_bundled():
     assert sn["sniper_wallets"] == 3
     assert sn["sniper_denominator"] == pytest.approx(1000.0)
     assert sn["sniper_slots"] == 32
-    bun = r.bundled_from_buys(buys, 10, {S1, S2})
+    bun = r.bundled_from_buys(buys, 10, {S1, S2}, supply=1000.0)
     assert bun["bundled"] is True
     assert bun["bundled_buys"] == 3
+    assert bun["create_slot_share"] == pytest.approx(0.60)
+    dust = r.bundled_from_buys(
+        [{"owner": S1, "delta": 5, "slot": 10},
+         {"owner": S2, "delta": 5, "slot": 10},
+         {"owner": S3, "delta": 5, "slot": 10}],
+        10, supply=1000.0,
+    )
+    assert dust["bundled"] is False
+    assert dust["bundled_buys"] == 3
+    assert dust["create_slot_share"] == pytest.approx(0.015)
     two = r.bundled_from_buys(
         [{"owner": S1, "delta": 10, "slot": 10},
          {"owner": S2, "delta": 10, "slot": 10}],
@@ -299,6 +309,55 @@ def test_pure_sniper_share_and_bundled():
     )
     assert excluded["sniper_wallets"] == 2
     assert excluded["sniper_share"] == pytest.approx(0.30)
+
+
+def test_sniper_share_clamped_to_unit_interval():
+    """Amount > supply (uiAmount vs getTokenSupply) must not report 1.02."""
+    import young_trail_rugrisk as r
+    buys = [
+        {"owner": S1, "delta": 510, "slot": 10},
+        {"owner": S2, "delta": 510, "slot": 10},
+    ]
+    sn = r.sniper_share_from_buys(buys, 1000.0, 10, 8)
+    assert sn["sniper_amount"] == pytest.approx(1020.0)
+    assert sn["sniper_share"] == pytest.approx(1.0)
+    assert 0.0 <= sn["sniper_share"] <= 1.0
+    empty = r.sniper_share_from_buys(
+        [{"owner": S1, "delta": -50, "slot": 10}], 1000.0, 10, 8,
+    )
+    assert empty["sniper_share"] == pytest.approx(0.0)
+
+
+def test_bundled_rate_before_after_on_stored_buys():
+    import young_trail_rugrisk as r
+    rows = [
+        {"tid": "dust:1", "features_json": {
+            "create_slot": 10, "supply": 1000.0, "creators": [],
+            "buys": [
+                {"owner": S1, "delta": 5, "slot": 10},
+                {"owner": S2, "delta": 5, "slot": 10},
+                {"owner": S3, "delta": 5, "slot": 10},
+            ],
+        }},
+        {"tid": "real:1", "features_json": {
+            "create_slot": 10, "supply": 1000.0, "creators": [],
+            "buys": [
+                {"owner": S1, "delta": 200, "slot": 10},
+                {"owner": S2, "delta": 200, "slot": 10},
+                {"owner": S3, "delta": 200, "slot": 10},
+            ],
+        }},
+    ]
+    report = r.bundled_rate(rows)
+    assert report["n"] == 2
+    assert report["old_yes"] == 2
+    assert report["new_yes"] == 1
+    assert report["old_rate"] == pytest.approx(1.0)
+    assert report["new_rate"] == pytest.approx(0.5)
+    dust = r.recompute_bundled_from_cached(rows[0])
+    assert dust["bundled"] is False
+    real = r.recompute_bundled_from_cached(rows[1])
+    assert real["bundled"] is True
 
 
 def test_pure_fresh_holder_share():

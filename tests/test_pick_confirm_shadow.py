@@ -239,6 +239,15 @@ def test_historical_replay_drops_horn_prowler_pepa(pcs):
     assert out["CHILL"]["outcome"] in (None, "")
 
 
+def test_replay_historical_does_not_write_live_db(pcs, tmp_path, monkeypatch):
+    live_n = len(pcs.all_rows())
+    out = pcs.replay_historical(live_db=False)
+    assert out["HORN"]["outcome"] == "dropped_unconfirmed"
+    assert len(pcs.all_rows()) == live_n
+    assert all(r.get("ticker") != "HORN" or r.get("first_ts") != 1_700_000_000.0
+               for r in pcs.all_rows())
+
+
 def test_no_protected_file_mentions():
     for name in (
         "thresholds.py", "filter.py",
