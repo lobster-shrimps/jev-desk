@@ -17,6 +17,10 @@ from judge_inputs import format_flow
 
 log = logging.getLogger(__name__)
 
+# Same as the SOFT min in thresholds.py. Copied so this module does not
+# grow a new import of the live threshold table.
+ACCOUNT_IS_PROJECT_MIN = 0.70
+
 
 def _fmt_unknown(value, *, kind="num") -> str:
     if value is None or value == "":
@@ -57,6 +61,20 @@ def _noul_of(ans, name):
     return None
 
 
+def _clamp_share(value):
+    if value is None or value == "":
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return value
+    if n < 0.0:
+        return 0.0
+    if n > 1.0:
+        return 1.0
+    return n
+
+
 def _followers_and_age(d: dict):
     xa = d.get("x_account") if isinstance(d.get("x_account"), dict) else {}
     followers = d.get("x_followers")
@@ -70,6 +88,83 @@ def _followers_and_age(d: dict):
     return followers, age
 
 
+def _x_handle(d: dict) -> str | None:
+    xa = d.get("x_account") if isinstance(d.get("x_account"), dict) else {}
+    for key in ("handle", "screen_name", "username", "userName"):
+        raw = xa.get(key) if xa.get(key) is not None else d.get(f"x_{key}")
+        if raw is None and key == "handle":
+            raw = d.get("x_handle")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().lstrip("@")
+    return None
+
+
+def _handle_matches_token(handle: str | None, ticker: str | None) -> bool:
+    h = (handle or "").lstrip("@").lower().strip()
+    t = (ticker or "").lower().strip()
+    if not h or not t or len(t) < 2:
+        return False
+    return h == t or h.startswith(t) or t.startswith(h)
+
+
+def _noul_from(block):
+    if isinstance(block, dict):
+        return block.get("noul")
+    return block
+
+
+def account_is_the_project(d, ans=None, soft_scores=None) -> bool:
+    """True when the linked X account is the project's.
+
+    Threshold: account_is_the_project noul >= 0.70 (same as the SOFT min)
+    or the handle matches the ticker. Used by summary() and the rug veto.
+    """
+    d = d if isinstance(d, dict) else {}
+    noul = _noul_of(ans, "account_is_the_project")
+    if noul is None and isinstance(soft_scores, dict):
+        noul = _noul_from(soft_scores.get("account_is_the_project"))
+    if noul is None:
+        noul = _noul_from(d.get("account_is_the_project"))
+    if noul is not None:
+        try:
+            if float(noul) >= ACCOUNT_IS_PROJECT_MIN:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return _handle_matches_token(_x_handle(d), d.get("ticker"))
+
+
+def project_followers(d, ans=None, soft_scores=None):
+    """Followers only when the linked account is the project's. Else None."""
+    if not account_is_the_project(d, ans=ans, soft_scores=soft_scores):
+        return None
+    followers, _age = _followers_and_age(d if isinstance(d, dict) else {})
+    return followers
+
+
+def _lp_boost(d: dict, sig: dict):
+    """Keep real source values; treat leftover 0 defaults as unknown."""
+    boost = d.get("boost_amount")
+    if boost is None:
+        raw = sig.get("boost_amount")
+        if raw is not None:
+            try:
+                if float(raw) != 0.0 or sig.get("boost_total") is not None:
+                    boost = raw
+            except (TypeError, ValueError):
+                boost = None
+    lp = d.get("lp_locked_pct")
+    if lp is None:
+        raw = sig.get("lp_locked_pct")
+        if raw is not None:
+            try:
+                if float(raw) != 0.0 or sig.get("rugcheck_score") is not None:
+                    lp = raw
+            except (TypeError, ValueError):
+                lp = None
+    return boost, lp
+
+
 def _rug_bits(d: dict) -> dict:
     feat = d.get("_rug_veto") if isinstance(d.get("_rug_veto"), dict) else {}
     if feat.get("sniper_share") is None and feat.get("bundled") is None:
@@ -78,9 +173,17 @@ def _rug_bits(d: dict) -> dict:
             tid = d.get("tid")
             for row in desk_rugrisk.all_rows():
                 if row.get("tid") == tid:
+                    bundled = row.get("bundled")
+                    try:
+                        import young_trail_rugrisk
+                        recomputed = young_trail_rugrisk.recompute_bundled_from_cached(row)
+                        if recomputed and recomputed.get("bundled") is not None:
+                            bundled = recomputed.get("bundled")
+                    except Exception as e:
+                        log.warning("summary bundled recompute: %s", safe_err(e))
                     feat = {
                         "sniper_share": row.get("sniper_share"),
-                        "bundled": row.get("bundled"),
+                        "bundled": bundled,
                         "sniper_wallets": row.get("sniper_wallets"),
                     }
                     break
@@ -120,20 +223,37 @@ def social_tail(d, ans) -> str:
     promo = sig.get("paid_promo")
     if promo is None:
         promo = d.get("paid_promo")
-    boost = sig.get("boost_amount")
-    if boost is None:
-        boost = d.get("boost_amount")
-    lp = sig.get("lp_locked_pct")
-    if lp is None:
-        lp = d.get("lp_locked_pct")
+    boost, lp = _lp_boost(d, sig)
+    if account_is_the_project(d, ans):
+        follow_bit = (
+            f"x followers {_fmt_unknown(followers, kind='int')}, "
+            f"account age {_fmt_unknown(age, kind='int')}"
+            + ("d" if age is not None else "")
+        )
+    elif followers is not None and followers != "":
+        handle = _x_handle(d)
+        handle_s = f"@{handle}" if handle else "@unknown"
+        try:
+            n_fol = int(float(followers))
+        except (TypeError, ValueError):
+            n_fol = followers
+        follow_bit = (
+            f"x linked account is not the project ({handle_s}, {n_fol} followers), "
+            f"account age {_fmt_unknown(age, kind='int')}"
+            + ("d" if age is not None else "")
+        )
+    else:
+        follow_bit = (
+            f"x followers unknown, "
+            f"account age {_fmt_unknown(age, kind='int')}"
+            + ("d" if age is not None else "")
+        )
     return "; ".join([
-        f"x followers {_fmt_unknown(followers, kind='int')}, "
-        f"account age {_fmt_unknown(age, kind='int')}"
-        + ("d" if age is not None else ""),
+        follow_bit,
         f"official {_fmt_unknown(official, kind='noul')}, "
         f"recycled {_fmt_unknown(recycled, kind='noul')}, "
         f"dev_loaded {_fmt_unknown(loaded, kind='noul')}",
-        f"sniper {_fmt_unknown(rug.get('sniper_share'), kind='share')}, "
+        f"sniper {_fmt_unknown(_clamp_share(rug.get('sniper_share')), kind='share')}, "
         f"bundled {_fmt_unknown(rug.get('bundled'), kind='bool')}, "
         f"snipers {_fmt_unknown(rug.get('sniper_wallets'), kind='int')}",
         f"dev holding {_fmt_unknown(holding, kind='pct')}, "

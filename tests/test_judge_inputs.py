@@ -171,6 +171,59 @@ def test_summary_social_tail_unknowns_and_values():
     assert "unknown" not in filled.split("x followers")[1]
 
 
+def test_summary_followers_only_when_account_is_project():
+    borrowed = {
+        **SAMPLE_D,
+        "ticker": "FOD",
+        "x_account": {"handle": "elonmusk", "followers": 4_400_000,
+                      "account_age_days": 4000, "x_kind": "borrowed"},
+    }
+    ans = {**SAMPLE_ANS, "account_is_the_project": {"noul": 0.12},
+           "effort": {"score": 1.0}}
+    text = summary(borrowed, ans)
+    assert "x followers 4400000" not in text
+    assert "x linked account is not the project (@elonmusk, 4400000 followers)" in text
+    official = {
+        **SAMPLE_D,
+        "ticker": "FOD",
+        "x_account": {"handle": "fod", "followers": 88, "account_age_days": 9},
+    }
+    ans2 = {**SAMPLE_ANS, "account_is_the_project": {"noul": 0.80},
+            "effort": {"score": 2.0}}
+    text2 = summary(official, ans2)
+    assert "x followers 88" in text2
+    assert "linked account is not the project" not in text2
+    matched = {
+        **SAMPLE_D,
+        "ticker": "COOKED",
+        "x_account": {"handle": "cooked", "followers": 210, "account_age_days": 20},
+    }
+    text3 = summary(matched, SAMPLE_ANS)
+    assert "x followers 210" in text3
+
+
+def test_summary_lp_boost_zero_from_signals_is_unknown(monkeypatch):
+    """Older picks store 0 defaults; print unknown unless the source returned it."""
+    import young_trail_signals
+
+    class _Rows:
+        def all_rows(self):
+            return [{
+                "tid": SAMPLE_D["tid"],
+                "boost_amount": 0.0,
+                "boost_total": None,
+                "lp_locked_pct": 0.0,
+                "rugcheck_score": None,
+            }]
+
+    monkeypatch.setattr(young_trail_signals, "all_rows", _Rows().all_rows)
+    text = summary(SAMPLE_D, SAMPLE_ANS)
+    assert "dex boost unknown" in text
+    assert "lp unknown" in text
+    assert "dex boost 0.00" not in text
+    assert "lp 0%" not in text
+
+
 def test_trade_counts_stashes_m5_from_dex():
     pairs = [{
         "liquidity": {"usd": 50_000},
@@ -763,8 +816,16 @@ def test_replay_judge_social_prints_unknowns():
     import replay_judge_social
     rows = replay_judge_social.replay(live=False, use_mock=False)
     by = {r["ticker"]: r for r in rows}
+    assert set(by) >= {
+        "hellop", "CHILL", "HORN", "PROWLER", "PEPA", "FOD", "SHADOW",
+        "Jeetjak", "COOKED", "KUM", "Bien",
+    }
     assert "x followers 40" in by["PEPA"]["new_summary"]
     assert "sniper 0.75" in by["PROWLER"]["new_summary"]
-    assert "unknown" in by["hellop"]["new_summary"]
-    assert by["PEPA"]["old_summary"]
-    assert "x followers" not in by["PEPA"]["old_summary"]
+    assert "x linked account is not the project" in by["FOD"]["new_summary"]
+    assert "x followers 4400000" in by["FOD"]["old_summary"]
+    assert "dex boost 0.00" in by["hellop"]["old_summary"]
+    assert "dex boost unknown" in by["hellop"]["new_summary"]
+    assert "lp unknown" in by["hellop"]["new_summary"]
+    assert "sniper 1.00" in by["hellop"]["new_summary"]
+    assert "sniper 1.02" in by["hellop"]["old_summary"]

@@ -50,7 +50,9 @@ HISTORICAL_PICKS = (
      "sniper_wallets": 8, "followers": None, "became_pick": True},
     {"ticker": "PEPA", "tid": "PepaMint111111111111111111111111111111:1399811149",
      "chain": "solana", "judge_score": 0.72, "sniper_share": None, "bundled": None,
-     "sniper_wallets": None, "followers": 40.0, "became_pick": True},
+     "sniper_wallets": None, "followers": 40.0,
+     "x_account": {"handle": "PEPA", "followers": 40},
+     "became_pick": True},
 )
 
 _tls = threading.local()
@@ -173,6 +175,38 @@ def _followers(d: dict | None):
     return _num(d.get("followers"))
 
 
+def _soft_scores_of(src: dict | None) -> dict:
+    src = src if isinstance(src, dict) else {}
+    scores = src.get("soft_scores")
+    if isinstance(scores, dict):
+        return scores
+    blob = _loads(src.get("soft_scores_json"))
+    if blob:
+        return blob
+    feat = _loads(src.get("features_json"))
+    extra = feat.get("soft_scores")
+    return extra if isinstance(extra, dict) else {}
+
+
+def _project_followers(d: dict | None, ans=None, soft_scores=None):
+    """Followers for the <100 check only when the account is the project's.
+
+    Same rule as pick.summary: noul >= 0.70 or handle matches ticker.
+    Borrowed mega-accounts and unverified handles are unknown (no skip).
+    """
+    d = d if isinstance(d, dict) else {}
+    try:
+        from pick import account_is_the_project, project_followers
+        if not account_is_the_project(d, ans=ans, soft_scores=soft_scores):
+            return None
+        n = project_followers(d, ans=ans, soft_scores=soft_scores)
+        if n is not None:
+            return _num(n)
+    except Exception as e:
+        log.warning("rug_veto project followers: %s", safe_err(e))
+    return None
+
+
 def decide(sniper_share=None, followers=None, status: str | None = None) -> dict:
     """would_skip + reasons. Unknown followers never skip. Timeout → unavailable."""
     reasons = []
@@ -210,34 +244,169 @@ def _loads(raw) -> dict:
         return {}
 
 
-def _latest_rugrisk(tid: str | None) -> dict | None:
-    if not tid:
-        return None
+def _norm_ticker(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def _tid_matches(left, right) -> bool:
+    a, b = str(left or ""), str(right or "")
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return a.split(":", 1)[0] == b.split(":", 1)[0] and len(a.split(":", 1)[0]) >= 8
+
+
+def _latest_rugrisk(tid: str | None, ticker: str | None = None) -> dict | None:
+    """Newest desk_rugrisk row by tid or ticker. Fail-soft."""
     try:
         import desk_rugrisk
-        rows = [
-            r for r in desk_rugrisk.all_rows()
-            if r.get("tid") == tid
-        ]
-        if not rows:
-            return None
-        rows.sort(key=lambda r: float(r.get("ts") or 0), reverse=True)
-        return rows[0]
+        rows = list(desk_rugrisk.all_rows() or [])
     except Exception as e:
         log.warning("rug_veto rugrisk lookup: %s", safe_err(e))
         return None
+    if not rows:
+        return None
+    hit = None
+    if tid:
+        exact = [r for r in rows if r.get("tid") == tid]
+        if exact:
+            hit = max(exact, key=lambda r: float(r.get("ts") or 0))
+        else:
+            loose = [r for r in rows if _tid_matches(r.get("tid"), tid)]
+            if loose:
+                hit = max(loose, key=lambda r: float(r.get("ts") or 0))
+    key = _norm_ticker(ticker)
+    if hit is None and key:
+        named = [r for r in rows if _norm_ticker(r.get("ticker")) == key]
+        if named:
+            hit = max(named, key=lambda r: float(r.get("ts") or 0))
+    return hit
+
+
+def _latest_cycle_token(tid: str | None, ticker: str | None = None) -> dict | None:
+    """Newest cycle_history token / shadow_kill by tid or ticker. Fail-soft."""
+    try:
+        import cycle_history
+        db = cycle_history._connect()
+    except Exception as e:
+        log.warning("rug_veto cycle_history: %s", safe_err(e))
+        return None
+    row = None
+    try:
+        if tid:
+            row = db.execute(
+                "SELECT * FROM tokens WHERE tid = ? ORDER BY ts DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+        if row is None and ticker:
+            row = db.execute(
+                "SELECT * FROM tokens WHERE upper(ticker) = ? ORDER BY ts DESC LIMIT 1",
+                (_norm_ticker(ticker),),
+            ).fetchone()
+        token = None
+        if row is not None:
+            try:
+                token = cycle_history._token_dict(row)
+            except Exception:
+                token = dict(row)
+        kill = None
+        try:
+            if tid:
+                kill = db.execute(
+                    "SELECT * FROM shadow_kills WHERE tid = ? ORDER BY ts DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+            if kill is None and ticker:
+                kill = db.execute(
+                    """SELECT * FROM shadow_kills
+                       WHERE upper(ticker) = ? ORDER BY ts DESC LIMIT 1""",
+                    (_norm_ticker(ticker),),
+                ).fetchone()
+        except Exception:
+            kill = None
+        if token is None and kill is None:
+            return None
+        out = dict(token or {})
+        if kill is not None:
+            try:
+                kd = cycle_history._shadow_kill_dict(kill)
+            except Exception:
+                kd = dict(kill)
+            if out.get("x_followers") is None:
+                out["x_followers"] = kd.get("x_followers")
+            if not out.get("soft_scores") and kd.get("soft_scores"):
+                out["soft_scores"] = kd.get("soft_scores")
+            if out.get("tid") is None:
+                out["tid"] = kd.get("tid")
+            if out.get("judge_score") is None:
+                out["judge_score"] = kd.get("judge_score")
+        return out
+    except Exception as e:
+        log.warning("rug_veto cycle_history lookup: %s", safe_err(e))
+        return None
+
+
+def _merge_real_fields(src: dict) -> dict:
+    """Overlay desk_rugrisk + cycle_history facts onto a fixture/src row."""
+    src = dict(src or {})
+    rug = _latest_rugrisk(src.get("tid"), src.get("ticker"))
+    hist = _latest_cycle_token(src.get("tid"), src.get("ticker"))
+    if rug:
+        for key in ("sniper_share", "bundled", "sniper_wallets", "status"):
+            if rug.get(key) is not None:
+                src[key] = rug.get(key)
+        if rug.get("tid"):
+            src["tid"] = rug["tid"]
+        blob = _loads(rug.get("features_json"))
+        if src.get("followers") is None and blob.get("followers") is not None:
+            src["followers"] = blob.get("followers")
+        if src.get("x_followers") is None and blob.get("followers") is not None:
+            src["x_followers"] = blob.get("followers")
+        src["source"] = src.get("source") or "desk_rugrisk"
+    if hist:
+        placeholders = {h.get("tid") for h in HISTORICAL_PICKS}
+        if hist.get("tid") and (
+            not src.get("tid") or src.get("tid") in placeholders
+        ):
+            src["tid"] = hist["tid"]
+        if src.get("judge_score") is None and hist.get("judge_score") is not None:
+            src["judge_score"] = hist.get("judge_score")
+        if src.get("followers") is None and hist.get("x_followers") is not None:
+            src["followers"] = hist.get("x_followers")
+        if src.get("x_followers") is None and hist.get("x_followers") is not None:
+            src["x_followers"] = hist.get("x_followers")
+        if hist.get("soft_scores"):
+            src["soft_scores"] = hist.get("soft_scores")
+        if hist.get("ticker") and not src.get("ticker"):
+            src["ticker"] = hist.get("ticker")
+        src["source"] = src.get("source") or "cycle_history"
+    return src
 
 
 def _features_from_row(row: dict | None) -> dict:
     row = row if isinstance(row, dict) else {}
     blob = _loads(row.get("features_json"))
     followers = _num(blob.get("followers"))
+    if followers is None:
+        followers = _num(row.get("followers"))
+    if followers is None:
+        followers = _num(row.get("x_followers"))
+    bundled = None if row.get("bundled") is None else int(bool(row.get("bundled")))
+    try:
+        import young_trail_rugrisk
+        recomputed = young_trail_rugrisk.recompute_bundled_from_cached(row)
+        if recomputed and recomputed.get("bundled") is not None:
+            bundled = int(bool(recomputed.get("bundled")))
+    except Exception as e:
+        log.warning("rug_veto bundled recompute: %s", safe_err(e))
     return {
         "sniper_share": _num(row.get("sniper_share")),
         "sniper_wallets": _int(row.get("sniper_wallets")),
-        "bundled": None if row.get("bundled") is None else int(bool(row.get("bundled"))),
+        "bundled": bundled,
         "followers": followers,
         "status": row.get("status") or STATUS_OK,
+        "soft_scores": _soft_scores_of(row),
     }
 
 
@@ -253,7 +422,7 @@ def _remaining(deadline) -> float:
 def _compute_missing(d: dict, now: float, deadline) -> dict:
     """Run desk_rugrisk.compute_one if budget and cycle time remain."""
     tid = d.get("tid")
-    existing = _latest_rugrisk(tid)
+    existing = _latest_rugrisk(tid, d.get("ticker"))
     feat = _features_from_row(existing)
     if feat.get("sniper_share") is not None and feat.get("status") == STATUS_OK:
         return feat
@@ -289,8 +458,15 @@ def prepare(survivors, *, deadline=None, now: float | None = None) -> dict:
             if not isinstance(d, dict) or not d.get("tid"):
                 continue
             feat = _compute_missing(d, ts, deadline)
+            ans = item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else {}
+            scores = feat.get("soft_scores") or _soft_scores_of(d)
             if feat.get("followers") is None:
                 feat["followers"] = _followers(d)
+            feat["followers"] = _project_followers(
+                {**d, "followers": feat.get("followers"),
+                 "x_followers": feat.get("followers")},
+                ans=ans, soft_scores=scores,
+            )
             d["_rug_veto"] = feat
             _prepared[str(d["tid"])] = feat
             out["n"] += 1
@@ -358,8 +534,15 @@ def record(stats=None, survivors=None, order=None, *, now: float | None = None) 
                 continue
             d = dossiers.get(tid) or {}
             feat = dict(d.get("_rug_veto") or _prepared.get(str(tid)) or {})
-            if feat.get("followers") is None:
-                feat["followers"] = _followers(d) if d else _followers(row)
+            scores = feat.get("soft_scores") or _soft_scores_of(d) or _soft_scores_of(row)
+            raw_followers = feat.get("followers")
+            if raw_followers is None:
+                raw_followers = _followers(d) if d else _followers(row)
+            feat["followers"] = _project_followers(
+                {**(d or {}), **row, "followers": raw_followers,
+                 "x_followers": raw_followers},
+                soft_scores=scores,
+            )
             decided = decide(
                 feat.get("sniper_share"), feat.get("followers"), feat.get("status"),
             )
@@ -438,11 +621,18 @@ def counts() -> dict:
 
 def replay_row(src: dict) -> dict:
     """Apply decide() to a desk_rugrisk or fixture row."""
-    src = src if isinstance(src, dict) else {}
+    src = _merge_real_fields(src if isinstance(src, dict) else {})
     blob = _loads(src.get("features_json"))
-    followers = _followers(src)
-    if followers is None:
-        followers = _num(blob.get("followers"))
+    raw = _followers(src)
+    if raw is None:
+        raw = _num(blob.get("followers"))
+    bag = dict(src)
+    if raw is not None:
+        bag.setdefault("followers", raw)
+        bag.setdefault("x_followers", raw)
+    followers = _project_followers(
+        bag, soft_scores=_soft_scores_of(src) or blob.get("soft_scores"),
+    )
     decided = decide(src.get("sniper_share"), followers, src.get("status"))
     return {
         "ticker": src.get("ticker"),

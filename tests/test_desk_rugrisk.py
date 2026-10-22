@@ -358,3 +358,15 @@ def test_research_hook_fail_open():
     assert i != -1
     chunk = src[i:i + 200]
     assert "safe_err" in src[i:i + 280]
+
+
+def test_charge_lock_timeout_does_not_patch(drr, monkeypatch):
+    desk, rug, _helius = drr
+    monkeypatch.setattr(rug, "CHARGE_LOCK_TIMEOUT_SEC", 0.05)
+    assert rug.acquire_charge_lock(timeout=0.05) is True
+    try:
+        feat = desk._compute_features(MINT, DEV, T0)
+        assert feat.get("status") == "unavailable"
+        assert feat.get("error") == "charge_lock_timeout"
+    finally:
+        rug.release_charge_lock()

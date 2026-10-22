@@ -466,6 +466,8 @@ def _compute_features(mint: str, creator: str | None, now: float) -> dict:
         _charge_day(n, when)
         return True
 
+    if not rug.acquire_charge_lock():
+        return {"status": STATUS_UNAVAILABLE, "error": "charge_lock_timeout"}
     try:
         rug._can_charge = can
         rug._charge = charge
@@ -473,6 +475,7 @@ def _compute_features(mint: str, creator: str | None, now: float) -> dict:
     finally:
         rug._can_charge = orig_can
         rug._charge = orig_charge
+        rug.release_charge_lock()
 
 
 def _store_computed(row: dict, feat: dict, now: float) -> None:

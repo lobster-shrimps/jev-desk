@@ -62,7 +62,10 @@ SNIPER_SLOTS = 8
 SNIPER_SKIP_PCT = 0.30
 # 1–2 bonding-curve buys must not fire the skip rule by themselves.
 SNIPER_MIN_WALLETS = 4
+# Real bundle: several distinct create-slot wallets AND a stated minimum
+# share of total supply. 3 dust snipes in the mint slot are not a bundle.
 BUNDLED_MIN_BUYERS = 3
+BUNDLED_MIN_SHARE = 0.10
 FRESH_MAX_SIGS = 2
 DEV_RUG_SKIP = 1
 TOP_HOLDERS = 10
@@ -153,6 +156,10 @@ RUG_IX = {
     "closeAccount", "sell", "withdrawProtocolFee",
 }
 
+# Shared with desk_rugrisk's temporary _can_charge/_charge patch so the
+# background sampler and the rug-veto compute cannot overlap.
+CHARGE_LOCK_TIMEOUT_SEC = 8.0
+_charge_lock = threading.Lock()
 _tls = threading.local()
 _schema_lock = threading.Lock()
 _time_fn = time.time
@@ -183,6 +190,23 @@ def set_overnight_fn(fn) -> None:
     """Inject overnight predicate for tests. None restores OUTCOMES_WINDOW."""
     global _overnight_fn
     _overnight_fn = fn
+
+
+def acquire_charge_lock(timeout: float | None = None) -> bool:
+    """Take the charge-function lock. False on timeout. Fail-soft callers skip."""
+    wait = CHARGE_LOCK_TIMEOUT_SEC if timeout is None else float(timeout)
+    try:
+        return bool(_charge_lock.acquire(timeout=max(0.0, wait)))
+    except Exception as e:
+        log.warning("young_trail_rugrisk charge lock: %s", safe_err(e))
+        return False
+
+
+def release_charge_lock() -> None:
+    try:
+        _charge_lock.release()
+    except Exception:
+        pass
 
 
 def current_time() -> float:
@@ -1195,8 +1219,15 @@ def sniper_share_from_buys(buys: list[dict], supply: float, create_slot: int,
         if int(create_slot) <= int(slot) <= end:
             wallets[str(owner)] = wallets.get(str(owner), 0.0) + float(delta)
     amount = sum(wallets.values())
+    # ui-amount deltas can exceed getTokenSupply (timing / decimals). Bound
+    # the ratio; never report a share outside [0, 1].
+    share = amount / float(supply)
+    if share < 0.0:
+        share = 0.0
+    elif share > 1.0:
+        share = 1.0
     return {
-        "sniper_share": amount / float(supply),
+        "sniper_share": share,
         "sniper_wallets": len(wallets),
         "sniper_amount": amount,
         "sniper_denominator": float(supply),
@@ -1303,13 +1334,22 @@ def recompute_sniper_from_cached(row: dict) -> dict | None:
 
 
 def bundled_from_buys(buys: list[dict], create_slot: int,
-                      fresh_owners: set | None = None, exclude=None) -> dict:
-    """3+ distinct non-creator buys in the creation slot. Pure."""
+                      fresh_owners: set | None = None, exclude=None,
+                      supply=None) -> dict:
+    """Real bundled launch: several distinct create-slot wallets above a min share.
+
+    Stated minimum: BUNDLED_MIN_BUYERS (3) distinct non-excluded wallets in
+    the creation slot whose combined buys are at least BUNDLED_MIN_SHARE
+    (10%) of total supply. Organic 3-wallet dust snipes are not bundled.
+    Without a usable supply the share cannot be verified, so bundled is False.
+    """
+    empty = {"bundled": None, "bundled_buys": 0, "create_slot_buyers": 0,
+             "create_slot_fresh": 0, "create_slot_amount": 0.0,
+             "create_slot_share": None}
     if create_slot is None:
-        return {"bundled": None, "bundled_buys": 0, "create_slot_buyers": 0,
-                "create_slot_fresh": 0}
+        return empty
     skip = _owner_set(exclude)
-    buyers = set()
+    buyers: dict[str, float] = {}
     fresh = set()
     known_fresh = _owner_set(fresh_owners)
     for b in buys or []:
@@ -1321,16 +1361,119 @@ def bundled_from_buys(buys: list[dict], create_slot: int,
             continue
         if str(owner) in skip:
             continue
-        buyers.add(str(owner))
-        if str(owner) in known_fresh:
-            fresh.add(str(owner))
+        key = str(owner)
+        buyers[key] = buyers.get(key, 0.0) + float(delta)
+        if key in known_fresh:
+            fresh.add(key)
     n = len(buyers)
+    amount = sum(buyers.values())
+    supply_n = _num(supply)
+    share = None
+    if supply_n is not None and supply_n > 0:
+        share = amount / float(supply_n)
+        if share < 0.0:
+            share = 0.0
+        elif share > 1.0:
+            share = 1.0
+    bundled = bool(
+        n >= BUNDLED_MIN_BUYERS
+        and share is not None
+        and share >= BUNDLED_MIN_SHARE
+    )
     return {
-        "bundled": n >= BUNDLED_MIN_BUYERS,
+        "bundled": bundled,
         "bundled_buys": n,
         "create_slot_buyers": n,
         "create_slot_fresh": len(fresh),
+        "create_slot_amount": amount,
+        "create_slot_share": share,
     }
+
+
+def bundled_legacy_from_buys(buys: list[dict], create_slot: int,
+                             exclude=None) -> bool | None:
+    """Pre-fix rule: 3+ distinct create-slot buyers, no supply floor."""
+    if create_slot is None:
+        return None
+    skip = _owner_set(exclude)
+    buyers = set()
+    for b in buys or []:
+        if b.get("slot") is None or int(b["slot"]) != int(create_slot):
+            continue
+        owner = b.get("owner")
+        delta = _num(b.get("delta"), 0.0) or 0.0
+        if not owner or delta <= 0 or str(owner) in skip:
+            continue
+        buyers.add(str(owner))
+    return len(buyers) >= 3
+
+
+def recompute_bundled_from_cached(row: dict) -> dict | None:
+    """Rebuild bundled from stored create-slot buys + supply. No RPC."""
+    if not row:
+        return None
+    extra = _parse_features_blob(row.get("features_json"))
+    buys = extra.get("buys")
+    if not isinstance(buys, list) or not buys:
+        return None
+    create_slot = extra.get("create_slot")
+    if create_slot is None:
+        create_slot = row.get("create_slot")
+    if create_slot is None:
+        return None
+    supply = (
+        _num(row.get("sniper_denominator"))
+        or _num(extra.get("sniper_denominator"))
+        or _num(extra.get("supply"))
+        or _num(row.get("supply"))
+    )
+    mint, _net = parse_tid(row.get("tid"))
+    exclude = sniper_exclude_owners(
+        mint, extra.get("creators") or [], extra.get("holders"),
+    )
+    return bundled_from_buys(
+        buys, int(create_slot), exclude=exclude, supply=supply,
+    )
+
+
+def bundled_rate(rows) -> dict:
+    """Before/after bundled rate on stored buys. No RPC."""
+    out = {"n": 0, "old_yes": 0, "new_yes": 0, "old_rate": None, "new_rate": None}
+    for row in rows or []:
+        extra = _parse_features_blob(row.get("features_json"))
+        buys = extra.get("buys")
+        if not isinstance(buys, list) or not buys:
+            continue
+        create_slot = extra.get("create_slot")
+        if create_slot is None:
+            create_slot = row.get("create_slot")
+        if create_slot is None:
+            continue
+        supply = (
+            _num(row.get("sniper_denominator"))
+            or _num(extra.get("sniper_denominator"))
+            or _num(extra.get("supply"))
+            or _num(row.get("supply"))
+        )
+        mint, _net = parse_tid(row.get("tid"))
+        exclude = sniper_exclude_owners(
+            mint, extra.get("creators") or [], extra.get("holders"),
+        )
+        old = bundled_legacy_from_buys(buys, int(create_slot), exclude=exclude)
+        new = bundled_from_buys(
+            buys, int(create_slot), exclude=exclude, supply=supply,
+        )
+        if old is None:
+            continue
+        out["n"] += 1
+        if old:
+            out["old_yes"] += 1
+        if new.get("bundled"):
+            out["new_yes"] += 1
+    if out["n"]:
+        out["old_rate"] = round(out["old_yes"] / out["n"], 4)
+        out["new_rate"] = round(out["new_yes"] / out["n"], 4)
+    return out
 
 
 def dev_initial_share_from_buys(buys: list[dict], supply: float, create_slot: int,
@@ -2877,6 +3020,7 @@ def compute_features(mint: str, creator: str | None = None,
         )
         bundled = bundled_from_buys(
             buys, create_slot, fresh_owners, exclude=exclude,
+            supply=supply,
         )
         fresh = fresh_holder_share(top, fresh_owners)
         dev_share = dev_initial_share_from_buys(
@@ -3465,6 +3609,9 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
     `prices` is ignored (entry-time on-chain features). Fail open. Never gates.
     """
     empty = {"entries": 0, "computed": 0, "backfill": 0, "overnight": False}
+    if not acquire_charge_lock():
+        log.warning("young_trail_rugrisk sampler skipped charge_lock_timeout")
+        return empty
     try:
         if not enabled():
             return empty
@@ -3492,6 +3639,8 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
     except Exception as e:
         log.warning("young_trail_rugrisk sampler: %s", safe_err(e))
         return empty
+    finally:
+        release_charge_lock()
 
 
 def all_rows() -> list[dict]:
