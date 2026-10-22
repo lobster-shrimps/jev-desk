@@ -272,65 +272,97 @@ def _signal_bits(d: dict) -> dict:
     return {}
 
 
+def _is_known(value) -> bool:
+    return value is not None and value != ""
+
+
+def _is_true(value) -> bool:
+    return value in (True, 1, "1", "yes", "true")
+
+
+def _noul_true(value, cutoff: float = 0.5) -> bool:
+    if not _is_known(value):
+        return False
+    if _is_true(value):
+        return True
+    try:
+        return float(value) >= cutoff
+    except (TypeError, ValueError):
+        return False
+
+
+def _fmt_known(value, *, kind="num") -> str | None:
+    """Format a present value. None if missing — never the word unknown."""
+    if not _is_known(value):
+        return None
+    text = _fmt_unknown(value, kind=kind)
+    if text == "unknown":
+        return None
+    return text
+
+
 def social_tail(d, ans) -> str:
-    """Always-present extras. Missing values are 'unknown', never 0."""
+    """Known, meaningful facts only. Empty when nothing qualifies; never 'unknown'."""
     d = d if isinstance(d, dict) else {}
     ans = ans if isinstance(ans, dict) else {}
-    followers, age = _followers_and_age(d)
-    official = _noul_of(ans, "account_is_the_project")
+    bits = []
+    # Official/project account + followers only after the #97 noul/handle check.
+    if account_is_the_project(d, ans):
+        followers, _age = _followers_and_age(d)
+        handle = _x_handle(d)
+        fol = _fmt_known(followers, kind="int")
+        if handle and fol is not None:
+            bits.append(f"project @{handle}, {fol} followers")
+        elif fol is not None:
+            bits.append(f"x followers {fol}")
+        elif handle:
+            bits.append(f"project @{handle}")
     recycled = _noul_of(ans, "recycled_account")
-    loaded = _noul_of(ans, "dev_still_loaded")
+    recycled_s = _fmt_known(recycled, kind="noul")
+    if recycled_s is not None and _noul_true(recycled):
+        bits.append(f"recycled {recycled_s}")
     rug = _rug_bits(d)
-    sig = _signal_bits(d)
-    sold = d.get("dev_sold_pct")
+    sniper = _clamp_share(rug.get("sniper_share"))
+    sniper_s = _fmt_known(sniper, kind="share")
+    if sniper_s is not None:
+        try:
+            if float(sniper) >= 0.5:
+                bits.append(f"sniper {sniper_s}")
+        except (TypeError, ValueError):
+            pass
+    if _is_true(rug.get("bundled")):
+        bits.append("bundled yes")
     holding = d.get("developer_holding_percentage")
     if holding is None:
         holding = d.get("dev_pct")
+    holding_s = _fmt_known(holding, kind="pct")
+    if holding_s is not None:
+        bits.append(f"dev holding {holding_s}")
+    sold_s = _fmt_known(d.get("dev_sold_pct"), kind="pct")
+    if sold_s is not None:
+        bits.append(f"dev sold {sold_s}")
+    sig = _signal_bits(d)
     promo = sig.get("paid_promo")
     if promo is None:
         promo = d.get("paid_promo")
+    if _is_true(promo):
+        bits.append("paid promo yes")
     boost, lp = _lp_boost(d, sig)
-    if account_is_the_project(d, ans):
-        follow_bit = (
-            f"x followers {_fmt_unknown(followers, kind='int')}, "
-            f"account age {_fmt_unknown(age, kind='int')}"
-            + ("d" if age is not None else "")
-        )
-    elif followers is not None and followers != "":
-        handle = _x_handle(d)
-        if handle:
-            handle_s = f"@{handle}"
-        else:
-            handle_s = "linked x post"
+    boost_s = _fmt_known(boost, kind="share")
+    if boost_s is not None:
         try:
-            n_fol = int(float(followers))
+            if float(boost) != 0.0:
+                bits.append(f"dex boost {boost_s}")
         except (TypeError, ValueError):
-            n_fol = followers
-        follow_bit = (
-            f"x linked account is not the project ({handle_s}, {n_fol} followers), "
-            f"account age {_fmt_unknown(age, kind='int')}"
-            + ("d" if age is not None else "")
-        )
-    else:
-        follow_bit = (
-            f"x followers unknown, "
-            f"account age {_fmt_unknown(age, kind='int')}"
-            + ("d" if age is not None else "")
-        )
-    return "; ".join([
-        follow_bit,
-        f"official {_fmt_unknown(official, kind='noul')}, "
-        f"recycled {_fmt_unknown(recycled, kind='noul')}, "
-        f"dev_loaded {_fmt_unknown(loaded, kind='noul')}",
-        f"sniper {_fmt_unknown(_clamp_share(rug.get('sniper_share')), kind='share')}, "
-        f"bundled {_fmt_unknown(rug.get('bundled'), kind='bool')}, "
-        f"snipers {_fmt_unknown(rug.get('sniper_wallets'), kind='int')}",
-        f"dev holding {_fmt_unknown(holding, kind='pct')}, "
-        f"dev sold {_fmt_unknown(sold, kind='pct')}",
-        f"paid promo {_fmt_unknown(promo, kind='bool')}, "
-        f"dex boost {_fmt_unknown(boost, kind='share')}, "
-        f"lp {_fmt_unknown(lp, kind='pct')}",
-    ])
+            pass
+    lp_s = _fmt_known(lp, kind="pct")
+    if lp_s is not None:
+        try:
+            if float(lp) != 0.0:
+                bits.append(f"lp {lp_s}")
+        except (TypeError, ValueError):
+            pass
+    return "; ".join(bits)
 
 
 def summary(d, ans) -> str:
@@ -362,8 +394,34 @@ def summary(d, ans) -> str:
         bits.append(d["holder_growth"])
     if d.get("dev_sells"):
         bits.append(d["dev_sells"])
-    bits.append(social_tail(d, ans))
+    tail = social_tail(d, ans)
+    if tail:
+        bits.append(tail)
     return "; ".join(bits)
+
+
+def pick_state(survivors) -> dict:
+    """Candidates plus has_facts, so PICK can drop the extra sentence when empty."""
+    candidates = []
+    has_facts = False
+    for d, a in survivors:
+        text = summary(d, a)
+        if social_tail(d, a):
+            has_facts = True
+        candidates.append({"ticker": d["ticker"], "summary": text})
+    return {"candidates": candidates, "has_facts": has_facts}
+
+
+def render_pick_prompt(survivors) -> str:
+    """Instructions + per-token summaries. Byte-identical to pre-#96 when no facts."""
+    from questions import PICK
+    state = pick_state(survivors)
+    qs = PICK(state)
+    instr = getattr(qs["best"], "instructions", "") or ""
+    lines = [instr]
+    for c in state["candidates"]:
+        lines.append(f"{c['ticker']}: {c['summary']}")
+    return "\n".join(lines)
 
 
 def size_factor_for(ans) -> float:
@@ -381,8 +439,7 @@ def pick(judge, survivors) -> dict | None:
         return None
 
     try:
-        state = {"candidates": [{"ticker": d["ticker"], "summary": summary(d, a)}
-                                for d, a in survivors]}
+        state = pick_state(survivors)
         r = judge("pick", state)
         best, worth = r["answers"]["best"], r["answers"]["worth_trading_at_all"]
 

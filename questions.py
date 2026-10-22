@@ -127,15 +127,28 @@ SOCIAL = {
 }
 
 
+# Pre-#96 pick instructions. Extra facts sentence is appended only when a
+# candidate actually has a facts line (see pick.pick_state has_facts).
+PICK_INSTRUCTIONS = (
+    "Choose the single token in `candidates` that is the best entry "
+    "right now. Weigh crowd shape, contract risk, concentration and "
+    "the project account together. Prefer a clean unspent setup over "
+    "a larger move that already happened."
+)
+PICK_FACTS_SENTENCE = (
+    "Listed facts after a candidate summary are observed values we have "
+    "for that token."
+)
+
+
 def PICK(state):
     """Options built from the shortlist at call time. Choice takes up to 255."""
+    extra = ""
+    if state.get("has_facts"):
+        extra = " " + PICK_FACTS_SENTENCE
     return {
         "best": Choice(
-            instructions="Choose the single token in `candidates` that is the best entry "
-                         "right now. Weigh crowd shape, contract risk, concentration and "
-                         "the project account together. Prefer a clean unspent setup over "
-                         "a larger move that already happened. Small, new or recycled "
-                         "accounts with high sniper share are classic rug setups.",
+            instructions=PICK_INSTRUCTIONS + extra,
             criteria={c["ticker"]: c["summary"] for c in state["candidates"]}),
         "worth_trading_at_all": Noul(
             instructions="At least one token in `candidates` is worth a position today, "
