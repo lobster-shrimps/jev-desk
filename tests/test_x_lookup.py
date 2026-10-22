@@ -759,6 +759,15 @@ class _RecDesk(Desk):
         pass
 
 
+def _confirming_run(desk, judge, **kwargs):
+    """Two cycles so pick-confirm can shadow-fill."""
+    kwargs.setdefault("shadow", True)
+    kwargs.setdefault("gt_dossier_reserve", 3)
+    fomo = type("F", (), {"token": lambda self: None})()
+    shift.run_once(fomo, judge, desk, 1000.0, **kwargs)
+    return shift.run_once(fomo, judge, desk, 1000.0, **kwargs)
+
+
 def _wire_judge_token(monkeypatch, x_handle="tokacct"):
     book.release()
     book.DB.execute("DELETE FROM defer")
@@ -833,8 +842,7 @@ def test_social_judge_only_when_x_account_truthy(monkeypatch):
     desk = _RecDesk()
     get, _ = _project_route(handle="tokacct", ticker="XTK")
     with patch("x_lookup.requests.get", side_effect=get):
-        shift.run_once(type("F", (), {"token": lambda self: None})(),
-                       judge_ok, desk, 1000.0, shadow=True, gt_dossier_reserve=3)
+        _confirming_run(desk, judge_ok)
     assert "social" in sets_ok
     assert desk.shadow
     assert "account_is_the_project" in desk.shadow[0]["why"]
@@ -867,8 +875,7 @@ def test_social_judge_only_when_x_account_truthy(monkeypatch):
             "developer_holding_percentage": 2, "gt_score_details": None,
             "is_honeypot": None, "mint_authority": False, "freeze_authority": False,
             "description": "a token", "x_handle": "missingacct", "net": 1399811149})
-        shift.run_once(type("F", (), {"token": lambda self: None})(),
-                       judge_fail, desk2, 1000.0, shadow=True, gt_dossier_reserve=3)
+        _confirming_run(desk2, judge_fail)
     assert "social" not in sets_fail
     assert desk2.shadow
     assert "account_is_the_project" not in desk2.shadow[0]["why"]
@@ -904,8 +911,7 @@ def test_no_handle_skips_lookup_and_social(monkeypatch):
 
     desk = _RecDesk()
     with patch("x_lookup.requests.get", side_effect=AssertionError("no lookup without handle")):
-        shift.run_once(type("F", (), {"token": lambda self: None})(),
-                       judge, desk, 1000.0, shadow=True, gt_dossier_reserve=3)
+        _confirming_run(desk, judge)
     assert "social" not in sets_called
     assert desk.shadow[0]["size_factor"] == NO_SOCIAL_CUT
 
@@ -1156,8 +1162,7 @@ def test_social_judge_skipped_for_borrowed_elonmusk(monkeypatch):
             "is_honeypot": None, "mint_authority": False, "freeze_authority": False,
             "description": "casino coin", "x_handle": "elonmusk", "net": 1399811149,
             "ticker": "casino"})
-        shift.run_once(type("F", (), {"token": lambda self: None})(),
-                       judge, desk, 1000.0, shadow=True, gt_dossier_reserve=3)
+        _confirming_run(desk, judge)
     assert "social" not in sets_called
     assert desk.shadow
     assert "account_is_the_project" not in desk.shadow[0]["why"]
