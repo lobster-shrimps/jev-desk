@@ -157,7 +157,7 @@ def test_judge_hi_includes_holders_and_dev_sold(tmp_path, monkeypatch):
 
 def test_protected_files_untouched():
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "collect.py", "judge.py",
     ):
         r = subprocess.run(

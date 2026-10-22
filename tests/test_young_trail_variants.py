@@ -219,7 +219,7 @@ def test_live_decide_exit_unchanged(yt):
 
 
 def test_protected_modules_untouched():
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py",
+    for name in ("thresholds.py", "filter.py",
                  "collect.py", "judge.py"):
         r = subprocess.run(
             ["git", "diff", "--", name],

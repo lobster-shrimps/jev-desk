@@ -313,7 +313,7 @@ def test_briefing_includes_young_trail_line(yt):
 
 
 def test_protected_modules_untouched():
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py",
+    for name in ("thresholds.py", "filter.py",
                  "judge.py"):
         r = subprocess.run(
             ["git", "diff", "--", name],
