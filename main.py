@@ -1076,12 +1076,25 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                     picked_row = d
                     break
         recorded = None
+        allowed = True
         try:
-            recorded = desk.log_shadow(order, stats, fomo_data=picked_row)
+            import pick_confirm_shadow
+            allowed = pick_confirm_shadow.fill_allowed(order)
         except Exception as e:
-            log.warning("log_shadow: %s", safe_err(e))
-        stats["shadow_order"] = order
-        stats["shadow_recorded"] = bool(recorded)
+            log.warning("shadow fill confirm: %s", safe_err(e))
+        if allowed:
+            try:
+                recorded = desk.log_shadow(order, stats, fomo_data=picked_row)
+            except Exception as e:
+                log.warning("log_shadow: %s", safe_err(e))
+            stats["shadow_order"] = order
+            stats["shadow_recorded"] = bool(recorded)
+        else:
+            log.info("shadow fill deferred pending_confirm ticker=%s paper=1",
+                     picked_token.get("ticker"))
+            stats["shadow_order"] = None
+            stats["shadow_recorded"] = False
+            stats["confirm_held"] = True
         return None, stats  # never send; report() uses shadow_order / shadow_recorded
 
     book.take(order)          # the desk is now held. No scan until RISK calls release().

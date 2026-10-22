@@ -1,10 +1,11 @@
-"""Two-cycle pick confirm. Paper/shadow only.
+"""Two-cycle pick confirm. Required for shadow fills.
 
 When a judged token first clears score >= 0.6, record pending_confirm.
-Next cycle: judged again at >= 0.6 → confirmed + paper 'would pick';
-judge fail, filter/soft kill, or not seen → unconfirmed.
+It is only shadow-filled if it clears again on a later cycle with no new
+soft kill. Pending expires if not re-seen within 2 cycles.
 
-Never writes the real pick or shadow_ledger. Fail open. safe_err only.
+Outcomes: confirmed_pick / dropped_unconfirmed / expired.
+Shadow fills only. Never live orders. Fail open. safe_err only.
 """
 from __future__ import annotations
 
@@ -29,10 +30,20 @@ LOCK_TIMEOUT_SEC = 0.2
 STATUS_PENDING = "pending_confirm"
 STATUS_CONFIRMED = "confirmed"
 STATUS_UNCONFIRMED = "unconfirmed"
+OUTCOME_PICK = "confirmed_pick"
+OUTCOME_DROPPED = "dropped_unconfirmed"
+OUTCOME_EXPIRED = "expired"
+EXPIRE_MISSED_CYCLES = 2
+PEPA = "PepaMint111111111111111111111111111111:1399811149"
+HORN = "HornMint111111111111111111111111111111:1399811149"
+PROWLER = "ProwlerMint11111111111111111111111111:1399811149"
+CHILL = "CHILL:1399811149"
 
 _tls = threading.local()
 _schema_lock = threading.Lock()
 _time_fn = time.time
+_just_confirmed_tids: set[str] = set()
+_just_confirmed_tickers: set[str] = set()
 
 
 def set_time_fn(fn) -> None:
@@ -74,6 +85,8 @@ def _close_local() -> None:
 
 def reset() -> None:
     _close_local()
+    _just_confirmed_tids.clear()
+    _just_confirmed_tickers.clear()
 
 
 def _connect() -> sqlite3.Connection:
@@ -129,6 +142,15 @@ def _init_schema(db: sqlite3.Connection) -> None:
     _schema_step(db, "idx_pc_status", lambda: db.execute(
         "CREATE INDEX IF NOT EXISTS idx_pc_status ON pick_confirm(status)"
     ))
+    cols = {row[1] for row in db.execute("PRAGMA table_info(pick_confirm)")}
+    if "outcome" not in cols:
+        _schema_step(db, "outcome", lambda: db.execute(
+            "ALTER TABLE pick_confirm ADD COLUMN outcome TEXT"
+        ))
+    if "missed_cycles" not in cols:
+        _schema_step(db, "missed_cycles", lambda: db.execute(
+            "ALTER TABLE pick_confirm ADD COLUMN missed_cycles INTEGER NOT NULL DEFAULT 0"
+        ))
 
 
 def _num(value, default=None):
@@ -198,28 +220,60 @@ def _confirm(row: dict, ts: float, score, price) -> None:
     db = _connect()
     db.execute(
         """UPDATE pick_confirm SET
-             status = ?, confirm_ts = ?, confirm_score = ?, confirm_price = ?,
-             entry_price = ?, last_mark = ?, last_mark_ts = ?
+             status = ?, outcome = ?, confirm_ts = ?, confirm_score = ?,
+             confirm_price = ?, entry_price = ?, last_mark = ?, last_mark_ts = ?,
+             missed_cycles = 0
            WHERE tid = ? AND first_ts = ?""",
-        (STATUS_CONFIRMED, float(ts), _num(score), px, px, px, float(ts),
-         row["tid"], row["first_ts"]),
+        (STATUS_CONFIRMED, OUTCOME_PICK, float(ts), _num(score), px, px, px,
+         float(ts), row["tid"], row["first_ts"]),
     )
     db.commit()
+    if row.get("tid"):
+        _just_confirmed_tids.add(str(row["tid"]))
+    if row.get("ticker"):
+        _just_confirmed_tickers.add(str(row["ticker"]))
     log.info(
-        "pick_confirm would pick tid=%s ticker=%s price=%s score=%s paper=1",
+        "pick_confirm confirmed_pick tid=%s ticker=%s price=%s score=%s paper=1",
         row.get("tid"), row.get("ticker") or "?", px, score,
     )
 
 
-def _unconfirm(row: dict, reason: str) -> None:
+def _unconfirm(row: dict, reason: str, *, outcome: str = OUTCOME_DROPPED) -> None:
     db = _connect()
     db.execute(
-        """UPDATE pick_confirm SET status = ?, unconfirm_reason = ?
+        """UPDATE pick_confirm SET status = ?, outcome = ?, unconfirm_reason = ?
            WHERE tid = ? AND first_ts = ?""",
-        (STATUS_UNCONFIRMED, str(reason or "unknown")[:200],
+        (STATUS_UNCONFIRMED, outcome, str(reason or "unknown")[:200],
          row["tid"], row["first_ts"]),
     )
     db.commit()
+
+
+def _bump_missed(row: dict, missed: int) -> None:
+    db = _connect()
+    db.execute(
+        """UPDATE pick_confirm SET missed_cycles = ?
+           WHERE tid = ? AND first_ts = ?""",
+        (int(missed), row["tid"], row["first_ts"]),
+    )
+    db.commit()
+
+
+def fill_allowed(order) -> bool:
+    """True only when this cycle just confirmed the picked token."""
+    if not isinstance(order, dict):
+        return False
+    token = order.get("token") if isinstance(order.get("token"), dict) else {}
+    ticker = token.get("ticker")
+    if ticker and str(ticker) in _just_confirmed_tickers:
+        return True
+    addr = token.get("address")
+    if addr:
+        prefix = str(addr)
+        for tid in _just_confirmed_tids:
+            if str(tid).startswith(prefix):
+                return True
+    return False
 
 
 def _dossier_by_tid(survivors) -> dict:
@@ -233,23 +287,31 @@ def _dossier_by_tid(survivors) -> dict:
 
 def on_cycle(stats: dict | None, survivors=None, now: float | None = None) -> dict:
     """Resolve last-cycle pending, then record new >=0.6 judged tokens."""
-    empty = {"pending": 0, "confirmed": 0, "unconfirmed": 0, "new_pending": 0}
+    empty = {"pending": 0, "confirmed": 0, "unconfirmed": 0, "expired": 0,
+             "new_pending": 0}
     try:
         ts = current_time() if now is None else float(now)
+        _just_confirmed_tids.clear()
+        _just_confirmed_tickers.clear()
         stats = stats if isinstance(stats, dict) else {}
         tokens = [t for t in (stats.get("tokens") or []) if isinstance(t, dict)]
         by_tid = {t.get("tid"): t for t in tokens if t.get("tid")}
         dossiers = _dossier_by_tid(survivors)
         threshold = confirm_min()
-        confirmed = unconfirmed = 0
+        confirmed = unconfirmed = expired = 0
         resolved = set()
         for row in pending_rows():
             tid = row.get("tid")
             resolved.add(tid)
             seen = by_tid.get(tid)
             if seen is None:
-                _unconfirm(row, "not_seen")
-                unconfirmed += 1
+                missed = int(row.get("missed_cycles") or 0) + 1
+                if missed >= EXPIRE_MISSED_CYCLES:
+                    _unconfirm(row, "expired", outcome=OUTCOME_EXPIRED)
+                    expired += 1
+                    unconfirmed += 1
+                else:
+                    _bump_missed(row, missed)
                 continue
             stage = seen.get("stage") or ""
             if stage == "judged" and seen.get("judge_verdict") != "error":
@@ -259,11 +321,14 @@ def on_cycle(stats: dict | None, survivors=None, now: float | None = None) -> di
                     _confirm(row, ts, score, _price_of(d) or _price_of(seen))
                     confirmed += 1
                     continue
-                _unconfirm(row, f"judge_score={score}")
+                _unconfirm(row, f"judge_score={score}", outcome=OUTCOME_DROPPED)
                 unconfirmed += 1
                 continue
             reason = seen.get("reason") or stage or "killed"
-            _unconfirm(row, f"{stage}:{reason}" if stage else str(reason))
+            _unconfirm(
+                row, f"{stage}:{reason}" if stage else str(reason),
+                outcome=OUTCOME_DROPPED,
+            )
             unconfirmed += 1
         new_pending = 0
         pending_now = {r["tid"] for r in pending_rows()}
@@ -284,6 +349,7 @@ def on_cycle(stats: dict | None, survivors=None, now: float | None = None) -> di
             "pending": len(pending_rows()),
             "confirmed": confirmed,
             "unconfirmed": unconfirmed,
+            "expired": expired,
             "new_pending": new_pending,
         }
     except Exception as e:
@@ -371,12 +437,15 @@ def counts() -> dict:
         "pending_confirm": 0,
         "confirmed": 0,
         "unconfirmed": 0,
+        "dropped": 0,
+        "expired": 0,
         "open": 0,
         "closed": 0,
         "confirmed_pnl": 0.0,
     }
     for r in rows:
         st = r.get("status")
+        outcome = r.get("outcome")
         if st == STATUS_PENDING:
             out["pending_confirm"] += 1
         elif st == STATUS_CONFIRMED:
@@ -390,6 +459,10 @@ def counts() -> dict:
                     out["confirmed_pnl"] += pnl
         elif st == STATUS_UNCONFIRMED:
             out["unconfirmed"] += 1
+            if outcome == OUTCOME_EXPIRED:
+                out["expired"] += 1
+            else:
+                out["dropped"] += 1
     out["confirmed_pnl"] = round(out["confirmed_pnl"], 4)
     return out
 
@@ -417,23 +490,78 @@ def ops_payload() -> dict:
             "paper": True,
             "simulated": True,
             "live_orders": False,
-            "gates_picks": False,
+            "gates_picks": True,
+            "gates_live_orders": False,
             "confirm_min": confirm_min(),
             "ticket_usd": TICKET_USD,
             "caveat": (
-                "Two-cycle confirm is paper only. It does not change the real "
-                "pick or the main shadow ledger."
+                "Two-cycle confirm is required for shadow fills. First clear "
+                "is pending; a second clear with no soft kill fills. Live "
+                "orders stay off."
             ),
             "counts": c,
             "confirmed_pnl": c["confirmed_pnl"],
             "real_picks": _real_picks_pnl(),
-            "label": "shadow, does not gate picks",
+            "label": "required for shadow fills · no live orders",
             "entries": all_rows()[:80],
         }
     except Exception as e:
         log.warning("pick_confirm ops: %s", safe_err(e))
         return {
             "paper": True, "simulated": True, "live_orders": False,
-            "gates_picks": False, "error": "unavailable",
+            "gates_picks": True, "error": "unavailable",
             "counts": counts(), "entries": [],
         }
+
+
+def replay_historical() -> dict:
+    """HORN / PROWLER / PEPA drop; CHILL stays pending without a second look."""
+    reset()
+    set_time_fn(lambda: 1_700_000_000.0)
+    t0 = 1_700_000_000.0
+    on_cycle({"tokens": [
+        {"tid": HORN, "ticker": "HORN", "stage": "judged",
+         "judge_score": 0.72, "judge_verdict": "pass", "price_usd": 0.0004},
+        {"tid": PROWLER, "ticker": "PROWLER", "stage": "judged",
+         "judge_score": 0.81, "judge_verdict": "pass", "price_usd": 0.0009},
+        {"tid": PEPA, "ticker": "PEPA", "stage": "judged",
+         "judge_score": 0.72, "judge_verdict": "pick", "price_usd": 0.0002},
+        {"tid": CHILL, "ticker": "CHILL", "stage": "judged",
+         "judge_score": 0.64, "judge_verdict": "pick", "price_usd": 0.001},
+    ]}, now=t0)
+    on_cycle({"tokens": [
+        {"tid": HORN, "ticker": "HORN", "stage": "judged",
+         "judge_score": 0.51, "judge_verdict": "pass", "price_usd": 0.00035},
+        {"tid": PROWLER, "ticker": "PROWLER", "stage": "soft",
+         "reason": "shape_is_wrong"},
+        {"tid": PEPA, "ticker": "PEPA", "stage": "judged",
+         "judge_score": 0.48, "judge_verdict": "pass", "price_usd": 0.00015},
+    ]}, now=t0 + 900)
+    by = {r["ticker"]: r for r in all_rows()}
+    set_time_fn(None)
+    return {
+        "HORN": {"outcome": by.get("HORN", {}).get("outcome"),
+                 "status": by.get("HORN", {}).get("status"),
+                 "reason": by.get("HORN", {}).get("unconfirm_reason")},
+        "PROWLER": {"outcome": by.get("PROWLER", {}).get("outcome"),
+                    "status": by.get("PROWLER", {}).get("status"),
+                    "reason": by.get("PROWLER", {}).get("unconfirm_reason")},
+        "PEPA": {"outcome": by.get("PEPA", {}).get("outcome"),
+                 "status": by.get("PEPA", {}).get("status"),
+                 "reason": by.get("PEPA", {}).get("unconfirm_reason")},
+        "CHILL": {"outcome": by.get("CHILL", {}).get("outcome"),
+                  "status": by.get("CHILL", {}).get("status"),
+                  "reason": by.get("CHILL", {}).get("unconfirm_reason")},
+    }
+
+
+def main() -> None:
+    payload = replay_historical()
+    print("pick_confirm_required replay")
+    for name, rec in payload.items():
+        print(f"  {name}: status={rec.get('status')} outcome={rec.get('outcome')} "
+              f"reason={rec.get('reason')}")
+
+
+if __name__ == "__main__":
+    main()
