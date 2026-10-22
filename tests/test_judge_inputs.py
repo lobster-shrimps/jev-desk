@@ -171,6 +171,71 @@ def test_summary_social_tail_unknowns_and_values():
     assert "unknown" not in filled.split("x followers")[1]
 
 
+def test_summary_parses_status_url_handle_and_linked_x_post():
+    url_d = {
+        **SAMPLE_D,
+        "ticker": "ABC",
+        "x_account": {
+            "handle": "https://x.com/MarioNawfal/status/123456",
+            "followers": 88_000, "account_age_days": 900,
+        },
+    }
+    ans = {**SAMPLE_ANS, "account_is_the_project": {"noul": 0.10},
+           "effort": {"score": 1.0}}
+    text = summary(url_d, ans)
+    assert "(@MarioNawfal, 88000 followers)" in text
+    assert "@unknown" not in text
+    post_d = {
+        **SAMPLE_D,
+        "ticker": "XYZ",
+        "x_handle": "https://x.com/i/status/999",
+        "x_account": {"followers": 12, "account_age_days": 3},
+    }
+    text2 = summary(post_d, ans)
+    assert "linked x post" in text2
+    assert "@unknown" not in text2
+
+
+def test_fresh_followers_used_everywhere(tmp_path, monkeypatch):
+    """One fxtwitter sample, same count in desk / veto / judge text."""
+    monkeypatch.setenv("X_CACHE_DB", str(tmp_path / "x_cache.db"))
+    monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
+    monkeypatch.setenv("DESK_OUTBOX", str(tmp_path))
+    import x_lookup
+    import desk_rugrisk
+    import rug_veto_shadow
+    x_lookup.reset()
+    desk_rugrisk.reset()
+    rug_veto_shadow.reset()
+    x_lookup.set_time_fn(lambda: 1_700_000_100.0)
+    x_lookup._cache_put("pepa", {
+        "handle": "pepa", "followers": 42, "fetched_via": "fxtwitter",
+    }, ok=True)
+    d = {
+        **SAMPLE_D,
+        "ticker": "PEPA",
+        "tid": "PepaMint111111111111111111111111111111:1399811149",
+        "x_handle": "PEPA",
+        "x_followers": 18,
+        "x_account": {"handle": "PEPA", "followers": 18, "fetched_via": "fxtwitter",
+                      "fetched_at": 1_700_000_000.0},
+    }
+    rec = x_lookup.fresh_followers(d)
+    assert rec["followers"] == pytest.approx(42)
+    assert rec["source"] == "fxtwitter"
+    assert desk_rugrisk._followers(d) == pytest.approx(42)
+    assert rug_veto_shadow._followers(d) == pytest.approx(42)
+    ans = {**SAMPLE_ANS, "account_is_the_project": {"noul": 0.80},
+           "effort": {"score": 1.0}}
+    text = summary(d, ans)
+    assert "x followers 42" in text
+    assert "x followers 18" not in text
+    x_lookup.reset()
+    x_lookup.set_time_fn(None)
+    desk_rugrisk.reset()
+    rug_veto_shadow.reset()
+
+
 def test_summary_followers_only_when_account_is_project():
     borrowed = {
         **SAMPLE_D,

@@ -224,6 +224,57 @@ def test_replay_reads_desk_rugrisk_and_cycle_history(rvs, tmp_path, monkeypatch)
     assert "followers_unknown" not in (hellop.get("reasons") or [])
 
 
+def test_live_prepare_does_not_inherit_old_pepe_by_ticker(rvs):
+    """A new PEPE must not read an old PEPE desk_rugrisk row."""
+    import desk_rugrisk
+    old = {
+        "tid": "OldPepeMint11111111111111111111111111:1399811149",
+        "ticker": "PEPE", "chain": "solana", "net": 1399811149,
+        "x_followers": 900,
+    }
+    desk_rugrisk.enqueue(old, "judged", 0.7, T0)
+    db = desk_rugrisk._connect()
+    db.execute(
+        """UPDATE desk_rugrisk SET status = 'ok', sniper_share = 0.91,
+             bundled = 1, sniper_wallets = 9 WHERE ticker = 'PEPE'"""
+    )
+    db.commit()
+    new = {
+        "tid": "NewPepeMint22222222222222222222222222:1399811149",
+        "ticker": "PEPE", "chain": "solana", "net": 1399811149,
+        "addr": "NewPepeMint22222222222222222222222222",
+    }
+    rvs.prepare([(new, {})], deadline=T0 - 1, now=T0)
+    feat = new.get("_rug_veto") or {}
+    assert feat.get("sniper_share") is None
+    assert feat.get("bundled") is None
+    assert feat.get("sniper_wallets") is None
+
+
+def test_replay_reads_young_trail_rugrisk_by_address(rvs, tmp_path, monkeypatch):
+    """hellop/CHILL/HORN sniper lives on young_trail_rugrisk, not desk."""
+    import young_trail_rugrisk as ytr
+    monkeypatch.setenv("OUTCOMES_DB", str(tmp_path / "outcomes.db"))
+    ytr.reset()
+    mint = "HelloMintAddr1111111111111111111111111"
+    db = ytr._connect()
+    db.execute(
+        """INSERT INTO young_trail_rugrisk (
+             tid, ticker, chain, entry_ts, status,
+             sniper_share, sniper_wallets, bundled
+           ) VALUES (?, 'hellop', 'solana', ?, 'ok', 0.33, 6, 0)""",
+        (f"{mint}:1399811149", T0),
+    )
+    db.commit()
+    rec = rvs.replay_row({
+        "ticker": "hellop", "tid": f"{mint}:1399811149", "chain": "solana",
+    })
+    assert rec["sniper_share"] == pytest.approx(0.33)
+    assert rec["sniper_wallets"] == 6
+    assert rec["bundled"] in (0, False)
+    ytr.reset()
+
+
 def test_borrowed_followers_do_not_skip(rvs):
     rec = rvs.replay_row({
         "ticker": "FOD", "tid": "FodMint:1399811149",

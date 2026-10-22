@@ -3609,9 +3609,6 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
     `prices` is ignored (entry-time on-chain features). Fail open. Never gates.
     """
     empty = {"entries": 0, "computed": 0, "backfill": 0, "overnight": False}
-    if not acquire_charge_lock():
-        log.warning("young_trail_rugrisk sampler skipped charge_lock_timeout")
-        return empty
     try:
         if not enabled():
             return empty
@@ -3639,8 +3636,6 @@ def on_sampler_tick(prices: dict | None = None, now: float | None = None) -> dic
     except Exception as e:
         log.warning("young_trail_rugrisk sampler: %s", safe_err(e))
         return empty
-    finally:
-        release_charge_lock()
 
 
 def all_rows() -> list[dict]:

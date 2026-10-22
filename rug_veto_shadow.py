@@ -164,7 +164,15 @@ def _int(value, default=None):
 
 
 def _followers(d: dict | None):
+    """Freshest fxtwitter count. Same helper as desk_rugrisk and pick.summary."""
     d = d if isinstance(d, dict) else {}
+    try:
+        import x_lookup
+        rec = x_lookup.fresh_followers(d)
+        if rec.get("followers") is not None:
+            return _num(rec.get("followers"))
+    except Exception as e:
+        log.warning("rug_veto followers: %s", safe_err(e))
     n = _num(d.get("x_followers"))
     if n is not None:
         return n
@@ -248,43 +256,70 @@ def _norm_ticker(value) -> str:
     return str(value or "").strip().upper()
 
 
-def _tid_matches(left, right) -> bool:
-    a, b = str(left or ""), str(right or "")
-    if not a or not b:
+def _addr_of(tid) -> str | None:
+    if not tid:
+        return None
+    s = str(tid)
+    return s.split(":", 1)[0] if ":" in s else s
+
+
+def _same_token(row: dict | None, tid: str | None, chain=None) -> bool:
+    """Address/tid + chain. Live path never falls back to ticker."""
+    if not row or not tid:
         return False
-    if a == b:
+    if row.get("tid") == tid:
         return True
-    return a.split(":", 1)[0] == b.split(":", 1)[0] and len(a.split(":", 1)[0]) >= 8
+    addr, row_addr = _addr_of(tid), _addr_of(row.get("tid"))
+    if not addr or not row_addr or addr != row_addr or len(addr) < 8:
+        return False
+    if chain:
+        rc = str(row.get("chain") or "").strip().lower()
+        return not rc or rc == str(chain).strip().lower()
+    return True
 
 
-def _latest_rugrisk(tid: str | None, ticker: str | None = None) -> dict | None:
-    """Newest desk_rugrisk row by tid or ticker. Fail-soft."""
+def _pick_latest(rows, *, tid=None, ticker=None, chain=None,
+                 allow_ticker: bool = False, ts_key: str = "ts"):
+    hits = [r for r in rows if _same_token(r, tid, chain)]
+    if not hits and allow_ticker and ticker:
+        key = _norm_ticker(ticker)
+        hits = [r for r in rows if _norm_ticker(r.get("ticker")) == key]
+    if not hits:
+        return None
+    return max(hits, key=lambda r: float(r.get(ts_key) or 0))
+
+
+def _latest_rugrisk(tid: str | None, ticker: str | None = None,
+                    chain=None, *, allow_ticker: bool = False) -> dict | None:
+    """Newest desk_rugrisk row. Live: tid/address+chain. Replay: ticker ok."""
     try:
         import desk_rugrisk
         rows = list(desk_rugrisk.all_rows() or [])
     except Exception as e:
         log.warning("rug_veto rugrisk lookup: %s", safe_err(e))
         return None
-    if not rows:
+    return _pick_latest(
+        rows, tid=tid, ticker=ticker, chain=chain, allow_ticker=allow_ticker,
+    )
+
+
+def _latest_young_trail(tid: str | None, ticker: str | None = None,
+                        chain=None, *, allow_ticker: bool = False) -> dict | None:
+    """Newest young_trail_rugrisk row by token address. Replay uses this."""
+    try:
+        import young_trail_rugrisk
+        rows = list(young_trail_rugrisk.all_rows() or [])
+    except Exception as e:
+        log.warning("rug_veto young_trail lookup: %s", safe_err(e))
         return None
-    hit = None
-    if tid:
-        exact = [r for r in rows if r.get("tid") == tid]
-        if exact:
-            hit = max(exact, key=lambda r: float(r.get("ts") or 0))
-        else:
-            loose = [r for r in rows if _tid_matches(r.get("tid"), tid)]
-            if loose:
-                hit = max(loose, key=lambda r: float(r.get("ts") or 0))
-    key = _norm_ticker(ticker)
-    if hit is None and key:
-        named = [r for r in rows if _norm_ticker(r.get("ticker")) == key]
-        if named:
-            hit = max(named, key=lambda r: float(r.get("ts") or 0))
-    return hit
+    return _pick_latest(
+        rows, tid=tid, ticker=ticker, chain=chain, allow_ticker=allow_ticker,
+        ts_key="entry_ts",
+    )
 
 
-def _latest_cycle_token(tid: str | None, ticker: str | None = None) -> dict | None:
+def _latest_cycle_token(tid: str | None, ticker: str | None = None,
+                        chain=None, *, allow_ticker: bool = False) -> dict | None:
     """Newest cycle_history token / shadow_kill by tid or ticker. Fail-soft."""
     try:
         import cycle_history
@@ -299,7 +334,19 @@ def _latest_cycle_token(tid: str | None, ticker: str | None = None) -> dict | No
                 "SELECT * FROM tokens WHERE tid = ? ORDER BY ts DESC LIMIT 1",
                 (tid,),
             ).fetchone()
-        if row is None and ticker:
+            if row is None:
+                addr = _addr_of(tid)
+                if addr and len(addr) >= 8:
+                    row = db.execute(
+                        """SELECT * FROM tokens WHERE tid LIKE ? || ':%'
+                           ORDER BY ts DESC LIMIT 1""",
+                        (addr,),
+                    ).fetchone()
+                    if row is not None and chain:
+                        got = str(row["chain"] or "").lower()
+                        if got and got != str(chain).strip().lower():
+                            row = None
+        if row is None and allow_ticker and ticker:
             row = db.execute(
                 "SELECT * FROM tokens WHERE upper(ticker) = ? ORDER BY ts DESC LIMIT 1",
                 (_norm_ticker(ticker),),
@@ -317,7 +364,7 @@ def _latest_cycle_token(tid: str | None, ticker: str | None = None) -> dict | No
                     "SELECT * FROM shadow_kills WHERE tid = ? ORDER BY ts DESC LIMIT 1",
                     (tid,),
                 ).fetchone()
-            if kill is None and ticker:
+            if kill is None and allow_ticker and ticker:
                 kill = db.execute(
                     """SELECT * FROM shadow_kills
                        WHERE upper(ticker) = ? ORDER BY ts DESC LIMIT 1""",
@@ -348,10 +395,27 @@ def _latest_cycle_token(tid: str | None, ticker: str | None = None) -> dict | No
 
 
 def _merge_real_fields(src: dict) -> dict:
-    """Overlay desk_rugrisk + cycle_history facts onto a fixture/src row."""
+    """Overlay desk_rugrisk + young_trail_rugrisk + cycle_history (replay)."""
     src = dict(src or {})
-    rug = _latest_rugrisk(src.get("tid"), src.get("ticker"))
-    hist = _latest_cycle_token(src.get("tid"), src.get("ticker"))
+    rug = _latest_rugrisk(
+        src.get("tid"), src.get("ticker"), src.get("chain"), allow_ticker=True,
+    )
+    yt = _latest_young_trail(
+        src.get("tid"), src.get("ticker"), src.get("chain"), allow_ticker=True,
+    )
+    hist = _latest_cycle_token(
+        src.get("tid"), src.get("ticker"), src.get("chain"), allow_ticker=True,
+    )
+    if yt and (src.get("sniper_share") is None or src.get("bundled") is None):
+        for key in ("sniper_share", "bundled", "sniper_wallets", "status"):
+            if src.get(key) is None and yt.get(key) is not None:
+                src[key] = yt.get(key)
+        if yt.get("tid") and (
+            not src.get("tid")
+            or src.get("tid") in {h.get("tid") for h in HISTORICAL_PICKS}
+        ):
+            src["tid"] = yt["tid"]
+        src["source"] = src.get("source") or "young_trail_rugrisk"
     if rug:
         for key in ("sniper_share", "bundled", "sniper_wallets", "status"):
             if rug.get(key) is not None:
@@ -422,7 +486,7 @@ def _remaining(deadline) -> float:
 def _compute_missing(d: dict, now: float, deadline) -> dict:
     """Run desk_rugrisk.compute_one if budget and cycle time remain."""
     tid = d.get("tid")
-    existing = _latest_rugrisk(tid, d.get("ticker"))
+    existing = _latest_rugrisk(tid, chain=d.get("chain"), allow_ticker=False)
     feat = _features_from_row(existing)
     if feat.get("sniper_share") is not None and feat.get("status") == STATUS_OK:
         return feat
