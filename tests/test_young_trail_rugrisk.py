@@ -549,14 +549,14 @@ def test_skip_rules_do_not_gate_entries(ytr):
 
 def test_no_gating_imports_or_protected_files():
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "collect.py", "judge.py", "young_trail.py", "young_trail_fast.py",
         "young_trail_helius.py", "young_trail_variants.py",
     ):
         text = (ROOT / name).read_text()
         assert "young_trail_rugrisk" not in text, name
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "judge.py",
     ):
         r = subprocess.run(

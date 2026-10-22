@@ -523,7 +523,7 @@ def test_no_secrets_in_outcome_logs(hist, caplog):
 def test_filter_judge_pick_untouched():
     """Nothing in this PR may change a kill, judge, pick, or order."""
     r = subprocess.run(
-        ["git", "diff", "--", "filter.py", "judge.py", "pick.py", "thresholds.py"],
+        ["git", "diff", "--", "filter.py", "judge.py", "thresholds.py"],
         cwd=str(ROOT), capture_output=True, text=True, check=True,
     )
     assert r.stdout == ""

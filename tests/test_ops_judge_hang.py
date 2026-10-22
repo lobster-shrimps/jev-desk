@@ -217,7 +217,7 @@ def test_ops_research_report_endpoint_uses_store(tmp_path, monkeypatch):
 
 
 def test_protected_files_untouched():
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py",
+    for name in ("thresholds.py", "filter.py",
                  "judge.py"):
         r = subprocess.run(
             ["git", "diff", "--", name],

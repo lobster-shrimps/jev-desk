@@ -134,7 +134,8 @@ def PICK(state):
             instructions="Choose the single token in `candidates` that is the best entry "
                          "right now. Weigh crowd shape, contract risk, concentration and "
                          "the project account together. Prefer a clean unspent setup over "
-                         "a larger move that already happened.",
+                         "a larger move that already happened. Small, new or recycled "
+                         "accounts with high sniper share are classic rug setups.",
             criteria={c["ticker"]: c["summary"] for c in state["candidates"]}),
         "worth_trading_at_all": Noul(
             instructions="At least one token in `candidates` is worth a position today, "

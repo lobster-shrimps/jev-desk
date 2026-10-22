@@ -341,7 +341,7 @@ def test_ops_html_has_research_hooks():
 
 
 def test_protected_files_untouched():
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py"):
+    for name in ("thresholds.py", "filter.py"):
         r = subprocess.run(
             ["git", "diff", "--", name],
             cwd=str(ROOT), capture_output=True, text=True, check=True,

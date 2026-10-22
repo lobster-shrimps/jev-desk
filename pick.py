@@ -18,6 +18,132 @@ from judge_inputs import format_flow
 log = logging.getLogger(__name__)
 
 
+def _fmt_unknown(value, *, kind="num") -> str:
+    if value is None or value == "":
+        return "unknown"
+    if kind == "bool":
+        if value in (True, 1, "1", "yes", "true"):
+            return "yes"
+        if value in (False, 0, "0", "no", "false"):
+            return "no"
+        return "unknown"
+    if kind == "pct":
+        try:
+            return f"{float(value):.0f}%"
+        except (TypeError, ValueError):
+            return "unknown"
+    if kind == "share":
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "unknown"
+    if kind == "noul":
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return "unknown"
+    try:
+        if kind == "int":
+            return str(int(float(value)))
+        return str(value)
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _noul_of(ans, name):
+    block = (ans or {}).get(name)
+    if isinstance(block, dict):
+        return block.get("noul")
+    return None
+
+
+def _followers_and_age(d: dict):
+    xa = d.get("x_account") if isinstance(d.get("x_account"), dict) else {}
+    followers = d.get("x_followers")
+    if followers is None:
+        followers = xa.get("followers")
+        if followers is None:
+            followers = xa.get("followers_count")
+    age = xa.get("account_age_days")
+    if age is None:
+        age = d.get("account_age_days")
+    return followers, age
+
+
+def _rug_bits(d: dict) -> dict:
+    feat = d.get("_rug_veto") if isinstance(d.get("_rug_veto"), dict) else {}
+    if feat.get("sniper_share") is None and feat.get("bundled") is None:
+        try:
+            import desk_rugrisk
+            tid = d.get("tid")
+            for row in desk_rugrisk.all_rows():
+                if row.get("tid") == tid:
+                    feat = {
+                        "sniper_share": row.get("sniper_share"),
+                        "bundled": row.get("bundled"),
+                        "sniper_wallets": row.get("sniper_wallets"),
+                    }
+                    break
+        except Exception as e:
+            log.warning("summary rugrisk: %s", safe_err(e))
+    return feat
+
+
+def _signal_bits(d: dict) -> dict:
+    try:
+        import young_trail_signals
+        tid = d.get("tid")
+        if not tid:
+            return {}
+        for row in young_trail_signals.all_rows():
+            if row.get("tid") == tid:
+                return row
+    except Exception as e:
+        log.warning("summary signals: %s", safe_err(e))
+    return {}
+
+
+def social_tail(d, ans) -> str:
+    """Always-present extras. Missing values are 'unknown', never 0."""
+    d = d if isinstance(d, dict) else {}
+    ans = ans if isinstance(ans, dict) else {}
+    followers, age = _followers_and_age(d)
+    official = _noul_of(ans, "account_is_the_project")
+    recycled = _noul_of(ans, "recycled_account")
+    loaded = _noul_of(ans, "dev_still_loaded")
+    rug = _rug_bits(d)
+    sig = _signal_bits(d)
+    sold = d.get("dev_sold_pct")
+    holding = d.get("developer_holding_percentage")
+    if holding is None:
+        holding = d.get("dev_pct")
+    promo = sig.get("paid_promo")
+    if promo is None:
+        promo = d.get("paid_promo")
+    boost = sig.get("boost_amount")
+    if boost is None:
+        boost = d.get("boost_amount")
+    lp = sig.get("lp_locked_pct")
+    if lp is None:
+        lp = d.get("lp_locked_pct")
+    return "; ".join([
+        f"x followers {_fmt_unknown(followers, kind='int')}, "
+        f"account age {_fmt_unknown(age, kind='int')}"
+        + ("d" if age is not None else ""),
+        f"official {_fmt_unknown(official, kind='noul')}, "
+        f"recycled {_fmt_unknown(recycled, kind='noul')}, "
+        f"dev_loaded {_fmt_unknown(loaded, kind='noul')}",
+        f"sniper {_fmt_unknown(rug.get('sniper_share'), kind='share')}, "
+        f"bundled {_fmt_unknown(rug.get('bundled'), kind='bool')}, "
+        f"snipers {_fmt_unknown(rug.get('sniper_wallets'), kind='int')}",
+        f"dev holding {_fmt_unknown(holding, kind='pct')}, "
+        f"dev sold {_fmt_unknown(sold, kind='pct')}",
+        f"paid promo {_fmt_unknown(promo, kind='bool')}, "
+        f"dex boost {_fmt_unknown(boost, kind='share')}, "
+        f"lp {_fmt_unknown(lp, kind='pct')}",
+    ])
+
+
 def summary(d, ans) -> str:
     """Two lines per candidate, built from answers Jev already gave.
        Never the raw dossier. A fat state costs accuracy."""
@@ -47,6 +173,7 @@ def summary(d, ans) -> str:
         bits.append(d["holder_growth"])
     if d.get("dev_sells"):
         bits.append(d["dev_sells"])
+    bits.append(social_tail(d, ans))
     return "; ".join(bits)
 
 

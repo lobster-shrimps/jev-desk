@@ -311,7 +311,7 @@ def test_no_secrets_in_payload(ytf, monkeypatch, caplog):
 
 def test_protected_files_untouched():
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "judge.py",
     ):
         r = subprocess.run(

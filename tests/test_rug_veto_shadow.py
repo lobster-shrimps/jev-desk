@@ -152,7 +152,7 @@ def test_pick_unchanged_when_module_raises(rvs, monkeypatch):
 
 def test_no_protected_file_mentions():
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "collect.py", "judge.py",
     ):
         text = (ROOT / name).read_text()

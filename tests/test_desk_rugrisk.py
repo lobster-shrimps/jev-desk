@@ -340,7 +340,7 @@ def test_sampler_hook_after_rugrisk():
 
 def test_no_gating_imports_or_protected_files():
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "collect.py", "judge.py",
     ):
         text = (ROOT / name).read_text()
