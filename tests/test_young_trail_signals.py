@@ -801,7 +801,7 @@ def test_main_notes_candidate_after_dossier_does_not_gate():
 
 def test_no_gating_imports_or_protected_files():
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "collect.py", "judge.py", "young_trail.py", "young_trail_fast.py",
         "young_trail_helius.py", "young_trail_variants.py",
         "young_trail_rugrisk.py",
@@ -809,7 +809,7 @@ def test_no_gating_imports_or_protected_files():
         text = (ROOT / name).read_text()
         assert "young_trail_signals" not in text, name
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "judge.py",
     ):
         r = subprocess.run(

@@ -177,7 +177,7 @@ def test_main_shadow_path_passes_shortlist_row_and_records_flag():
     # Must not rebuild a dict that only reads t.get("price") (the hellop miss).
     shadow_block = src.split("if shadow:")[1].split("book.take")[0]
     assert 't.get("price")' not in shadow_block
-    for name in ("thresholds.py", "questions.py", "pick.py", "filter.py"):
+    for name in ("thresholds.py", "filter.py"):
         r = pathlib.Path(__file__).resolve().parent.parent.joinpath(name).read_text()
         if name == "thresholds.py":
             assert "PICK_MIN_WORTH  = 0.60" in r

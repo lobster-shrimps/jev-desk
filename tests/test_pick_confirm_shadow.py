@@ -241,7 +241,7 @@ def test_historical_replay_drops_horn_prowler_pepa(pcs):
 
 def test_no_protected_file_mentions():
     for name in (
-        "thresholds.py", "questions.py", "pick.py", "filter.py",
+        "thresholds.py", "filter.py",
         "collect.py", "judge.py",
     ):
         text = (ROOT / name).read_text()

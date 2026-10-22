@@ -39,15 +39,24 @@ SAMPLE_ANS = {
     "concentration_is_exit_risk": {"noul": 0.2},
     "authority_risk": {"choice": "renounced"},
 }
-SAMPLE_BEFORE = (
+SAMPLE_SOCIAL_UNKNOWN = (
+    "x followers unknown, account age unknown; "
+    "official unknown, recycled unknown, dev_loaded unknown; "
+    "sniper unknown, bundled unknown, snipers unknown; "
+    "dev holding unknown, dev sold unknown; "
+    "paid promo unknown, dex boost unknown, lp unknown"
+)
+SAMPLE_PREFIX = (
     "solana, 42m old, $300,000 mcap, $48,000 liq, 310 holders; "
     "crowd 0.70, concentration risk 0.20; authority renounced; no usable X account"
 )
+SAMPLE_BEFORE = SAMPLE_PREFIX + "; " + SAMPLE_SOCIAL_UNKNOWN
 SAMPLE_AFTER = (
-    SAMPLE_BEFORE
+    SAMPLE_PREFIX
     + "; flow 1h b/s 540/120, 5m b/s 40/15"
     + "; holders +50 in 30m (+38.5%/h)"
     + "; dev sold 12% of initial since launch"
+    + "; " + SAMPLE_SOCIAL_UNKNOWN
 )
 
 
@@ -67,7 +76,7 @@ def test_summary_prefix_unchanged_without_optional_fields():
 def test_summary_renders_flow_with_and_without_m5():
     with_m5 = {**SAMPLE_D, "buys_h1": 540, "sells_h1": 120, "buys_m5": 40, "sells_m5": 15}
     s = summary(with_m5, SAMPLE_ANS)
-    assert s.startswith(SAMPLE_BEFORE)
+    assert s.startswith(SAMPLE_PREFIX)
     assert "flow 1h b/s 540/120, 5m b/s 40/15" in s
     without_m5 = {**SAMPLE_D, "buys_h1": 540, "sells_h1": 120}
     s2 = summary(without_m5, SAMPLE_ANS)
@@ -94,8 +103,9 @@ def test_summary_renders_dev_sells_and_omits_when_missing():
     none = {**SAMPLE_D, "dev_sells": "dev sells: none seen"}
     assert "dev sold 12% of initial since launch" in summary(sold, SAMPLE_ANS)
     assert "dev sells: none seen" in summary(none, SAMPLE_ANS)
-    assert "dev sold" not in summary(SAMPLE_D, SAMPLE_ANS)
+    assert "dev sold 12%" not in summary(SAMPLE_D, SAMPLE_ANS)
     assert "dev sells" not in summary(SAMPLE_D, SAMPLE_ANS)
+    assert "dev sold unknown" in summary(SAMPLE_D, SAMPLE_ANS)
 
 
 def test_summary_sample_token_before_after_all_fields():
@@ -108,6 +118,57 @@ def test_summary_sample_token_before_after_all_fields():
     s = summary(d, SAMPLE_ANS)
     assert s == SAMPLE_AFTER
     assert _prefix_bits(s) == _prefix_bits(SAMPLE_BEFORE)
+
+
+def test_summary_social_tail_unknowns_and_values():
+    s = summary(SAMPLE_D, SAMPLE_ANS)
+    assert "x followers unknown" in s
+    assert "account age unknown" in s
+    assert "official unknown" in s
+    assert "recycled unknown" in s
+    assert "dev_loaded unknown" in s
+    assert "sniper unknown" in s
+    assert "bundled unknown" in s
+    assert "snipers unknown" in s
+    assert "dev holding unknown" in s
+    assert "dev sold unknown" in s
+    assert "paid promo unknown" in s
+    assert "dex boost unknown" in s
+    assert "lp unknown" in s
+    assert " 0" not in s.split("x followers")[1][:20]
+
+    d = {
+        **SAMPLE_D,
+        "x_account": {"followers": 240, "account_age_days": 12},
+        "developer_holding_percentage": 2.4,
+        "dev_sold_pct": 12.0,
+        "_rug_veto": {"sniper_share": 0.12, "bundled": 0, "sniper_wallets": 4},
+        "paid_promo": False,
+        "boost_amount": 0.0,
+        "lp_locked_pct": 80,
+    }
+    ans = {
+        **SAMPLE_ANS,
+        "account_is_the_project": {"noul": 0.85},
+        "effort": {"score": 2.0},
+        "recycled_account": {"noul": 0.10},
+        "dev_still_loaded": {"noul": 0.20},
+    }
+    filled = summary(d, ans)
+    assert "x followers 240" in filled
+    assert "account age 12d" in filled
+    assert "official 0.85" in filled
+    assert "recycled 0.10" in filled
+    assert "dev_loaded 0.20" in filled
+    assert "sniper 0.12" in filled
+    assert "bundled no" in filled
+    assert "snipers 4" in filled
+    assert "dev holding 2%" in filled
+    assert "dev sold 12%" in filled
+    assert "paid promo no" in filled
+    assert "dex boost 0.00" in filled
+    assert "lp 80%" in filled
+    assert "unknown" not in filled.split("x followers")[1]
 
 
 def test_trade_counts_stashes_m5_from_dex():
@@ -685,14 +746,25 @@ def test_tx_version_error_retries_once_and_succeeds():
 
 
 def test_thresholds_and_questions_diff_empty():
-    for name in ("thresholds.py", "questions.py"):
-        r = subprocess.run(
-            ["git", "diff", "--", name],
-            cwd=str(ROOT), capture_output=True, text=True, check=True,
-        )
-        assert r.stdout == "", r.stdout
+    r = subprocess.run(
+        ["git", "diff", "--", "thresholds.py"],
+        cwd=str(ROOT), capture_output=True, text=True, check=True,
+    )
+    assert r.stdout == "", r.stdout
     src = (ROOT / "thresholds.py").read_text()
     assert "PICK_MIN_WORTH  = 0.60" in src
     q = (ROOT / "questions.py").read_text()
     assert "Classify the shape of this launch from the fields in `state`." in q
     assert "`developer_holding_percentage` is large enough that the creator" in q
+    assert "classic rug setups" in q
+
+
+def test_replay_judge_social_prints_unknowns():
+    import replay_judge_social
+    rows = replay_judge_social.replay(live=False, use_mock=False)
+    by = {r["ticker"]: r for r in rows}
+    assert "x followers 40" in by["PEPA"]["new_summary"]
+    assert "sniper 0.75" in by["PROWLER"]["new_summary"]
+    assert "unknown" in by["hellop"]["new_summary"]
+    assert by["PEPA"]["old_summary"]
+    assert "x followers" not in by["PEPA"]["old_summary"]

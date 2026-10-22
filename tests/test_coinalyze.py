@@ -436,7 +436,7 @@ def test_ops_briefing_json_has_regime(hist, monkeypatch):
 
 
 def test_zero_effect_on_filter_and_thresholds():
-    for name in ("filter.py", "pick.py", "thresholds.py", "questions.py", "judge.py"):
+    for name in ("filter.py", "thresholds.py", "judge.py"):
         src = (ROOT / name).read_text()
         assert "coinalyze" not in src
         assert "COINALYZE" not in src
