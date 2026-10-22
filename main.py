@@ -1019,6 +1019,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 captured["r"] = r
             return r
         try:
+            import rug_veto_shadow
+            rug_veto_shadow.prepare(survivors, deadline=cycle_deadline)
+        except Exception as e:
+            log.warning("rug_veto_shadow prepare: %s", safe_err(e))
+        try:
             order = pick(_capturing_judge, survivors)
         except Exception as e:
             log.warning("pick failed (NO PICK): %s", safe_err(e))
@@ -1033,6 +1038,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             )
         except Exception as e:
             log.warning("judge verdicts: %s", safe_err(e))
+        try:
+            import rug_veto_shadow
+            rug_veto_shadow.record(stats, survivors, order, now=cycle_start)
+        except Exception as e:
+            log.warning("rug_veto_shadow: %s", safe_err(e))
 
     try:
         import pick_confirm_shadow

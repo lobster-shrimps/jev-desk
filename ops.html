@@ -67,7 +67,7 @@ tr.pick td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
 </header>
 <div id="fomo-auth-banner" class="err" hidden style="padding:8px 20px;background:color-mix(in srgb,var(--neg) 18%,var(--bg));border-bottom:1px solid var(--neg)"></div>
 <nav class="jump" aria-label="Sections">
-  <a href="#desk">Desk</a><a href="#desk-rug">Desk rug</a><a href="#pick-confirm">Confirm</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#yt-helius">Helius</a><a href="#yt-rugrisk">Rug-risk</a><a href="#yt-signals">Signals</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
+  <a href="#desk">Desk</a><a href="#desk-rug">Desk rug</a><a href="#rug-veto">Rug veto</a><a href="#pick-confirm">Confirm</a><a href="#yt">young_trail</a><a href="#yt-fast">60s fast</a><a href="#yt-helius">Helius</a><a href="#yt-rugrisk">Rug-risk</a><a href="#yt-signals">Signals</a><a href="#variants">Exit variants</a><a href="#research">Research</a><a href="#outcomes">Outcomes &amp; budget</a><a href="#mood">Market mood</a><a href="#briefing">Briefing</a><a href="#controls">Controls</a>
 </nav>
 <main>
 <section id="desk" class="s6" aria-labelledby="desk-h">
@@ -86,6 +86,13 @@ tr.pick td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
   <div class="scroll"><table id="drr-t"><thead><tr><th>Ticker</th><th>Stage</th><th class="n">Score</th><th>Verdict</th><th class="n">Sniper</th><th>Bundled</th><th class="n">Dev rugs</th><th>&lt;100 fol</th><th>Sn≥0.5</th><th>Dev≥1%</th><th>Recyc≥0.2</th></tr></thead><tbody></tbody></table></div>
   <h2 style="margin-top:16px">Flag vs outcome <small>counterfactual</small></h2>
   <div class="scroll"><table id="drr-cf"><thead><tr><th>Flag</th><th class="n">Hit n</th><th class="n">Hit picks</th><th class="n">Hit P&amp;L</th><th class="n">Miss n</th><th class="n">Miss picks</th><th class="n">Miss P&amp;L</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="rug-veto" class="s6" aria-labelledby="rv-h">
+  <h2 id="rv-h">Rug veto <small>shadow, does not gate picks</small></h2>
+  <div class="err" id="rv-err" hidden></div>
+  <div class="kv" id="rv-kv"></div>
+  <div class="note" id="rv-note">shadow, does not gate picks</div>
+  <div class="scroll"><table id="rv-t"><thead><tr><th>Ticker</th><th class="n">Score</th><th class="n">Sniper</th><th>Bundled</th><th class="n">Followers</th><th>Skip</th><th>Reasons</th><th>Pick</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="pick-confirm" class="s6" aria-labelledby="pc-h">
   <h2 id="pc-h">Two-cycle confirm <small>shadow, does not gate picks</small></h2>
@@ -228,7 +235,7 @@ async function load(){
   if(loadInflight)return;
   loadInflight=true;
   try{
-  const [S,YT,V,SL,B,YF,YH,YR,YX,DR,PC]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius'),J('/ops/young_trail_rugrisk'),J('/ops/young_trail_signals'),J('/ops/desk_rugrisk'),J('/ops/pick_confirm')]);
+  const [S,YT,V,SL,B,YF,YH,YR,YX,DR,PC,RV]=await Promise.all([J('/ops/summary'),J('/ops/young_trail'),J('/ops/young_trail_variants'),J('/api/shadow_ledger'),J('/ops/briefing?compact=1'),J('/ops/young_trail_fast'),J('/ops/young_trail_helius'),J('/ops/young_trail_rugrisk'),J('/ops/young_trail_signals'),J('/ops/desk_rugrisk'),J('/ops/pick_confirm'),J('/ops/rug_veto')]);
   const now=Date.now()/1000;
   if(S){const h=S.health||{};
     $('h-mode').textContent=(h.mode||'shadow')+' · judge '+(h.judge_mode||'?');
@@ -289,6 +296,15 @@ async function load(){
     rows('drr-cf',(DR.counterfactuals||[]).map(f=>{
       const h=f.hit||{}, m=f.miss||{};
       return `<tr><td>${esc(f.label||f.id)}</td><td class="n">${h.n??0}</td><td class="n">${h.picks??0}</td><td class="n ${cls(h.pick_pnl)}">${fmtUsd(h.pick_pnl)}</td><td class="n">${m.n??0}</td><td class="n">${m.picks??0}</td><td class="n ${cls(m.pick_pnl)}">${fmtUsd(m.pick_pnl)}</td></tr>`;
+    }).join(''));
+  }
+  if(!softErr('rv-err', RV, 'rug_veto unavailable')){
+    const c=RV.counts||{};
+    kv('rv-kv',[['Rows',c.n||0],['Would skip',c.would_skip||0,'warn'],['Would keep',c.would_keep||0,'ok'],['Picks logged',c.picks||0],['Unavailable',c.unavailable||0],['Followers unknown',c.followers_unknown||0]]);
+    $('rv-note').textContent=RV.label||RV.caveat||'shadow, does not gate picks';
+    rows('rv-t',(RV.entries||[]).slice(0,24).map(r=>{
+      const reasons=Array.isArray(r.reasons)?r.reasons.join(', '):(r.reasons||'');
+      return `<tr class="${r.became_pick?'pick':''}"><td>${esc(r.ticker)}</td><td class="n">${r.judge_score==null?'—':(+r.judge_score).toFixed(2)}</td><td class="n">${r.sniper_share==null?'—':(+r.sniper_share).toFixed(2)}</td><td>${r.bundled==1||r.bundled===true?'yes':r.bundled==0||r.bundled===false?'no':'—'}</td><td class="n">${r.followers==null?'—':(+r.followers).toFixed(0)}</td><td>${r.would_skip?'yes':'no'}</td><td class="stat">${esc(reasons)}</td><td>${r.became_pick?'yes':'no'}</td></tr>`;
     }).join(''));
   }
   if(!softErr('pc-err', PC, 'pick_confirm unavailable')){

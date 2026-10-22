@@ -18,6 +18,7 @@ OPS_ENDPOINTS = (
     "/ops",
     "/ops/summary",
     "/ops/desk_rugrisk",
+    "/ops/rug_veto",
     "/ops/pick_confirm",
     "/ops/young_trail",
     "/ops/young_trail_variants",
@@ -40,14 +41,17 @@ def test_ops_html_renders_and_new_endpoints_exist():
     html = client.get("/ops").text
     assert "JEV Ops" in html
     assert 'id="desk-rug"' in html
+    assert 'id="rug-veto"' in html
     assert 'id="pick-confirm"' in html
     assert 'id="drr-err"' in html
+    assert 'id="rv-err"' in html
     assert 'id="pc-err"' in html
     assert "shadow, does not gate picks" in html
     assert "1 row adjusted (bad price mark)" in html or "row adjusted (bad price mark)" in html
     assert "holders_source||'unknown'" in html or 'holders_source||"unknown"' in html
     assert "Oct 20 11:59 PM ET" not in html
     assert "/ops/desk_rugrisk" in html
+    assert "/ops/rug_veto" in html
     assert "/ops/pick_confirm" in html
     assert "/ops/young_trail_variants" in html
     assert "/ops/summary" in html
@@ -60,7 +64,7 @@ def test_ops_html_renders_and_new_endpoints_exist():
 def test_ops_payloads_are_paper_only():
     client = _client()
     for path in (
-        "/ops/desk_rugrisk", "/ops/pick_confirm",
+        "/ops/desk_rugrisk", "/ops/rug_veto", "/ops/pick_confirm",
         "/ops/young_trail", "/ops/young_trail_variants",
     ):
         data = client.get(path).json()
