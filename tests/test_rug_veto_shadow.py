@@ -101,19 +101,87 @@ def test_prepare_timeout_records_unavailable(rvs, monkeypatch):
     assert d["_rug_veto"]["status"] == "unavailable"
 
 
-def test_historical_replay_pepa_prowler_skip(rvs):
+def _seed_real(tmp_path, monkeypatch):
+    """Minimal live-shaped DBs: picks in cycle_history, sniper facts in
+    young_trail_rugrisk, followers in research. Mirrors the Mac data shape."""
+    import sqlite3
+    import desk_rugrisk
+    import rug_veto_shadow
+    seed = tmp_path / "seed"
+    seed.mkdir(exist_ok=True)
+    ch = seed / "cycle_history.db"
+    rs = seed / "research.db"
+    oc = seed / "outcomes.db"
+    monkeypatch.setenv("CYCLE_HISTORY_DB", str(ch))
+    monkeypatch.setenv("RESEARCH_DB", str(rs))
+    monkeypatch.setenv("OUTCOMES_DB", str(oc))
+    desk_rugrisk.reset()
+    rug_veto_shadow.reset()
+    picks = [
+        ("HornMintAAA:1399811149", "HORN", 0.70, 0.75, 8, 1, 36),
+        ("ProwlerMintAAA:1399811149", "PROWLER", 0.61, 0.75, 7, 1, 22),
+        ("ChillMintAAA:1399811149", "CHILL", 0.64, 0.80, 5, 1, 12),
+        ("HellopMintAAA:1399811149", "hellop", 0.62, None, None, None, None),
+    ]
+    c = sqlite3.connect(ch)
+    c.execute("CREATE TABLE tokens (tid TEXT, ticker TEXT, chain TEXT, "
+              "judge_score REAL, judge_verdict TEXT, ts REAL)")
+    for tid, tk, js, *_ in picks:
+        c.execute("INSERT INTO tokens VALUES (?,?,?,?,?,?)",
+                  (tid, tk, "solana", js, "pick", T0))
+    c.commit(); c.close()
+    o = sqlite3.connect(oc)
+    o.execute("CREATE TABLE IF NOT EXISTS young_trail_rugrisk (tid TEXT PRIMARY KEY, "
+              "sniper_share REAL, sniper_wallets INTEGER, bundled INTEGER, status TEXT)")
+    for tid, _tk, _js, sn, sw, b, _f in picks:
+        if sn is not None:
+            o.execute("INSERT INTO young_trail_rugrisk VALUES (?,?,?,?,?)",
+                      (tid, sn, sw, b, "ok"))
+    o.commit(); o.close()
+    r = sqlite3.connect(rs)
+    r.execute("CREATE TABLE token_snapshots (tid TEXT, ts REAL, x_followers INTEGER)")
+    for tid, _tk, _js, _sn, _sw, _b, fol in picks:
+        if fol is not None:
+            r.execute("INSERT INTO token_snapshots VALUES (?,?,?)", (tid, T0, fol))
+    r.commit(); r.close()
+
+
+def test_historical_replay_reads_real_db_facts(rvs, tmp_path, monkeypatch):
+    _seed_real(tmp_path, monkeypatch)
     payload = rvs.replay()
     by = {r["ticker"]: r for r in payload["historical"]}
-    assert by["PEPA"]["would_skip"] is True
-    assert "followers_lt_100" in by["PEPA"]["reasons"]
-    assert by["PROWLER"]["would_skip"] is True
-    assert "sniper_share_ge_50" in by["PROWLER"]["reasons"]
-    assert by["HORN"]["would_skip"] is False
-    assert "followers_unknown" in by["HORN"]["reasons"]
-    assert by["CHILL"]["would_skip"] is False
-    assert "followers_unknown" in by["CHILL"]["reasons"]
+    for name in ("HORN", "PROWLER", "CHILL"):
+        assert by[name]["would_skip"] is True, name
+        assert "sniper_share_ge_50" in by[name]["reasons"], name
+        assert "followers_lt_100" in by[name]["reasons"], name
+        assert by[name]["followers"] is not None
+    # No facts in the DB: stays unknown, never an invented skip.
     assert by["hellop"]["would_skip"] is False
     assert "followers_unknown" in by["hellop"]["reasons"]
+    assert by["hellop"]["sniper_share"] is None
+
+
+def test_replay_never_writes_source_dbs(rvs, tmp_path, monkeypatch):
+    import sqlite3
+    _seed_real(tmp_path, monkeypatch)
+    rvs.replay()
+    names = {r[0] for r in sqlite3.connect(tmp_path / "seed" / "outcomes.db").execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "rug_veto_shadow" not in names
+
+
+def test_prepare_uses_young_trail_rugrisk_before_rpc(rvs, tmp_path, monkeypatch):
+    _seed_real(tmp_path, monkeypatch)
+    import desk_rugrisk
+
+    def boom(*a, **k):
+        raise AssertionError("no RPC when stored sniper facts exist")
+    monkeypatch.setattr(desk_rugrisk, "compute_one", boom)
+    d = {"tid": "HornMintAAA:1399811149", "ticker": "HORN",
+         "x_account": {"followers": 36}}
+    rvs.prepare([(d, {})], deadline=T0 + 600, now=T0)
+    assert d["_rug_veto"]["sniper_share"] == 0.75
+    assert d["_rug_veto"]["followers"] == 36
 
 
 def test_pick_unchanged_when_module_raises(rvs, monkeypatch):
@@ -164,9 +232,9 @@ def test_no_protected_file_mentions():
         assert r.stdout == "", name
 
 
-def test_replay_script_runs(rvs, capsys):
+def test_replay_script_runs(rvs, capsys, tmp_path, monkeypatch):
+    _seed_real(tmp_path, monkeypatch)
     rvs.main()
     out = capsys.readouterr().out
-    assert "PEPA" in out
     assert "PROWLER" in out
     assert "would_skip=True" in out

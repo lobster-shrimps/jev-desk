@@ -32,26 +32,11 @@ STATUS_UNAVAILABLE = "unavailable"
 STATUS_BUDGET = "budget"
 STATUS_NA = "n/a"
 
-# Live-shaped fixtures for the five historical picks. Used when outcomes.db
-# has no row. Numbers come from ops/tests (PEPA followers 40, PROWLER sniper
-# 0.75 bundled). Missing fields stay None so would_skip cannot invent a skip.
-HISTORICAL_PICKS = (
-    {"ticker": "hellop", "tid": "hellop:1399811149", "chain": "solana",
-     "judge_score": 0.70, "sniper_share": None, "bundled": None,
-     "sniper_wallets": None, "followers": None, "became_pick": True},
-    {"ticker": "CHILL", "tid": "CHILL:1399811149", "chain": "solana",
-     "judge_score": 0.64, "sniper_share": None, "bundled": None,
-     "sniper_wallets": None, "followers": None, "became_pick": True},
-    {"ticker": "HORN", "tid": "HornMint111111111111111111111111111111:1399811149",
-     "chain": "solana", "judge_score": 0.72, "sniper_share": None, "bundled": None,
-     "sniper_wallets": None, "followers": None, "became_pick": True},
-    {"ticker": "PROWLER", "tid": "ProwlerMint11111111111111111111111111:1399811149",
-     "chain": "solana", "judge_score": 0.81, "sniper_share": 0.75, "bundled": 1,
-     "sniper_wallets": 8, "followers": None, "became_pick": True},
-    {"ticker": "PEPA", "tid": "PepaMint111111111111111111111111111111:1399811149",
-     "chain": "solana", "judge_score": 0.72, "sniper_share": None, "bundled": None,
-     "sniper_wallets": None, "followers": 40.0, "became_pick": True},
-)
+# The five historical desk picks. Their tid, judge score, sniper share and X
+# followers are read from the live DBs at replay time (cycle_history picks,
+# desk_rugrisk / young_trail_rugrisk, research token_snapshots). Nothing is
+# hard-coded; a missing fact stays None so would_skip cannot invent a skip.
+HISTORICAL_TICKERS = ("hellop", "CHILL", "HORN", "PROWLER", "PEPA")
 
 _tls = threading.local()
 _schema_lock = threading.Lock()
@@ -210,6 +195,105 @@ def _loads(raw) -> dict:
         return {}
 
 
+def _ro(path) -> sqlite3.Connection | None:
+    """Read-only connection. None when the file is missing."""
+    try:
+        p = pathlib.Path(path)
+        if not p.exists():
+            return None
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=LOCK_TIMEOUT_SEC)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as e:
+        log.warning("rug_veto ro open: %s", safe_err(e))
+        return None
+
+
+def _research_followers(tid: str | None):
+    """Latest non-null fxtwitter follower count from research snapshots. Read-only."""
+    if not tid:
+        return None
+    try:
+        import research
+        conn = _ro(research.db_path())
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                """SELECT x_followers FROM token_snapshots
+                   WHERE tid = ? AND x_followers IS NOT NULL
+                   ORDER BY ts DESC LIMIT 1""",
+                (tid,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return _num(row["x_followers"]) if row else None
+    except Exception as e:
+        log.warning("rug_veto research followers: %s", safe_err(e))
+        return None
+
+
+def _yt_rugrisk(tid: str | None) -> dict | None:
+    """young_trail_rugrisk sniper facts for tid. Read-only, no RPC."""
+    if not tid:
+        return None
+    try:
+        import young_trail_rugrisk
+        conn = _ro(young_trail_rugrisk.db_path())
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                """SELECT sniper_share, sniper_wallets, bundled, status
+                   FROM young_trail_rugrisk
+                   WHERE tid = ? AND sniper_share IS NOT NULL""",
+                (tid,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        return {
+            "sniper_share": _num(row["sniper_share"]),
+            "sniper_wallets": _int(row["sniper_wallets"]),
+            "bundled": None if row["bundled"] is None else int(bool(row["bundled"])),
+            "status": STATUS_OK,
+        }
+    except Exception as e:
+        log.warning("rug_veto yt rugrisk: %s", safe_err(e))
+        return None
+
+
+def _historical_picks() -> list[dict]:
+    """Real pick rows for HISTORICAL_TICKERS from cycle_history. Read-only."""
+    out = []
+    try:
+        import cycle_history
+        conn = _ro(cycle_history.db_path())
+        if conn is None:
+            return out
+        try:
+            for name in HISTORICAL_TICKERS:
+                row = conn.execute(
+                    """SELECT tid, ticker, chain, judge_score FROM tokens
+                       WHERE ticker = ? AND judge_verdict = 'pick'
+                       ORDER BY ts DESC LIMIT 1""",
+                    (name,),
+                ).fetchone()
+                if row:
+                    out.append({
+                        "tid": row["tid"], "ticker": row["ticker"],
+                        "chain": row["chain"] or "solana",
+                        "judge_score": _num(row["judge_score"]),
+                        "became_pick": True,
+                    })
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("rug_veto historical picks: %s", safe_err(e))
+    return out
+
+
 def _latest_rugrisk(tid: str | None) -> dict | None:
     if not tid:
         return None
@@ -225,6 +309,20 @@ def _latest_rugrisk(tid: str | None) -> dict | None:
         return rows[0]
     except Exception as e:
         log.warning("rug_veto rugrisk lookup: %s", safe_err(e))
+        return None
+
+
+def _latest_rugrisk_with_sniper(tid: str | None) -> dict | None:
+    try:
+        import desk_rugrisk
+        rows = [r for r in desk_rugrisk.all_rows()
+                if r.get("tid") == tid and r.get("sniper_share") is not None]
+        if not rows:
+            return None
+        rows.sort(key=lambda r: float(r.get("ts") or 0), reverse=True)
+        return rows[0]
+    except Exception as e:
+        log.warning("rug_veto rugrisk sniper lookup: %s", safe_err(e))
         return None
 
 
@@ -257,6 +355,10 @@ def _compute_missing(d: dict, now: float, deadline) -> dict:
     feat = _features_from_row(existing)
     if feat.get("sniper_share") is not None and feat.get("status") == STATUS_OK:
         return feat
+    yt = _yt_rugrisk(tid)
+    if yt:
+        yt["followers"] = feat.get("followers")
+        return yt
     if _remaining(deadline) < MIN_REMAINING_SEC:
         feat["status"] = STATUS_UNAVAILABLE
         return feat
@@ -443,7 +545,19 @@ def replay_row(src: dict) -> dict:
     followers = _followers(src)
     if followers is None:
         followers = _num(blob.get("followers"))
-    decided = decide(src.get("sniper_share"), followers, src.get("status"))
+    if followers is None:
+        followers = _research_followers(src.get("tid"))
+    sniper = _num(src.get("sniper_share"))
+    status = src.get("status")
+    if sniper is None:
+        yt = _yt_rugrisk(src.get("tid"))
+        if yt:
+            sniper = yt["sniper_share"]
+            status = STATUS_OK
+            for k in ("bundled", "sniper_wallets"):
+                if src.get(k) is None:
+                    src = {**src, k: yt.get(k)}
+    decided = decide(sniper, followers, status)
     return {
         "ticker": src.get("ticker"),
         "tid": src.get("tid"),
@@ -475,8 +589,12 @@ def replay(include_historical: bool = True) -> dict:
     seen = {(e.get("ticker") or "").upper() for e in entries if e.get("ticker")}
     historical = []
     if include_historical:
-        for src in HISTORICAL_PICKS:
-            rec = replay_row({**src, "source": "historical"})
+        for src in _historical_picks():
+            dr = _latest_rugrisk_with_sniper(src.get("tid"))
+            merged = {**src, **({k: dr.get(k) for k in (
+                "sniper_share", "sniper_wallets", "bundled", "features_json",
+            )} if dr else {})}
+            rec = replay_row({**merged, "source": "historical"})
             historical.append(rec)
             key = (src.get("ticker") or "").upper()
             if key not in seen:
