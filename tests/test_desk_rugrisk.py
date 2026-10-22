@@ -370,3 +370,20 @@ def test_charge_lock_timeout_does_not_patch(drr, monkeypatch):
         assert feat.get("error") == "charge_lock_timeout"
     finally:
         rug.release_charge_lock()
+
+
+def test_sampler_tick_does_not_hold_charge_lock(drr, monkeypatch):
+    """Sampler tick is not wrapped in the lock; desk can still acquire it."""
+    _desk, rug, _helius = drr
+    held = []
+
+    def during(*_a, **_k):
+        held.append(rug.acquire_charge_lock(timeout=0.05))
+        if held[-1]:
+            rug.release_charge_lock()
+        return 0
+
+    monkeypatch.setattr(rug, "compute_pending", during)
+    out = rug.on_sampler_tick({}, now=T0)
+    assert "entries" in out
+    assert held and held[0] is True

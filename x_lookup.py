@@ -49,6 +49,7 @@ HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 RESERVED_PATHS = {
     "i", "intent", "share", "home", "explore", "search", "settings",
     "compose", "hashtag", "web", "login", "signup", "tos", "privacy",
+    "status",
 }
 TWITTER_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com"}
 
@@ -161,10 +162,10 @@ def reset() -> None:
 
 
 def normalize_handle(raw) -> str | None:
-    """Strip @, x.com/twitter.com URLs and query strings. Reject communities and statuses.
+    """Strip @, x.com/twitter.com URLs and query strings. Reject communities.
 
-    Community links log `x_kind=community` and return None (no profile to fetch).
-    Status links are rejected: they are posts, not accounts.
+    Status / tweet URLs (https://x.com/MarioNawfal/status/...) yield the
+    handle. Community links log `x_kind=community` and return None.
     """
     if raw is None:
         return None
@@ -181,8 +182,6 @@ def normalize_handle(raw) -> str | None:
     lower = s.lower()
     if "/i/communities" in lower or "/i/community/" in lower:
         log.info("x_kind=community raw=%s", s[:160])
-        return None
-    if "/status/" in lower or lower.rstrip("/").endswith("/status"):
         return None
 
     path = s
@@ -212,11 +211,8 @@ def normalize_handle(raw) -> str | None:
         return None
 
     first = path.split("/")[0].lstrip("@")
-    rest = path[len(first):].lower() if "/" in path else ""
     if first.lower() == "i" or "/i/communities" in ("/" + path).lower():
         log.info("x_kind=community raw=%s", s[:160])
-        return None
-    if "/status/" in ("/" + path).lower() or rest.rstrip("/").endswith("/status"):
         return None
     if first.lower() in RESERVED_PATHS:
         return None
@@ -366,6 +362,9 @@ def read_x(handle: str, tid: str | None = None, token: dict | None = None) -> di
         cached, cached_ok = _cache_get(key)
         if cached_ok is True:
             cached = apply_x_kind(cached, token, handle=handle)
+            rec = cache_record(key)
+            if rec and rec.get("fetched_at") is not None:
+                cached["fetched_at"] = rec["fetched_at"]
             _log_lookup(tid, handle, True, cached, cached, "cache", "-",
                         cached.get("x_kind"))
             return cached
@@ -395,6 +394,7 @@ def read_x(handle: str, tid: str | None = None, token: dict | None = None) -> di
             return None
         _cache_put(key, block, ok=True)
         block = apply_x_kind(block, token, handle=handle)
+        block["fetched_at"] = current_time()
         _log_lookup(tid, handle, True, block, block, "fxtwitter", "-",
                     block.get("x_kind"))
         return block
@@ -769,6 +769,90 @@ def _positive_ttl_sec(payload: dict) -> float:
     if not posts:
         return float(NEGATIVE_TTL_SEC)
     return float(POSITIVE_TTL_SEC)
+
+
+def cache_record(handle: str) -> dict | None:
+    """Positive x_cache row → {payload, fetched_at}. Miss/error → None."""
+    key = normalize_handle(handle) or (handle or "").strip().lstrip("@").lower()
+    if not key:
+        return None
+    try:
+        db = _connect()
+        row = db.execute(
+            "SELECT payload_json, ok, fetched_at FROM x_cache WHERE handle = ?",
+            (key.lower(),),
+        ).fetchone()
+        if row is None or int(row["ok"] or 0) != 1:
+            return None
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else None
+        if not isinstance(payload, dict):
+            return None
+        return {"payload": payload, "fetched_at": float(row["fetched_at"])}
+    except Exception as e:
+        log.warning("x cache record: %s", safe_err(e))
+        return None
+
+
+def _num(value, default=None):
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def fresh_followers(d: dict | None) -> dict:
+    """Freshest fxtwitter follower count. One source of truth.
+
+    desk_rugrisk, the rug veto, and pick.summary all call this so PEPA
+    cannot show unknown / 18 / 42 from three stale copies.
+
+    Choice: newest `fetched_at` among (1) x_cache for the parsed handle
+    and (2) dossier x_account when it is a fxtwitter sample. Untimestamped
+    dossier `x_followers` is used only when no fxtwitter sample exists.
+    """
+    empty = {"followers": None, "fetched_at": None, "source": None}
+    d = d if isinstance(d, dict) else {}
+    candidates: list[tuple[float, float, str]] = []
+    handle = None
+    xa = d.get("x_account") if isinstance(d.get("x_account"), dict) else {}
+    for raw in (
+        xa.get("handle"), xa.get("screen_name"), xa.get("username"),
+        d.get("x_handle"),
+    ):
+        handle = normalize_handle(raw)
+        if handle:
+            break
+    if handle:
+        rec = cache_record(handle)
+        if rec:
+            n = _num((rec.get("payload") or {}).get("followers"))
+            ts = _num(rec.get("fetched_at"))
+            if n is not None and ts is not None:
+                candidates.append((ts, n, "fxtwitter"))
+    xa_n = _num(xa.get("followers") if xa.get("followers") is not None
+                else xa.get("followers_count"))
+    xa_ts = _num(xa.get("fetched_at") or xa.get("fetched_ts"))
+    xa_via = str(xa.get("fetched_via") or "")
+    if xa_n is not None and (xa_via == "fxtwitter" or xa_ts is not None):
+        candidates.append((xa_ts if xa_ts is not None else 0.0, xa_n, "fxtwitter"))
+    if candidates:
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        ts, n, src = candidates[0]
+        return {"followers": n, "fetched_at": ts if ts else None, "source": src}
+    fallback = xa_n
+    if fallback is None:
+        fallback = _num(d.get("x_followers"))
+    if fallback is None:
+        fallback = _num(d.get("followers"))
+    if fallback is None:
+        return empty
+    return {
+        "followers": fallback,
+        "fetched_at": _num(d.get("x_followers_ts") or d.get("followers_ts")),
+        "source": "dossier",
+    }
 
 
 def _cache_put(handle: str, payload, ok: bool) -> bool:

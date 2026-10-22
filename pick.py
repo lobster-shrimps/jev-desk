@@ -54,6 +54,28 @@ def _fmt_unknown(value, *, kind="num") -> str:
         return "unknown"
 
 
+def _addr_of(tid) -> str | None:
+    if not tid:
+        return None
+    s = str(tid)
+    return s.split(":", 1)[0] if ":" in s else s
+
+
+def _same_token(row: dict | None, tid: str | None, chain=None) -> bool:
+    """Live match: token address/tid + chain. Never ticker."""
+    if not row or not tid:
+        return False
+    if row.get("tid") == tid:
+        return True
+    addr, row_addr = _addr_of(tid), _addr_of(row.get("tid"))
+    if not addr or not row_addr or addr != row_addr or len(addr) < 8:
+        return False
+    if chain:
+        rc = str(row.get("chain") or "").strip().lower()
+        return not rc or rc == str(chain).strip().lower()
+    return True
+
+
 def _noul_of(ans, name):
     block = (ans or {}).get(name)
     if isinstance(block, dict):
@@ -75,28 +97,71 @@ def _clamp_share(value):
     return n
 
 
-def _followers_and_age(d: dict):
+def _x_raw_refs(d: dict) -> list:
     xa = d.get("x_account") if isinstance(d.get("x_account"), dict) else {}
-    followers = d.get("x_followers")
-    if followers is None:
-        followers = xa.get("followers")
-        if followers is None:
-            followers = xa.get("followers_count")
-    age = xa.get("account_age_days")
-    if age is None:
-        age = d.get("account_age_days")
-    return followers, age
+    refs = []
+    for key in ("handle", "screen_name", "username", "userName", "url"):
+        raw = xa.get(key)
+        if raw is None and key == "handle":
+            raw = d.get("x_handle")
+        if raw is not None and raw != "":
+            refs.append(raw)
+    for key in ("x_handle", "x_url", "twitter"):
+        raw = d.get(key)
+        if raw is not None and raw != "":
+            refs.append(raw)
+    return refs
 
 
 def _x_handle(d: dict) -> str | None:
+    """Profile handle, including https://x.com/Name/status/... → Name."""
+    try:
+        import x_lookup
+        for raw in _x_raw_refs(d):
+            parsed = x_lookup.normalize_handle(raw)
+            if parsed:
+                return parsed
+    except Exception as e:
+        log.warning("x handle parse: %s", safe_err(e))
     xa = d.get("x_account") if isinstance(d.get("x_account"), dict) else {}
     for key in ("handle", "screen_name", "username", "userName"):
         raw = xa.get(key) if xa.get(key) is not None else d.get(f"x_{key}")
         if raw is None and key == "handle":
             raw = d.get("x_handle")
-        if isinstance(raw, str) and raw.strip():
+        if isinstance(raw, str) and raw.strip() and "/" not in raw and ":" not in raw:
             return raw.strip().lstrip("@")
     return None
+
+
+def _linked_x_post(d: dict) -> bool:
+    for raw in _x_raw_refs(d):
+        s = str(raw).lower()
+        if "/status/" in s or s.rstrip("/").endswith("/status"):
+            return True
+        if "x.com/" in s or "twitter.com/" in s:
+            return True
+    return False
+
+
+def _followers_and_age(d: dict):
+    """Followers from the freshest fxtwitter sample. See x_lookup.fresh_followers."""
+    xa = d.get("x_account") if isinstance(d.get("x_account"), dict) else {}
+    followers = None
+    try:
+        import x_lookup
+        rec = x_lookup.fresh_followers(d)
+        followers = rec.get("followers")
+    except Exception as e:
+        log.warning("fresh followers: %s", safe_err(e))
+        followers = d.get("x_followers")
+        if followers is None:
+            followers = xa.get("followers")
+            if followers is None:
+                followers = xa.get("followers_count")
+    age = xa.get("account_age_days")
+    if age is None:
+        age = d.get("account_age_days")
+    return followers, age
 
 
 def _handle_matches_token(handle: str | None, ticker: str | None) -> bool:
@@ -171,8 +236,9 @@ def _rug_bits(d: dict) -> dict:
         try:
             import desk_rugrisk
             tid = d.get("tid")
+            chain = d.get("chain")
             for row in desk_rugrisk.all_rows():
-                if row.get("tid") == tid:
+                if _same_token(row, tid, chain):
                     bundled = row.get("bundled")
                     try:
                         import young_trail_rugrisk
@@ -232,7 +298,10 @@ def social_tail(d, ans) -> str:
         )
     elif followers is not None and followers != "":
         handle = _x_handle(d)
-        handle_s = f"@{handle}" if handle else "@unknown"
+        if handle:
+            handle_s = f"@{handle}"
+        else:
+            handle_s = "linked x post"
         try:
             n_fol = int(float(followers))
         except (TypeError, ValueError):

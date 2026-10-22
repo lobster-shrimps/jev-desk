@@ -298,6 +298,14 @@ def _skip_helius_reserve(now: float | None = None) -> bool:
 
 
 def _followers(d: dict) -> float | None:
+    """Freshest fxtwitter count. Same helper as the rug veto and judge text."""
+    try:
+        import x_lookup
+        rec = x_lookup.fresh_followers(d)
+        if rec.get("followers") is not None:
+            return _num(rec.get("followers"))
+    except Exception as e:
+        log.warning("desk_rugrisk followers: %s", safe_err(e))
     n = _num(d.get("x_followers"))
     if n is not None:
         return n
@@ -388,11 +396,22 @@ def enqueue(d, verdict, score, ts, ans=None) -> bool:
         stage = "pick" if str(verdict or "") == "pick" else "judged"
         mint, net = parse_tid(tid)
         guards = shadow_guards(d, ans=ans)
+        fol_ts = None
+        fol_src = None
+        try:
+            import x_lookup
+            rec = x_lookup.fresh_followers(d)
+            fol_ts = rec.get("fetched_at")
+            fol_src = rec.get("source")
+        except Exception:
+            pass
         blob = {
             "shadow_guards": {k: guards.get(k) for k in (
                 FLAG_FOLLOWERS, FLAG_SNIPER, FLAG_DEV, FLAG_RECYCLED,
             )},
             "followers": guards.get("followers"),
+            "followers_ts": fol_ts,
+            "followers_source": fol_src,
             "dev_holding_pct": guards.get("dev_holding_pct"),
             "recycled_account": guards.get("recycled_account"),
             "mint": mint,

@@ -139,13 +139,17 @@ def test_normalize_rejects_community_and_logs(caplog):
     assert "x_kind=community" in caplog.text
 
 
-def test_normalize_rejects_status_urls():
+def test_normalize_parses_status_urls_to_handle():
     assert x_lookup.normalize_handle(
-        "https://x.com/LuffyX100X/status/2102659581109272876") is None
+        "https://x.com/MarioNawfal/status/2102659581109272876") == "MarioNawfal"
     assert x_lookup.normalize_handle(
-        "LuffyX100X/status/2102659581109272876") is None
+        "https://x.com/LuffyX100X/status/2102659581109272876") == "LuffyX100X"
     assert x_lookup.normalize_handle(
-        "https://twitter.com/foo/status/1") is None
+        "LuffyX100X/status/2102659581109272876") == "LuffyX100X"
+    assert x_lookup.normalize_handle(
+        "https://twitter.com/foo/status/1") == "foo"
+    assert x_lookup.normalize_handle("https://x.com/i/status/1") is None
+    assert x_lookup.normalize_handle("https://x.com/status/1") is None
 
 
 def test_clean_handle_gt_path_unchanged():
