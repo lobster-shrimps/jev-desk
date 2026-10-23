@@ -36,6 +36,7 @@ def isolate_outcomes(tmp_path, monkeypatch):
     import desk_rugrisk
     import pick_confirm_shadow
     import rug_veto_shadow
+    import legacy_shadow_track
     gt_api.reset()
     outcomes.reset()
     desk_rugrisk.reset()
@@ -44,6 +45,8 @@ def isolate_outcomes(tmp_path, monkeypatch):
     pick_confirm_shadow.set_time_fn(None)
     rug_veto_shadow.reset()
     rug_veto_shadow.set_time_fn(None)
+    legacy_shadow_track.reset()
+    legacy_shadow_track.set_time_fn(None)
     outcomes.set_time_fn(None)
     outcomes.set_sleep_fn(lambda _d: None)
 
@@ -64,6 +67,8 @@ def isolate_outcomes(tmp_path, monkeypatch):
     pick_confirm_shadow.set_time_fn(None)
     rug_veto_shadow.reset()
     rug_veto_shadow.set_time_fn(None)
+    legacy_shadow_track.reset()
+    legacy_shadow_track.set_time_fn(None)
     backtest_signals.reset()
     backtest_signals.set_time_fn(None)
 

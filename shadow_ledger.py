@@ -321,8 +321,35 @@ def close(address: str, network_id: int, current_price: float = None, reason: st
                  pos["ticker"], current_price, realized_pnl_usd, realized_pnl_pct, reason)
     else:
         log.info("shadow close %s with stale price, PnL unmeasured, reason=%s", pos["ticker"], reason)
-    
+    _maybe_legacy_track(pos, close_record)
     return close_record
+
+
+def _maybe_legacy_track(pos: dict, close_record: dict) -> None:
+    """Log-only: keep marking a tp_50 close until the legacy rule resolves."""
+    try:
+        policy = close_record.get("exit_policy") or pos.get("exit_policy") or EXIT_POLICY_LEGACY
+        if policy != EXIT_POLICY_TP50:
+            return
+        import legacy_shadow_track as lst
+        entry_ts = _parse_ts(pos.get("ts"))
+        lst.on_tp50_policy_close(
+            source=lst.SOURCE_LEDGER,
+            key=f"{close_record.get('address')}:{close_record.get('network_id')}:{entry_ts}",
+            ticker=pos.get("ticker"),
+            address=close_record.get("address"),
+            network_id=close_record.get("network_id"),
+            tid=f"{close_record.get('address')}:{close_record.get('network_id')}",
+            entry_price=pos.get("entry_price_usd"),
+            entry_ts=entry_ts,
+            size_usd=pos.get("size_usd") or SHADOW_TICKET_USD,
+            tp50_exit_price=close_record.get("exit_price_usd"),
+            tp50_exit_ts=time.time(),
+            tp50_pnl=close_record.get("realized_pnl_usd"),
+            tp50_reason=close_record.get("reason"),
+        )
+    except Exception as e:
+        log.warning("legacy shadow track: %s", safe_err(e))
 
 
 def open_positions() -> list[dict]:
@@ -450,34 +477,47 @@ def mark_all_open_positions(fomo_client) -> dict:
         dict with counts: marked, closed, stale
     """
     opens = open_positions()
-    if not opens:
+    legacy_pending = []
+    try:
+        import legacy_shadow_track as lst
+        legacy_pending = lst.pending_tracks()
+    except Exception as e:
+        log.warning("legacy pending: %s", safe_err(e))
+
+    if not opens and not legacy_pending:
         return {"marked": 0, "closed": 0, "stale": 0}
-    
-    # Build list of tids for FOMO fetch
+
+    # One FOMO batch for open fills plus the few post-tp_50 legacy tracks.
     tids = [f"{pos['address']}:{pos['network_id']}" for pos in opens]
-    
+    for row in legacy_pending:
+        tid = row.get("tid")
+        if not tid and row.get("address") is not None and row.get("network_id") is not None:
+            tid = f"{row['address']}:{row['network_id']}"
+        if tid and tid not in tids:
+            tids.append(tid)
+
     # Fetch fresh data from FOMO (cheap, not GeckoTerminal)
     try:
-        fomo_data = fomo_client.tokens(tids)
+        fomo_data = fomo_client.tokens(tids) if tids else {}
     except Exception as e:
-        log.warning("failed to fetch FOMO data for shadow positions: %s", e)
+        log.warning("failed to fetch FOMO data for shadow positions: %s", safe_err(e))
         fomo_data = {}
-    
+
     marked_count = 0
     closed_count = 0
     stale_count = 0
-    
+
     for pos in opens:
         tid = f"{pos['address']}:{pos['network_id']}"
-        token_data = fomo_data.get(tid, {})
-        
+        token_data = fomo_data.get(tid, {}) if isinstance(fomo_data, dict) else {}
+
         price = token_data.get("price")
         vol24 = token_data.get("vol24")
-        
+
         # Mark position (checks time stop, stop-loss, take-profit)
-        result = mark(pos["address"], pos["network_id"], 
+        result = mark(pos["address"], pos["network_id"],
                      current_price=price, volume_h24=vol24)
-        
+
         if result:
             if result["action"] == "close":
                 closed_count += 1
@@ -485,6 +525,12 @@ def mark_all_open_positions(fomo_client) -> dict:
                 stale_count += 1
             else:
                 marked_count += 1
-    
+
+    try:
+        import legacy_shadow_track as lst
+        lst.mark_pending(fomo_data if isinstance(fomo_data, dict) else {}, now=time.time())
+    except Exception as e:
+        log.warning("legacy mark: %s", safe_err(e))
+
     log.info("shadow mark: %d marked, %d closed, %d stale", marked_count, closed_count, stale_count)
     return {"marked": marked_count, "closed": closed_count, "stale": stale_count}

@@ -161,6 +161,22 @@ def _init_schema(db: sqlite3.Connection) -> None:
         _schema_step(db, "exit_policy", lambda: db.execute(
             "ALTER TABLE pick_confirm ADD COLUMN exit_policy TEXT"
         ))
+    if "legacy_exit_reason" not in cols:
+        _schema_step(db, "legacy_exit_reason", lambda: db.execute(
+            "ALTER TABLE pick_confirm ADD COLUMN legacy_exit_reason TEXT"
+        ))
+    if "legacy_exit_price" not in cols:
+        _schema_step(db, "legacy_exit_price", lambda: db.execute(
+            "ALTER TABLE pick_confirm ADD COLUMN legacy_exit_price REAL"
+        ))
+    if "legacy_exit_ts" not in cols:
+        _schema_step(db, "legacy_exit_ts", lambda: db.execute(
+            "ALTER TABLE pick_confirm ADD COLUMN legacy_exit_ts REAL"
+        ))
+    if "legacy_pnl" not in cols:
+        _schema_step(db, "legacy_pnl", lambda: db.execute(
+            "ALTER TABLE pick_confirm ADD COLUMN legacy_pnl REAL"
+        ))
 
 
 def _num(value, default=None):
@@ -484,6 +500,8 @@ def _apply_mark(row: dict, price, now: float) -> str:
             (exit_px, now, reason, pnl, exit_px, now, row["tid"], row["first_ts"]),
         )
         db.commit()
+        if policy == EXIT_POLICY_TP50:
+            _maybe_legacy_on_close(row, px, now, entry)
         return "closed"
     if px is None or px <= 0:
         return "stale"
@@ -496,16 +514,109 @@ def _apply_mark(row: dict, price, now: float) -> str:
     return "marked"
 
 
+def _maybe_legacy_on_close(row: dict, price, now: float, entry) -> None:
+    """Record legacy fields now, or leave them null so mark_open keeps tracking."""
+    try:
+        if row.get("legacy_exit_ts") is not None:
+            return
+        import legacy_shadow_track as lst
+        entry_ts = float(row.get("confirm_ts") or now)
+        decision = lst.decide_legacy(entry, entry_ts, price, now)
+        if not decision:
+            return
+        _write_legacy(row, decision, now)
+    except Exception as e:
+        log.warning("pick_confirm legacy close: %s", safe_err(e))
+
+
+def _write_legacy(row: dict, decision: dict, now: float) -> None:
+    try:
+        db = _connect()
+        px = decision.get("legacy_exit_price")
+        db.execute(
+            """UPDATE pick_confirm SET
+                 legacy_exit_reason = ?, legacy_exit_price = ?,
+                 legacy_exit_ts = ?, legacy_pnl = ?,
+                 last_mark = COALESCE(?, last_mark),
+                 last_mark_ts = ?
+               WHERE tid = ? AND first_ts = ?""",
+            (
+                decision.get("legacy_exit_reason"),
+                px,
+                decision.get("legacy_exit_ts"),
+                decision.get("legacy_pnl"),
+                px, now, row["tid"], row["first_ts"],
+            ),
+        )
+        db.commit()
+    except Exception as e:
+        log.warning("pick_confirm legacy write: %s", safe_err(e))
+
+
+def _apply_legacy_mark(row: dict, price, now: float) -> str:
+    if row.get("legacy_exit_ts") is not None:
+        return "skip"
+    entry = _num(row.get("entry_price") or row.get("confirm_price"))
+    entry_ts = _num(row.get("confirm_ts"), now)
+    if entry is None or entry <= 0:
+        return "skip"
+    try:
+        import legacy_shadow_track as lst
+        decision = lst.decide_legacy(entry, entry_ts, price, now)
+    except Exception as e:
+        log.warning("pick_confirm legacy decide: %s", safe_err(e))
+        return "stale" if price is None else "marked"
+    if decision:
+        _write_legacy(row, decision, now)
+        return "legacy_resolved"
+    px = _num(price)
+    if px is None or px <= 0:
+        return "stale"
+    try:
+        db = _connect()
+        db.execute(
+            """UPDATE pick_confirm SET last_mark = ?, last_mark_ts = ?
+               WHERE tid = ? AND first_ts = ?""",
+            (px, now, row["tid"], row["first_ts"]),
+        )
+        db.commit()
+    except Exception as e:
+        log.warning("pick_confirm legacy mark: %s", safe_err(e))
+    return "marked"
+
+
+def _markable_rows() -> list[dict]:
+    db = _connect()
+    try:
+        rows = db.execute(
+            """SELECT * FROM pick_confirm
+               WHERE status = ?
+                 AND (exit_ts IS NULL
+                      OR (COALESCE(exit_policy, '') = ?
+                          AND legacy_exit_ts IS NULL))""",
+            (STATUS_CONFIRMED, EXIT_POLICY_TP50),
+        ).fetchall()
+        return [_row(r) for r in rows]
+    except Exception as e:
+        log.warning("pick_confirm markable: %s", safe_err(e))
+        try:
+            rows = db.execute(
+                """SELECT * FROM pick_confirm
+                   WHERE status = ? AND exit_ts IS NULL""",
+                (STATUS_CONFIRMED,),
+            ).fetchall()
+            return [_row(r) for r in rows]
+        except Exception as e2:
+            log.warning("pick_confirm markable fallback: %s", safe_err(e2))
+            return []
+
+
 def mark_open(fomo_client=None, now: float | None = None) -> dict:
-    """MTM confirmed opens. Same $50 / 6h / -30% / +100% as main shadow."""
-    out = {"marked": 0, "closed": 0, "stale": 0}
+    """MTM confirmed opens plus pending legacy tracks. Same FOMO batch."""
+    out = {"marked": 0, "closed": 0, "stale": 0, "legacy_resolved": 0}
     try:
         ts = current_time() if now is None else float(now)
-        opens = [_row(r) for r in _connect().execute(
-            """SELECT * FROM pick_confirm
-               WHERE status = ? AND exit_ts IS NULL""",
-            (STATUS_CONFIRMED,),
-        ).fetchall()]
+        opens = _markable_rows()
         if not opens:
             return out
         prices = {}
@@ -520,7 +631,10 @@ def mark_open(fomo_client=None, now: float | None = None) -> dict:
         for row in opens:
             bag = prices.get(row.get("tid")) or {}
             px = _price_of(bag) if bag else None
-            kind = _apply_mark(row, px, ts)
+            if row.get("exit_ts") is not None:
+                kind = _apply_legacy_mark(row, px, ts)
+            else:
+                kind = _apply_mark(row, px, ts)
             if kind in out:
                 out[kind] += 1
         return out
@@ -588,6 +702,12 @@ def _real_picks_pnl() -> dict:
 def ops_payload() -> dict:
     try:
         c = counts()
+        compare = {}
+        try:
+            import legacy_shadow_track as lst
+            compare = lst.comparison_summary()
+        except Exception as e:
+            log.warning("pick_confirm legacy compare: %s", safe_err(e))
         return {
             "paper": True,
             "simulated": True,
@@ -604,6 +724,7 @@ def ops_payload() -> dict:
             "counts": c,
             "confirmed_pnl": c["confirmed_pnl"],
             "real_picks": _real_picks_pnl(),
+            "legacy_compare": compare,
             "label": "required for shadow fills · no live orders",
             "entries": all_rows()[:80],
         }

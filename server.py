@@ -455,11 +455,17 @@ def api_shadow_ledger():
     Return shadow PnL ledger: open positions, closed positions, summary.
     All data is hypothetical and labeled as such.
     """
-    return JSONResponse({
+    payload = {
         "open_positions": shadow_ledger.open_positions(),
         "closed_positions": shadow_ledger.closed_positions(limit=50),
-        "summary": shadow_ledger.summary()
-    })
+        "summary": shadow_ledger.summary(),
+    }
+    try:
+        import legacy_shadow_track
+        payload["legacy_compare"] = legacy_shadow_track.comparison_summary()
+    except Exception as e:
+        log.warning("legacy_compare: %s", safe_err(e))
+    return JSONResponse(payload)
 
 
 @app.get("/api/fomo_status")

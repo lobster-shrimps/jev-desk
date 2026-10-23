@@ -75,6 +75,9 @@ tr.pick td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
   <div class="kv" id="desk-kv"></div>
   <h2>Shadow picks &amp; fills</h2>
   <div class="scroll"><table id="shadow-t"><thead><tr><th>Ticker</th><th>Status</th><th>Confirm</th><th class="n">Sniper</th><th class="n">Entry</th><th class="n">Exit</th><th class="n">P&amp;L</th><th>Reason</th></tr></thead><tbody></tbody></table></div>
+  <h2 style="margin-top:16px">tp_50 vs legacy <small>same entries · both resolved · log-only</small></h2>
+  <div class="kv" id="leg-kv"></div>
+  <div class="note" id="leg-note">Log-only. Counts rows where both exits are resolved. Pending = tp_50 closed, legacy still open.</div>
   <h2 style="margin-top:16px">Judge scores ≥ 0.60 <small>cutoff 0.6 · conf 0.55</small></h2>
   <div class="scroll"><table id="judge-t"><thead><tr><th>Time</th><th>Ticker</th><th class="n">Score</th><th class="n">Conf</th><th>Verdict</th><th class="n">Holders</th><th>Source</th><th>Dev sold</th></tr></thead><tbody></tbody></table></div>
 </section>
@@ -284,7 +287,10 @@ async function load(){
       const sn=rug&&rug.sniper_share!=null?(+rug.sniper_share).toFixed(2):'—';
       return `<tr><td>${esc(p.ticker)}</td><td>${p._s}</td><td class="stat">${esc(st)}</td><td class="n">${sn}</td><td class="n">${fmtPx(p.entry_price_usd)}</td><td class="n">${fmtPx(p.exit_price_usd)}</td><td class="n ${cls(p.realized_pnl_usd)}">${fmtUsd(p.realized_pnl_usd)}</td><td class="stat">${esc(p.reason||'')}</td></tr>`;
     }).join(''));
-    $('desk-sub').textContent=`shadow closed ${SL.summary?.closed_trades_count??0}`;}
+    $('desk-sub').textContent=`shadow closed ${SL.summary?.closed_trades_count??0}`;
+    const lc=SL.legacy_compare||{};const tp=lc.tp_50||{};const lg=lc.legacy||{};
+    kv('leg-kv',[['tp_50 closed',tp.closed_count??0],['tp_50 wins',tp.wins??0],['tp_50 P&L',fmtUsd(tp.realized_pnl_usd),cls(tp.realized_pnl_usd)],['legacy closed',lg.closed_count??0],['legacy wins',lg.wins??0],['legacy P&L',fmtUsd(lg.realized_pnl_usd),cls(lg.realized_pnl_usd)],['legacy pending',lc.pending_count??0]]);
+    $('leg-note').textContent='Log-only. Same entries; both resolved. Pending = tp_50 closed, legacy still open.';}
   if(!softErr('drr-err', DR, 'desk_rugrisk unavailable')){
     const c=DR.counts||{}, bud=DR.budget||{};
     kv('drr-kv',[['Budget ET',`${bud.day_used??0}/${bud.day_cap??600}`],['ok',c.ok||0,'ok'],['pending',c.pending||0],['error',c.error||0,'bad'],['picks',c.picks||0,'warn']]);
