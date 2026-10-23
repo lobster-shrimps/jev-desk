@@ -212,20 +212,19 @@ def test_shadow_ledger_mark_and_pnl():
     fomo_data = {"price": entry_price}
     shadow_ledger.entry(order, fomo_data)
     
-    # Mark at higher price (profit, but not enough to trigger take-profit)
-    current_price = 0.00015  # 50% gain (take-profit is 100%)
+    # New fills use tp_50: +60% is an exit. Legacy +100% is logged alongside.
+    current_price = 0.00016  # 60% gain
     mark_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=4000)
     
-    # Should stay open (no exit condition met)
     assert mark_record is not None
-    assert mark_record["action"] == "mark"
-    assert mark_record["unrealized_pnl_pct"] == pytest.approx(50.0, rel=0.01)
-    assert mark_record["unrealized_pnl_usd"] == pytest.approx(25.0, rel=0.01)
-    assert not mark_record.get("stale")
-    
-    # Position still open
-    opens = shadow_ledger.open_positions()
-    assert len(opens) == 1
+    assert mark_record["action"] == "close"
+    assert "tp_50" in mark_record["reason"]
+    assert mark_record["realized_pnl_pct"] == pytest.approx(60.0, rel=0.01)
+    assert mark_record["realized_pnl_usd"] == pytest.approx(30.0, rel=0.01)
+    assert mark_record.get("exit_policy") == "tp_50"
+    assert mark_record.get("legacy_would_exit") is False
+    assert mark_record.get("legacy_take_profit_pct") == 100.0
+    assert shadow_ledger.open_positions() == []
 
 
 def test_shadow_ledger_exit_on_stop_loss():
@@ -267,19 +266,66 @@ def test_shadow_ledger_exit_on_take_profit():
     }
     shadow_ledger.entry(order, {"price": 0.0001})
     
-    # Mark at much higher price (triggers take-profit at +100%)
-    current_price = 0.00025  # 150% gain (take-profit is 100%)
+    # New tp_50 fills also close well above +50%.
+    current_price = 0.00025  # 150% gain
     
     close_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=50000)
     
     assert close_record is not None
     assert close_record["action"] == "close"
-    assert "take_profit" in close_record["reason"]
+    assert "tp_50" in close_record["reason"] or "take_profit" in close_record["reason"]
     assert close_record["realized_pnl_pct"] == pytest.approx(150.0, rel=0.01)
+    assert close_record.get("exit_policy") == "tp_50"
     
     # Position closed
     opens = shadow_ledger.open_positions()
     assert len(opens) == 0
+
+
+def test_shadow_ledger_legacy_open_keeps_old_exit(clean_ledger):
+    """Existing positions without exit_policy keep +100% take-profit."""
+    ledger = shadow_ledger.LEDGER_PATH
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "action": "entry",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ticker": "OLD",
+        "address": "legacy1",
+        "network_id": 1399811149,
+        "chain": "solana",
+        "entry_price_usd": 0.0001,
+        "last_price_usd": 0.0001,
+        "size_usd": 50.0,
+        "size_tokens": 500000.0,
+    }
+    with ledger.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+    mark = shadow_ledger.mark("legacy1", 1399811149, current_price=0.00016)
+    assert mark["action"] == "mark"
+    assert mark["unrealized_pnl_pct"] == pytest.approx(60.0, rel=0.01)
+    assert mark.get("tp50_would_exit") is True
+    assert mark.get("legacy_would_exit") is False
+    assert mark.get("exit_policy") == "legacy"
+    assert len(shadow_ledger.open_positions()) == 1
+
+
+def test_new_pick_exits_tp50_and_logs_legacy(clean_ledger):
+    order = {
+        "token": {"ticker": "NEW", "address": "new1", "network_id": 1399811149,
+                  "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0",
+    }
+    entry = shadow_ledger.entry(order, {"price": 0.001})
+    assert entry["exit_policy"] == "tp_50"
+    mid = shadow_ledger.mark("new1", 1399811149, current_price=0.0014)
+    assert mid["action"] == "mark"
+    assert mid["tp50_would_exit"] is False
+    assert mid["legacy_would_exit"] is False
+    hit = shadow_ledger.mark("new1", 1399811149, current_price=0.0016)
+    assert hit["action"] == "close"
+    assert "tp_50" in hit["reason"]
+    assert hit["realized_pnl_usd"] == pytest.approx(30.0, rel=0.01)
+    assert hit.get("legacy_would_exit") is False
 
 
 def test_shadow_ledger_manual_close():

@@ -80,12 +80,15 @@ def test_record_and_ops_do_not_gate(rvs):
     assert row["became_pick"] is True
     payload = rvs.ops_payload()
     assert payload["gates_picks"] is False
+    assert payload["gates_shadow_fills"] is True
     assert payload["paper"] is True
+    assert payload["live_orders"] is False
     from fastapi.testclient import TestClient
     import server
     resp = TestClient(server.app).get("/ops/rug_veto")
     assert resp.status_code == 200
     assert resp.json()["gates_picks"] is False
+    assert resp.json()["gates_shadow_fills"] is True
 
 
 def test_prepare_timeout_records_unavailable(rvs, monkeypatch):
@@ -273,6 +276,94 @@ def test_replay_reads_young_trail_rugrisk_by_address(rvs, tmp_path, monkeypatch)
     assert rec["sniper_wallets"] == 6
     assert rec["bundled"] in (0, False)
     ytr.reset()
+
+
+def test_apply_to_pick_skips_and_fail_open(rvs):
+    picked = {
+        "tid": "ProwlerMint:1399811149", "ticker": "PROWLER",
+        "addr": "ProwlerMint", "chain": "solana",
+        "_rug_veto": {"sniper_share": 0.75, "bundled": 1, "followers": 500,
+                      "status": "ok"},
+    }
+    order = {"token": {"ticker": "PROWLER", "address": "ProwlerMint",
+                       "network_id": 1399811149}}
+    out = rvs.apply_to_pick(order, [(picked, {})])
+    assert out["skipped"] is True
+    assert out["vetoed"] is True
+    assert "sniper_share_ge_50" in out["reasons"]
+
+    thin = {
+        "tid": "PepaMint:1399811149", "ticker": "PEPA",
+        "addr": "PepaMint", "chain": "solana",
+        "x_account": {"handle": "PEPA", "followers": 40},
+        "_rug_veto": {"sniper_share": 0.1, "followers": 40, "status": "ok"},
+    }
+    order2 = {"token": {"ticker": "PEPA", "address": "PepaMint",
+                        "network_id": 1399811149}}
+    out2 = rvs.apply_to_pick(order2, [(thin, {})])
+    assert out2["skipped"] is True
+    assert "followers_lt_100" in out2["reasons"]
+
+    missing = {
+        "tid": "CleanMint:1399811149", "ticker": "CLEAN",
+        "addr": "CleanMint", "chain": "solana",
+        "_rug_veto": {"status": "unavailable"},
+    }
+    order3 = {"token": {"ticker": "CLEAN", "address": "CleanMint",
+                        "network_id": 1399811149}}
+    out3 = rvs.apply_to_pick(order3, [(missing, {})])
+    assert out3["skipped"] is False
+    assert "veto_unknown" in out3["reasons"]
+
+    def boom(*_a, **_k):
+        raise RuntimeError("veto exploded api-key=SECRET123")
+
+    rvs._prepared["x"] = {}
+    out4 = rvs.apply_to_pick(None, [])
+    assert out4["skipped"] is False
+
+
+def test_record_vetoed_pick_and_ops_lists_it(rvs):
+    d = {
+        "tid": "A:1399811149", "ticker": "PROWLER", "chain": "solana",
+        "addr": "A", "net": 1399811149,
+        "_rug_veto": {"sniper_share": 0.75, "bundled": 1, "followers": 400,
+                      "status": "ok"},
+    }
+    stats = {"tokens": [{
+        "tid": "A:1399811149", "ticker": "PROWLER", "chain": "solana",
+        "stage": "judged", "judge_score": 0.81, "judge_verdict": "pick",
+    }]}
+    order = {"token": {"ticker": "PROWLER", "address": "A", "network_id": 1399811149}}
+    vetoed = rvs.apply_to_pick(order, [(d, {})])
+    assert vetoed["skipped"] is True
+    n = rvs.record(stats, [(d, {})], order, vetoed=vetoed, now=T0)
+    assert n == 1
+    row = rvs.all_rows()[0]
+    assert row["vetoed"] is True
+    assert row["would_skip"] is True
+    assert row["became_pick"] is True
+    assert "sniper_share_ge_50" in row["reasons"]
+    payload = rvs.ops_payload()
+    assert payload["counts"]["vetoed"] == 1
+    assert payload["vetoed"]
+    assert payload["vetoed"][0]["ticker"] == "PROWLER"
+
+
+def test_apply_to_pick_errors_fail_open(rvs, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    def boom(*_a, **_k):
+        raise RuntimeError("https://example/?api-key=LEAKME")
+    monkeypatch.setattr(rvs, "decide", boom)
+    d = {
+        "tid": "A:1399811149", "ticker": "X", "addr": "A",
+        "_rug_veto": {"sniper_share": 0.9, "followers": 10, "status": "ok"},
+    }
+    order = {"token": {"ticker": "X", "address": "A", "network_id": 1}}
+    out = rvs.apply_to_pick(order, [(d, {})])
+    assert out["skipped"] is False
+    assert "veto_unknown" in out["reasons"]
+    assert "LEAKME" not in caplog.text
 
 
 def test_borrowed_followers_do_not_skip(rvs):
