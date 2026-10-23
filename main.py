@@ -1006,6 +1006,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # All survivors (including single survivor) go through pick gates.
     # History is written after pick so judged rows carry the pick/pass/error verdict.
     order = None
+    vetoed = None
     if survivors:
         captured = {}
         def _capturing_judge(qs, state):
@@ -1038,15 +1039,36 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             )
         except Exception as e:
             log.warning("judge verdicts: %s", safe_err(e))
+        vetoed = None
         try:
             import rug_veto_shadow
-            rug_veto_shadow.record(stats, survivors, order, now=cycle_start)
+            vetoed = rug_veto_shadow.apply_to_pick(order, survivors)
+            if vetoed.get("skipped"):
+                log.info(
+                    "rug_veto skip ticker=%s tid=%s reasons=%s paper=1",
+                    vetoed.get("ticker") or "?", vetoed.get("tid") or "?",
+                    ",".join(str(r) for r in (vetoed.get("reasons") or [])),
+                )
+                stats["rug_veto_skipped"] = True
+                stats["rug_veto_reasons"] = list(vetoed.get("reasons") or [])
+        except Exception as e:
+            log.warning("rug_veto_shadow apply: %s", safe_err(e))
+            vetoed = {"skipped": False, "reasons": ["veto_unknown"]}
+        try:
+            import rug_veto_shadow
+            rug_veto_shadow.record(
+                stats, survivors, order, vetoed=vetoed, now=cycle_start,
+            )
         except Exception as e:
             log.warning("rug_veto_shadow: %s", safe_err(e))
 
     try:
         import pick_confirm_shadow
-        pick_confirm_shadow.on_cycle(stats, survivors, now=cycle_start)
+        pick_confirm_shadow.on_cycle(
+            stats, survivors,
+            vetoed=vetoed if vetoed and vetoed.get("skipped") else None,
+            now=cycle_start,
+        )
     except Exception as e:
         log.warning("pick_confirm_shadow: %s", safe_err(e))
 
@@ -1077,24 +1099,34 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                     break
         recorded = None
         allowed = True
-        try:
-            import pick_confirm_shadow
-            allowed = pick_confirm_shadow.fill_allowed(order)
-        except Exception as e:
-            log.warning("shadow fill confirm: %s", safe_err(e))
-        if allowed:
-            try:
-                recorded = desk.log_shadow(order, stats, fomo_data=picked_row)
-            except Exception as e:
-                log.warning("log_shadow: %s", safe_err(e))
-            stats["shadow_order"] = order
-            stats["shadow_recorded"] = bool(recorded)
-        else:
-            log.info("shadow fill deferred pending_confirm ticker=%s paper=1",
-                     picked_token.get("ticker"))
+        veto_hold = bool(vetoed and vetoed.get("skipped"))
+        if veto_hold:
+            allowed = False
+            log.info("shadow fill vetoed ticker=%s reasons=%s paper=1",
+                     picked_token.get("ticker"),
+                     ",".join(str(r) for r in (vetoed.get("reasons") or [])))
             stats["shadow_order"] = None
             stats["shadow_recorded"] = False
-            stats["confirm_held"] = True
+            stats["rug_veto_held"] = True
+        else:
+            try:
+                import pick_confirm_shadow
+                allowed = pick_confirm_shadow.fill_allowed(order)
+            except Exception as e:
+                log.warning("shadow fill confirm: %s", safe_err(e))
+            if allowed:
+                try:
+                    recorded = desk.log_shadow(order, stats, fomo_data=picked_row)
+                except Exception as e:
+                    log.warning("log_shadow: %s", safe_err(e))
+                stats["shadow_order"] = order
+                stats["shadow_recorded"] = bool(recorded)
+            else:
+                log.info("shadow fill deferred pending_confirm ticker=%s paper=1",
+                         picked_token.get("ticker"))
+                stats["shadow_order"] = None
+                stats["shadow_recorded"] = False
+                stats["confirm_held"] = True
         return None, stats  # never send; report() uses shadow_order / shadow_recorded
 
     book.take(order)          # the desk is now held. No scan until RISK calls release().

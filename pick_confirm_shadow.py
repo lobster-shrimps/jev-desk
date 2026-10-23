@@ -4,7 +4,7 @@ When a judged token first clears score >= 0.6, record pending_confirm.
 It is only shadow-filled if it clears again on a later cycle with no new
 soft kill. Pending expires if not re-seen within 2 cycles.
 
-Outcomes: confirmed_pick / dropped_unconfirmed / expired.
+Outcomes: confirmed_pick / dropped_unconfirmed / expired / vetoed.
 Shadow fills only. Never live orders. Fail open. safe_err only.
 """
 from __future__ import annotations
@@ -27,6 +27,9 @@ TICKET_USD = 50.0
 MAX_HOLD_HOURS = 6.0
 STOP_LOSS_PCT = -30.0
 TAKE_PROFIT_PCT = 100.0
+TP50_PCT = 50.0
+EXIT_POLICY_TP50 = "tp_50"
+EXIT_POLICY_LEGACY = "legacy"
 LOCK_TIMEOUT_SEC = 0.2
 
 STATUS_PENDING = "pending_confirm"
@@ -35,6 +38,7 @@ STATUS_UNCONFIRMED = "unconfirmed"
 OUTCOME_PICK = "confirmed_pick"
 OUTCOME_DROPPED = "dropped_unconfirmed"
 OUTCOME_EXPIRED = "expired"
+OUTCOME_VETOED = "vetoed"
 EXPIRE_MISSED_CYCLES = 2
 PEPA = "PepaMint111111111111111111111111111111:1399811149"
 HORN = "HornMint111111111111111111111111111111:1399811149"
@@ -153,6 +157,10 @@ def _init_schema(db: sqlite3.Connection) -> None:
         _schema_step(db, "missed_cycles", lambda: db.execute(
             "ALTER TABLE pick_confirm ADD COLUMN missed_cycles INTEGER NOT NULL DEFAULT 0"
         ))
+    if "exit_policy" not in cols:
+        _schema_step(db, "exit_policy", lambda: db.execute(
+            "ALTER TABLE pick_confirm ADD COLUMN exit_policy TEXT"
+        ))
 
 
 def _num(value, default=None):
@@ -224,10 +232,10 @@ def _confirm(row: dict, ts: float, score, price) -> None:
         """UPDATE pick_confirm SET
              status = ?, outcome = ?, confirm_ts = ?, confirm_score = ?,
              confirm_price = ?, entry_price = ?, last_mark = ?, last_mark_ts = ?,
-             missed_cycles = 0
+             missed_cycles = 0, exit_policy = ?
            WHERE tid = ? AND first_ts = ?""",
         (STATUS_CONFIRMED, OUTCOME_PICK, float(ts), _num(score), px, px, px,
-         float(ts), row["tid"], row["first_ts"]),
+         float(ts), EXIT_POLICY_TP50, row["tid"], row["first_ts"]),
     )
     db.commit()
     if row.get("tid"):
@@ -261,6 +269,65 @@ def _bump_missed(row: dict, missed: int) -> None:
     db.commit()
 
 
+def _tid_of_order(order) -> str | None:
+    if not isinstance(order, dict):
+        return None
+    token = order.get("token") if isinstance(order.get("token"), dict) else {}
+    addr = token.get("address")
+    net = token.get("network_id")
+    if addr is not None and net is not None:
+        return f"{addr}:{net}"
+    if addr:
+        return str(addr)
+    return None
+
+
+def mark_vetoed(order, reasons=None, survivors=None, tid=None, *, now: float | None = None) -> dict | None:
+    """Record pick_confirm outcome=vetoed. No shadow fill. Fail open."""
+    try:
+        ticker = None
+        token = order.get("token") if isinstance(order, dict) else {}
+        if isinstance(token, dict):
+            ticker = token.get("ticker")
+        if not tid:
+            for item in survivors or []:
+                bag = item[0] if isinstance(item, (tuple, list)) and item else item
+                if isinstance(bag, dict) and ticker and bag.get("ticker") == ticker:
+                    tid = bag.get("tid")
+                    break
+        if not tid:
+            tid = _tid_of_order(order)
+        if not tid:
+            return None
+        ts = current_time() if now is None else float(now)
+        reason = ",".join(str(r) for r in (reasons or []) if r) or "rug_veto"
+        db = _connect()
+        pending = db.execute(
+            "SELECT * FROM pick_confirm WHERE tid = ? AND status = ?",
+            (tid, STATUS_PENDING),
+        ).fetchone()
+        if pending:
+            _unconfirm(_row(pending), reason, outcome=OUTCOME_VETOED)
+            return _row(db.execute(
+                "SELECT * FROM pick_confirm WHERE tid = ? AND first_ts = ?",
+                (tid, pending["first_ts"]),
+            ).fetchone())
+        db.execute(
+            """INSERT INTO pick_confirm (
+                 tid, first_ts, ticker, status, outcome, unconfirm_reason
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (tid, ts, ticker, STATUS_UNCONFIRMED, OUTCOME_VETOED, reason[:200]),
+        )
+        db.commit()
+        return _row(db.execute(
+            "SELECT * FROM pick_confirm WHERE tid = ? AND first_ts = ?",
+            (tid, ts),
+        ).fetchone())
+    except Exception as e:
+        log.warning("pick_confirm vetoed: %s", safe_err(e))
+        return None
+
+
 def fill_allowed(order) -> bool:
     """True only when this cycle just confirmed the picked token."""
     if not isinstance(order, dict):
@@ -287,10 +354,11 @@ def _dossier_by_tid(survivors) -> dict:
     return out
 
 
-def on_cycle(stats: dict | None, survivors=None, now: float | None = None) -> dict:
+def on_cycle(stats: dict | None, survivors=None, vetoed=None,
+             now: float | None = None) -> dict:
     """Resolve last-cycle pending, then record new >=0.6 judged tokens."""
     empty = {"pending": 0, "confirmed": 0, "unconfirmed": 0, "expired": 0,
-             "new_pending": 0}
+             "new_pending": 0, "vetoed": 0}
     try:
         ts = current_time() if now is None else float(now)
         _just_confirmed_tids.clear()
@@ -299,12 +367,21 @@ def on_cycle(stats: dict | None, survivors=None, now: float | None = None) -> di
         tokens = [t for t in (stats.get("tokens") or []) if isinstance(t, dict)]
         by_tid = {t.get("tid"): t for t in tokens if t.get("tid")}
         dossiers = _dossier_by_tid(survivors)
+        vetoed = vetoed if isinstance(vetoed, dict) else {}
+        vetoed_tid = str(vetoed.get("tid") or "") if vetoed.get("skipped") else ""
+        vetoed_ticker = str(vetoed.get("ticker") or "") if vetoed.get("skipped") else ""
+        veto_reason = ",".join(str(r) for r in (vetoed.get("reasons") or []) if r) or "rug_veto"
         threshold = confirm_min()
-        confirmed = unconfirmed = expired = 0
+        confirmed = unconfirmed = expired = vetoed_n = 0
         resolved = set()
         for row in pending_rows():
             tid = row.get("tid")
             resolved.add(tid)
+            if vetoed_tid and str(tid) == vetoed_tid:
+                _unconfirm(row, veto_reason, outcome=OUTCOME_VETOED)
+                vetoed_n += 1
+                unconfirmed += 1
+                continue
             seen = by_tid.get(tid)
             if seen is None:
                 missed = int(row.get("missed_cycles") or 0) + 1
@@ -343,6 +420,15 @@ def on_cycle(stats: dict | None, survivors=None, now: float | None = None) -> di
             tid = t.get("tid")
             if not tid or tid in pending_now or tid in resolved:
                 continue
+            if (vetoed_tid and str(tid) == vetoed_tid) or (
+                vetoed_ticker and str(t.get("ticker") or "") == vetoed_ticker
+            ):
+                mark_vetoed(
+                    {"token": {"ticker": t.get("ticker")}},
+                    vetoed.get("reasons"), survivors, tid=tid, now=ts,
+                )
+                vetoed_n += 1
+                continue
             d = dossiers.get(tid) or t
             if _upsert_pending(tid, t.get("ticker"), ts, score, _price_of(d)):
                 new_pending += 1
@@ -353,6 +439,7 @@ def on_cycle(stats: dict | None, survivors=None, now: float | None = None) -> di
             "unconfirmed": unconfirmed,
             "expired": expired,
             "new_pending": new_pending,
+            "vetoed": vetoed_n,
         }
     except Exception as e:
         log.warning("pick_confirm cycle: %s", safe_err(e))
@@ -368,14 +455,24 @@ def _apply_mark(row: dict, price, now: float) -> str:
     held_h = (now - float(row.get("confirm_ts") or now)) / 3600.0
     exit_px = px if px is not None and px > 0 else last
     reason = None
+    policy = row.get("exit_policy") or EXIT_POLICY_LEGACY
+    active_tp = TP50_PCT if policy == EXIT_POLICY_TP50 else TAKE_PROFIT_PCT
     if held_h >= MAX_HOLD_HOURS:
         reason = f"time_stop_{held_h:.1f}h" + ("_stale" if px is None else "")
     elif px is not None and px > 0:
         pct = (px / entry - 1.0) * 100.0
+        tp50_would = pct >= TP50_PCT
+        legacy_would = pct >= TAKE_PROFIT_PCT
         if pct <= STOP_LOSS_PCT:
             reason = f"stop_loss_{pct:.1f}pct"
-        elif pct >= TAKE_PROFIT_PCT:
-            reason = f"take_profit_{pct:.1f}pct"
+        elif pct >= active_tp:
+            reason = (f"tp_50_{pct:.1f}pct" if policy == EXIT_POLICY_TP50
+                      else f"take_profit_{pct:.1f}pct")
+        log.info(
+            "pick_confirm mark tid=%s policy=%s pct=%s tp50_would=%s "
+            "legacy_would=%s paper=1",
+            row.get("tid"), policy, pct, tp50_would, legacy_would,
+        )
     db = _connect()
     if reason:
         pnl = TICKET_USD * (exit_px / entry - 1.0) if exit_px else None
@@ -441,6 +538,7 @@ def counts() -> dict:
         "unconfirmed": 0,
         "dropped": 0,
         "expired": 0,
+        "vetoed": 0,
         "open": 0,
         "closed": 0,
         "confirmed_pnl": 0.0,
@@ -463,6 +561,8 @@ def counts() -> dict:
             out["unconfirmed"] += 1
             if outcome == OUTCOME_EXPIRED:
                 out["expired"] += 1
+            elif outcome == OUTCOME_VETOED:
+                out["vetoed"] += 1
             else:
                 out["dropped"] += 1
     out["confirmed_pnl"] = round(out["confirmed_pnl"], 4)

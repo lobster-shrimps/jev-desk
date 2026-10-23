@@ -33,7 +33,10 @@ SHADOW_TICKET_USD = 50.0
 # These are conservative defaults to ensure shadow positions eventually close.
 SHADOW_MAX_HOLD_HOURS = 6.0        # Max hold time before forced exit
 SHADOW_STOP_LOSS_PCT = -30.0       # Stop loss at -30% (conservative)
-SHADOW_TAKE_PROFIT_PCT = 100.0     # Take profit at +100% (let winners run)
+SHADOW_TAKE_PROFIT_PCT = 100.0     # Legacy take-profit (+100%). Existing opens keep this.
+SHADOW_TP50_PCT = 50.0             # New fills: same +50% take-profit as young_trail tp_50
+EXIT_POLICY_TP50 = "tp_50"
+EXIT_POLICY_LEGACY = "legacy"
 
 
 def _as_price(v):
@@ -128,6 +131,9 @@ def entry(order: dict, fomo_data: dict = None, token_row: dict | None = None) ->
         "model": order.get("model"),
         "order_id": order.get("order_id"),
         "price_source": source,
+        "exit_policy": EXIT_POLICY_TP50,
+        "take_profit_pct": SHADOW_TP50_PCT,
+        "legacy_take_profit_pct": SHADOW_TAKE_PROFIT_PCT,
     }
     
     _append(entry_record)
@@ -139,7 +145,8 @@ def entry(order: dict, fomo_data: dict = None, token_row: dict | None = None) ->
 def mark(address: str, network_id: int, current_price: float = None, volume_h24: float = None) -> dict:
     """
     Mark an open shadow position to market and check exit conditions.
-    Shadow exits: time stop (6h), stop-loss (-30%), take-profit (+100%).
+    Shadow exits: time stop (6h), stop-loss (-30%), take-profit
+    (+50% on new tp_50 fills; +100% on existing/legacy positions).
     RISK's h6 volume exit is NOT modelled (no real h6 data available).
     
     Args:
@@ -202,20 +209,34 @@ def mark(address: str, network_id: int, current_price: float = None, volume_h24:
     
     # Check price-based exits (stop-loss, take-profit)
     # Shadow ledger defaults, NOT trading thresholds
+    policy = pos.get("exit_policy") or EXIT_POLICY_LEGACY
+    active_tp = SHADOW_TP50_PCT if policy == EXIT_POLICY_TP50 else SHADOW_TAKE_PROFIT_PCT
+    tp50_would_exit = unrealized_pnl_pct >= SHADOW_TP50_PCT
+    legacy_would_exit = unrealized_pnl_pct >= SHADOW_TAKE_PROFIT_PCT
     should_exit = False
     exit_reason = None
     
     if unrealized_pnl_pct <= SHADOW_STOP_LOSS_PCT:
         should_exit = True
         exit_reason = f"stop_loss_{unrealized_pnl_pct:.1f}pct"
-    elif unrealized_pnl_pct >= SHADOW_TAKE_PROFIT_PCT:
+    elif unrealized_pnl_pct >= active_tp:
         should_exit = True
-        exit_reason = f"take_profit_{unrealized_pnl_pct:.1f}pct"
+        if policy == EXIT_POLICY_TP50:
+            exit_reason = f"tp_50_{unrealized_pnl_pct:.1f}pct"
+        else:
+            exit_reason = f"take_profit_{unrealized_pnl_pct:.1f}pct"
     
     if should_exit:
-        return close(address, network_id, current_price=current_price, reason=exit_reason, unmeasured=False)
+        rec = close(address, network_id, current_price=current_price, reason=exit_reason, unmeasured=False)
+        if isinstance(rec, dict):
+            rec["exit_policy"] = policy
+            rec["tp50_would_exit"] = tp50_would_exit
+            rec["legacy_would_exit"] = legacy_would_exit
+            rec["legacy_take_profit_pct"] = SHADOW_TAKE_PROFIT_PCT
+            rec["tp50_pnl_pct"] = unrealized_pnl_pct
+        return rec
     
-    # Mark to market (stays open)
+    # Mark to market (stays open). Log both exits for comparison.
     mark_record = {
         "action": "mark",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
@@ -228,6 +249,11 @@ def mark(address: str, network_id: int, current_price: float = None, volume_h24:
         "unrealized_pnl_pct": unrealized_pnl_pct,
         "held_hours": held_hours,
         "stale": False,
+        "exit_policy": policy,
+        "tp50_would_exit": tp50_would_exit,
+        "legacy_would_exit": legacy_would_exit,
+        "legacy_take_profit_pct": SHADOW_TAKE_PROFIT_PCT,
+        "tp50_pnl_pct": unrealized_pnl_pct,
     }
     
     _append(mark_record)
@@ -284,6 +310,9 @@ def close(address: str, network_id: int, current_price: float = None, reason: st
         "unmeasured": unmeasured,  # Flag for excluding from totals
         "reason": reason,
         "held_seconds": time.time() - _parse_ts(pos["ts"]),
+        "exit_policy": pos.get("exit_policy") or EXIT_POLICY_LEGACY,
+        "legacy_take_profit_pct": SHADOW_TAKE_PROFIT_PCT,
+        "tp50_pnl_pct": realized_pnl_pct,
     }
     
     _append(close_record)

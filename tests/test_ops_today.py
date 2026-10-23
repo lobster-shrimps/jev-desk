@@ -46,7 +46,8 @@ def test_ops_html_renders_and_new_endpoints_exist():
     assert 'id="drr-err"' in html
     assert 'id="rv-err"' in html
     assert 'id="pc-err"' in html
-    assert "shadow, does not gate picks" in html
+    assert "shadow skip on fill" in html
+    assert "does not gate picks" in html
     assert "1 row adjusted (bad price mark)" in html or "row adjusted (bad price mark)" in html
     assert "holders_source||'unknown'" in html or 'holders_source||"unknown"' in html
     assert "Oct 20 11:59 PM ET" not in html

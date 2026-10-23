@@ -176,6 +176,25 @@ def test_apply_judge_verdicts_still_runs_when_confirm_raises(pcs, monkeypatch, c
     assert stats["tokens"][0]["judge_verdict"] is not None
 
 
+def test_confirm_uses_tp50_and_logs_old_exit(pcs, caplog):
+    tid = "Tok:1399811149"
+    d = {"tid": tid, "ticker": "TOK", "price_usd": 1.0}
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.7, 1.0)]}, [(d, {})], now=T0)
+    pcs.set_time_fn(lambda: T0 + 600)
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.7, 1.0)]}, [(d, {})], now=T0 + 600)
+    row = pcs.all_rows()[0]
+    assert row["exit_policy"] == "tp_50"
+    class Fomo:
+        def tokens(self, tids):
+            return {tid: {"price": 1.5, "vol24": 1}}
+    caplog.set_level("INFO")
+    pcs.mark_open(Fomo(), now=T0 + 600)
+    row = pcs.all_rows()[0]
+    assert row["exit_reason"].startswith("tp_50")
+    assert row["pnl_usd"] == pytest.approx(25.0)
+    assert "legacy_would=False" in caplog.text or "legacy_would=" in caplog.text
+
+
 def test_mark_uses_shadow_exits_not_ledger(pcs, tmp_path, monkeypatch):
     tid = "Tok:1399811149"
     d = {"tid": tid, "ticker": "TOK", "price_usd": 1.0}
@@ -205,6 +224,52 @@ def test_ops_payload_and_route(pcs):
     resp = TestClient(server.app).get("/ops/pick_confirm")
     assert resp.status_code == 200
     assert resp.json()["paper"] is True
+
+
+def test_vetoed_outcome_skips_confirm_and_fill(pcs):
+    tid = "Tok:1399811149"
+    order = {"token": {"ticker": "TOK", "address": "Tok", "network_id": 1399811149}}
+    d = {"tid": tid, "ticker": "TOK", "price_usd": 0.002}
+    pcs.on_cycle(
+        {"tokens": [_judged(tid, "TOK", 0.72, 0.002)]}, [(d, {})],
+        vetoed={"skipped": True, "tid": tid, "ticker": "TOK",
+                "reasons": ["sniper_share_ge_50"]},
+        now=T0,
+    )
+    row = pcs.all_rows()[0]
+    assert row["outcome"] == "vetoed"
+    assert row["status"] == "unconfirmed"
+    assert "sniper_share_ge_50" in (row["unconfirm_reason"] or "")
+    assert pcs.fill_allowed(order) is False
+    assert pcs.counts()["vetoed"] == 1
+
+
+def test_two_cycle_confirm_still_works_without_veto(pcs):
+    tid = "Tok:1399811149"
+    order = {"token": {"ticker": "TOK", "address": "Tok", "network_id": 1399811149}}
+    d = {"tid": tid, "ticker": "TOK", "price_usd": 0.002}
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.72, 0.002)]}, [(d, {})], now=T0)
+    assert pcs.all_rows()[0]["status"] == "pending_confirm"
+    assert pcs.fill_allowed(order) is False
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.68, 0.0024)]}, [(d, {})], now=T0 + 600)
+    assert pcs.all_rows()[0]["outcome"] == "confirmed_pick"
+    assert pcs.fill_allowed(order) is True
+
+
+def test_pending_then_vetoed_on_second_cycle(pcs):
+    tid = "Tok:1399811149"
+    order = {"token": {"ticker": "TOK", "address": "Tok", "network_id": 1399811149}}
+    d = {"tid": tid, "ticker": "TOK", "price_usd": 0.002}
+    pcs.on_cycle({"tokens": [_judged(tid, "TOK", 0.72, 0.002)]}, [(d, {})], now=T0)
+    pcs.on_cycle(
+        {"tokens": [_judged(tid, "TOK", 0.68, 0.0024)]}, [(d, {})],
+        vetoed={"skipped": True, "tid": tid, "ticker": "TOK",
+                "reasons": ["followers_lt_100"]},
+        now=T0 + 600,
+    )
+    row = pcs.all_rows()[0]
+    assert row["outcome"] == "vetoed"
+    assert pcs.fill_allowed(order) is False
 
 
 def test_first_pass_no_fill_second_pass_fills(pcs):

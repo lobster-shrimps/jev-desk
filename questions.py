@@ -127,15 +127,20 @@ SOCIAL = {
 }
 
 
+# Pre-#96 pick instructions. Social/rug facts stay out of the judge prompt.
+PICK_INSTRUCTIONS = (
+    "Choose the single token in `candidates` that is the best entry "
+    "right now. Weigh crowd shape, contract risk, concentration and "
+    "the project account together. Prefer a clean unspent setup over "
+    "a larger move that already happened."
+)
+
+
 def PICK(state):
     """Options built from the shortlist at call time. Choice takes up to 255."""
     return {
         "best": Choice(
-            instructions="Choose the single token in `candidates` that is the best entry "
-                         "right now. Weigh crowd shape, contract risk, concentration and "
-                         "the project account together. Prefer a clean unspent setup over "
-                         "a larger move that already happened. Small, new or recycled "
-                         "accounts with high sniper share are classic rug setups.",
+            instructions=PICK_INSTRUCTIONS,
             criteria={c["ticker"]: c["summary"] for c in state["candidates"]}),
         "worth_trading_at_all": Noul(
             instructions="At least one token in `candidates` is worth a position today, "

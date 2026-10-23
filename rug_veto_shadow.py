@@ -1,13 +1,15 @@
-"""Log-only rug veto before the final pick. Paper/shadow only.
+"""Rug veto: log would_skip, and skip the shadow fill when it fires.
 
 For each token that reaches the final judge, reuse desk_rugrisk (sniper share,
 bundled, sniper wallets) under its existing Helius / ET day cap, plus the
 fxtwitter follower count already on the dossier. would_skip is sniper_share
->= 0.5 OR followers < 100. Unknown followers record reason followers_unknown
-and do not skip.
+>= 0.5 OR verified project followers < 100. Unknown followers record
+followers_unknown and do not skip.
 
-Never gates picks, the judge, or the shadow ledger. Fail open. safe_err only.
-On cycle-budget timeout the row is status=unavailable.
+When the picked token would_skip, skip the shadow fill (no entry), log
+vetoed, and mark pick_confirm outcome=vetoed. Fail open: missing data or
+errors do not skip and log veto_unknown. Judge still runs. No live orders.
+safe_err only. On cycle-budget timeout the row is status=unavailable.
 """
 from __future__ import annotations
 
@@ -142,6 +144,11 @@ def _init_schema(db: sqlite3.Connection) -> None:
     _schema_step(db, "idx_rvs_ts", lambda: db.execute(
         "CREATE INDEX IF NOT EXISTS idx_rvs_ts ON rug_veto_shadow(ts DESC)"
     ))
+    cols = {row[1] for row in db.execute("PRAGMA table_info(rug_veto_shadow)")}
+    if "vetoed" not in cols:
+        _schema_step(db, "vetoed", lambda: db.execute(
+            "ALTER TABLE rug_veto_shadow ADD COLUMN vetoed INTEGER NOT NULL DEFAULT 0"
+        ))
 
 
 def _num(value, default=None):
@@ -215,19 +222,29 @@ def _project_followers(d: dict | None, ans=None, soft_scores=None):
     return None
 
 
+def _clamped_sniper(sniper_share):
+    try:
+        from pick import _clamp_share
+        return _clamp_share(sniper_share)
+    except Exception:
+        return _num(sniper_share)
+
+
 def decide(sniper_share=None, followers=None, status: str | None = None) -> dict:
     """would_skip + reasons. Unknown followers never skip. Timeout → unavailable."""
     reasons = []
     would_skip = False
     st = status or STATUS_OK
-    if st in (STATUS_UNAVAILABLE, STATUS_BUDGET) and sniper_share is None:
+    sn = _clamped_sniper(sniper_share)
+    if isinstance(sn, str):
+        sn = _num(sn)
+    if st in (STATUS_UNAVAILABLE, STATUS_BUDGET) and sn is None:
         reasons.append("unavailable")
     if followers is None:
         reasons.append("followers_unknown")
     elif followers < FOLLOWERS_SKIP:
         reasons.append("followers_lt_100")
         would_skip = True
-    sn = _num(sniper_share)
     if sn is not None and sn >= SNIPER_SKIP:
         reasons.append("sniper_share_ge_50")
         would_skip = True
@@ -238,6 +255,72 @@ def decide(sniper_share=None, followers=None, status: str | None = None) -> dict
         "followers": _num(followers),
         "status": st if sn is not None or st != STATUS_OK else st,
     }
+
+
+def apply_to_pick(order, survivors=None) -> dict:
+    """Skip the shadow fill when the picked token trips the veto. Fail open."""
+    empty = {
+        "skipped": False, "vetoed": False, "would_skip": False,
+        "reasons": ["veto_unknown"], "tid": None, "ticker": None,
+        "sniper_share": None, "followers": None, "status": STATUS_OK,
+    }
+    try:
+        if not isinstance(order, dict) or not isinstance(order.get("token"), dict):
+            return {
+                "skipped": False, "vetoed": False, "would_skip": False,
+                "reasons": [], "tid": None, "ticker": None,
+                "sniper_share": None, "followers": None, "status": STATUS_OK,
+            }
+        token = order["token"]
+        ticker = token.get("ticker")
+        addr = token.get("address")
+        d, ans = None, {}
+        for item in survivors or []:
+            bag = item[0] if isinstance(item, (tuple, list)) and item else item
+            extra = item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else {}
+            if not isinstance(bag, dict):
+                continue
+            if ticker and bag.get("ticker") == ticker:
+                d, ans = bag, extra if isinstance(extra, dict) else {}
+                break
+            if addr and bag.get("addr") == addr:
+                d, ans = bag, extra if isinstance(extra, dict) else {}
+                break
+        if not isinstance(d, dict):
+            empty["ticker"] = ticker
+            return empty
+        feat = dict(d.get("_rug_veto") or _prepared.get(str(d.get("tid") or "")) or {})
+        followers = feat.get("followers")
+        if followers is None:
+            followers = _project_followers(
+                d, ans=ans, soft_scores=feat.get("soft_scores") or _soft_scores_of(d),
+            )
+        sniper = _clamped_sniper(feat.get("sniper_share"))
+        status = feat.get("status") or STATUS_OK
+        decided = decide(sniper, followers, status)
+        reasons = list(decided.get("reasons") or [])
+        missing = (
+            sniper is None
+            or followers is None
+            or status in (STATUS_UNAVAILABLE, STATUS_BUDGET)
+        )
+        if not decided["would_skip"] and missing and "veto_unknown" not in reasons:
+            reasons.append("veto_unknown")
+        skipped = bool(decided["would_skip"])
+        return {
+            "skipped": skipped,
+            "vetoed": skipped,
+            "would_skip": bool(decided["would_skip"]),
+            "reasons": reasons,
+            "sniper_share": decided.get("sniper_share"),
+            "followers": decided.get("followers"),
+            "status": decided.get("status") or status,
+            "tid": d.get("tid"),
+            "ticker": d.get("ticker") or ticker,
+        }
+    except Exception as e:
+        log.warning("rug_veto apply: %s", safe_err(e))
+        return empty
 
 
 def _loads(raw) -> dict:
@@ -559,8 +642,8 @@ def _insert(row: dict) -> None:
     db.execute(
         """INSERT OR REPLACE INTO rug_veto_shadow (
              tid, ticker, chain, ts, judge_score, sniper_share, sniper_wallets,
-             bundled, followers, would_skip, reasons, became_pick, status
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             bundled, followers, would_skip, reasons, became_pick, status, vetoed
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             row.get("tid"), row.get("ticker"), row.get("chain"),
             float(row.get("ts") or current_time()),
@@ -572,12 +655,23 @@ def _insert(row: dict) -> None:
             json.dumps(row.get("reasons") or [], default=str),
             1 if row.get("became_pick") else 0,
             row.get("status") or STATUS_OK,
+            1 if row.get("vetoed") else 0,
         ),
     )
     db.commit()
 
 
-def record(stats=None, survivors=None, order=None, *, now: float | None = None) -> int:
+def _veto_matches(vetoed, tid, ticker) -> bool:
+    if not isinstance(vetoed, dict):
+        return False
+    if vetoed.get("tid") and tid and str(vetoed.get("tid")) == str(tid):
+        return True
+    if vetoed.get("ticker") and ticker and str(vetoed.get("ticker")) == str(ticker):
+        return True
+    return False
+
+
+def record(stats=None, survivors=None, order=None, vetoed=None, *, now: float | None = None) -> int:
     """After judge verdicts. Write one paper row per final-judge token."""
     written = 0
     try:
@@ -611,6 +705,17 @@ def record(stats=None, survivors=None, order=None, *, now: float | None = None) 
                 feat.get("sniper_share"), feat.get("followers"), feat.get("status"),
             )
             ticker = row.get("ticker") or d.get("ticker")
+            became = _became_pick(order, ticker, tid)
+            reasons = list(decided["reasons"] or [])
+            is_vetoed = bool(vetoed and vetoed.get("skipped") and _veto_matches(vetoed, tid, ticker))
+            if is_vetoed:
+                for extra in vetoed.get("reasons") or []:
+                    if extra not in reasons:
+                        reasons.append(extra)
+            elif became and isinstance(vetoed, dict) and not vetoed.get("skipped"):
+                for extra in vetoed.get("reasons") or []:
+                    if extra == "veto_unknown" and extra not in reasons:
+                        reasons.append(extra)
             payload = {
                 "tid": tid,
                 "ticker": ticker,
@@ -622,8 +727,9 @@ def record(stats=None, survivors=None, order=None, *, now: float | None = None) 
                 "bundled": feat.get("bundled"),
                 "followers": decided["followers"],
                 "would_skip": decided["would_skip"],
-                "reasons": decided["reasons"],
-                "became_pick": _became_pick(order, ticker, tid),
+                "reasons": reasons,
+                "became_pick": became,
+                "vetoed": is_vetoed,
                 "status": decided["status"] or feat.get("status") or STATUS_OK,
             }
             try:
@@ -652,6 +758,7 @@ def all_rows() -> list[dict]:
                     d["reasons"] = [raw] if raw else []
             d["would_skip"] = bool(d.get("would_skip"))
             d["became_pick"] = bool(d.get("became_pick"))
+            d["vetoed"] = bool(d.get("vetoed"))
             rows.append(d)
         return rows
     except Exception as e:
@@ -668,6 +775,8 @@ def counts() -> dict:
         "picks": 0,
         "unavailable": 0,
         "followers_unknown": 0,
+        "vetoed": 0,
+        "veto_unknown": 0,
     }
     for r in rows:
         if r.get("would_skip"):
@@ -676,10 +785,14 @@ def counts() -> dict:
             out["would_keep"] += 1
         if r.get("became_pick"):
             out["picks"] += 1
+        if r.get("vetoed"):
+            out["vetoed"] += 1
         if r.get("status") == STATUS_UNAVAILABLE or "unavailable" in (r.get("reasons") or []):
             out["unavailable"] += 1
         if "followers_unknown" in (r.get("reasons") or []):
             out["followers_unknown"] += 1
+        if "veto_unknown" in (r.get("reasons") or []):
+            out["veto_unknown"] += 1
     return out
 
 
@@ -747,26 +860,32 @@ def replay(include_historical: bool = True) -> dict:
 
 def ops_payload() -> dict:
     try:
+        rows = all_rows()
+        vetoed = [r for r in rows if r.get("vetoed")]
         return {
             "paper": True,
             "simulated": True,
             "live_orders": False,
             "gates_picks": False,
+            "gates_shadow_fills": True,
             "caveat": (
-                "Rug veto is log-only. would_skip is counterfactual and does "
-                "not gate picks, trades, or the judge."
+                "Rug veto skips the shadow fill when it fires. Judge still "
+                "runs. Live orders stay off. would_skip is logged on every "
+                "judged token."
             ),
-            "label": "shadow, does not gate picks",
+            "label": "shadow skip on fill, no live orders",
             "counts": counts(),
             "replay": replay(),
-            "entries": all_rows()[:80],
+            "vetoed": vetoed[:80],
+            "entries": rows[:80],
         }
     except Exception as e:
         log.warning("rug_veto ops: %s", safe_err(e))
         return {
             "paper": True, "simulated": True, "live_orders": False,
-            "gates_picks": False, "error": "unavailable",
-            "counts": counts(), "entries": [],
+            "gates_picks": False, "gates_shadow_fills": True,
+            "error": "unavailable",
+            "counts": counts(), "vetoed": [], "entries": [],
         }
 
 

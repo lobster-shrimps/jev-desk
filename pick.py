@@ -362,8 +362,21 @@ def summary(d, ans) -> str:
         bits.append(d["holder_growth"])
     if d.get("dev_sells"):
         bits.append(d["dev_sells"])
-    bits.append(social_tail(d, ans))
+    # Facts stay off the judge prompt (pre-#96). Veto still uses the helpers.
     return "; ".join(bits)
+
+
+def render_pick_prompt(survivors) -> str:
+    """Instructions + per-token summaries. Pre-#96 text when facts are omitted."""
+    from questions import PICK
+    state = {"candidates": [{"ticker": d["ticker"], "summary": summary(d, a)}
+                            for d, a in survivors]}
+    qs = PICK(state)
+    instr = getattr(qs["best"], "instructions", "") or ""
+    lines = [instr]
+    for c in state["candidates"]:
+        lines.append(f"{c['ticker']}: {c['summary']}")
+    return "\n".join(lines)
 
 
 def size_factor_for(ans) -> float:

@@ -88,11 +88,11 @@ tr.pick td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
   <div class="scroll"><table id="drr-cf"><thead><tr><th>Flag</th><th class="n">Hit n</th><th class="n">Hit picks</th><th class="n">Hit P&amp;L</th><th class="n">Miss n</th><th class="n">Miss picks</th><th class="n">Miss P&amp;L</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="rug-veto" class="s6" aria-labelledby="rv-h">
-  <h2 id="rv-h">Rug veto <small>shadow, does not gate picks</small></h2>
+  <h2 id="rv-h">Rug veto <small>shadow skip on fill, no live orders</small></h2>
   <div class="err" id="rv-err" hidden></div>
   <div class="kv" id="rv-kv"></div>
-  <div class="note" id="rv-note">shadow, does not gate picks</div>
-  <div class="scroll"><table id="rv-t"><thead><tr><th>Ticker</th><th class="n">Score</th><th class="n">Sniper</th><th>Bundled</th><th class="n">Followers</th><th>Skip</th><th>Reasons</th><th>Pick</th></tr></thead><tbody></tbody></table></div>
+  <div class="note" id="rv-note">shadow skip on fill, no live orders</div>
+  <div class="scroll"><table id="rv-t"><thead><tr><th>Ticker</th><th class="n">Score</th><th class="n">Sniper</th><th>Bundled</th><th class="n">Followers</th><th>Skip</th><th>Vetoed</th><th>Reasons</th><th>Pick</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section id="pick-confirm" class="s6" aria-labelledby="pc-h">
   <h2 id="pc-h">Two-cycle confirm <small>required for shadow fills</small></h2>
@@ -300,11 +300,12 @@ async function load(){
   }
   if(!softErr('rv-err', RV, 'rug_veto unavailable')){
     const c=RV.counts||{};
-    kv('rv-kv',[['Rows',c.n||0],['Would skip',c.would_skip||0,'warn'],['Would keep',c.would_keep||0,'ok'],['Picks logged',c.picks||0],['Unavailable',c.unavailable||0],['Followers unknown',c.followers_unknown||0]]);
-    $('rv-note').textContent=RV.label||RV.caveat||'shadow, does not gate picks';
-    rows('rv-t',(RV.entries||[]).slice(0,24).map(r=>{
+    kv('rv-kv',[['Rows',c.n||0],['Would skip',c.would_skip||0,'warn'],['Would keep',c.would_keep||0,'ok'],['Vetoed fills',c.vetoed||0,'warn'],['Picks logged',c.picks||0],['Unavailable',c.unavailable||0],['Followers unknown',c.followers_unknown||0]]);
+    $('rv-note').textContent=RV.label||RV.caveat||'shadow skip on fill, no live orders';
+    const shown=[...(RV.vetoed||[]),...((RV.entries||[]).filter(r=>!r.vetoed))].slice(0,24);
+    rows('rv-t',shown.map(r=>{
       const reasons=Array.isArray(r.reasons)?r.reasons.join(', '):(r.reasons||'');
-      return `<tr class="${r.became_pick?'pick':''}"><td>${esc(r.ticker)}</td><td class="n">${r.judge_score==null?'—':(+r.judge_score).toFixed(2)}</td><td class="n">${r.sniper_share==null?'—':(+r.sniper_share).toFixed(2)}</td><td>${r.bundled==1||r.bundled===true?'yes':r.bundled==0||r.bundled===false?'no':'—'}</td><td class="n">${r.followers==null?'—':(+r.followers).toFixed(0)}</td><td>${r.would_skip?'yes':'no'}</td><td class="stat">${esc(reasons)}</td><td>${r.became_pick?'yes':'no'}</td></tr>`;
+      return `<tr class="${r.vetoed?'warn':r.became_pick?'pick':''}"><td>${esc(r.ticker)}</td><td class="n">${r.judge_score==null?'—':(+r.judge_score).toFixed(2)}</td><td class="n">${r.sniper_share==null?'—':(+r.sniper_share).toFixed(2)}</td><td>${r.bundled==1||r.bundled===true?'yes':r.bundled==0||r.bundled===false?'no':'—'}</td><td class="n">${r.followers==null?'—':(+r.followers).toFixed(0)}</td><td>${r.would_skip?'yes':'no'}</td><td>${r.vetoed?'yes':'no'}</td><td class="stat">${esc(reasons)}</td><td>${r.became_pick?'yes':'no'}</td></tr>`;
     }).join(''));
   }
   if(!softErr('pc-err', PC, 'pick_confirm unavailable')){

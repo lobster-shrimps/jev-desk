@@ -25,7 +25,8 @@ import gt_info_cache
 import judge_inputs
 import main as shift
 from fomo_api import Fomo
-from pick import summary, size_factor_for
+from pick import project_followers, render_pick_prompt, size_factor_for, summary
+from questions import PICK, PICK_INSTRUCTIONS
 from thresholds import PICK_MIN_WORTH, NO_SOCIAL_CUT
 
 # Sample token used in the PR before/after line.
@@ -39,25 +40,19 @@ SAMPLE_ANS = {
     "concentration_is_exit_risk": {"noul": 0.2},
     "authority_risk": {"choice": "renounced"},
 }
-SAMPLE_SOCIAL_UNKNOWN = (
-    "x followers unknown, account age unknown; "
-    "official unknown, recycled unknown, dev_loaded unknown; "
-    "sniper unknown, bundled unknown, snipers unknown; "
-    "dev holding unknown, dev sold unknown; "
-    "paid promo unknown, dex boost unknown, lp unknown"
-)
+# Pre-#96 summary: prefix only. Social/rug facts stay off the judge prompt.
 SAMPLE_PREFIX = (
     "solana, 42m old, $300,000 mcap, $48,000 liq, 310 holders; "
     "crowd 0.70, concentration risk 0.20; authority renounced; no usable X account"
 )
-SAMPLE_BEFORE = SAMPLE_PREFIX + "; " + SAMPLE_SOCIAL_UNKNOWN
+SAMPLE_BEFORE = SAMPLE_PREFIX
 SAMPLE_AFTER = (
     SAMPLE_PREFIX
     + "; flow 1h b/s 540/120, 5m b/s 40/15"
     + "; holders +50 in 30m (+38.5%/h)"
     + "; dev sold 12% of initial since launch"
-    + "; " + SAMPLE_SOCIAL_UNKNOWN
 )
+PRE_96_PROMPT = f"{PICK_INSTRUCTIONS}\nT0: {SAMPLE_PREFIX}"
 
 
 def _prefix_bits(text: str) -> list[str]:
@@ -105,7 +100,7 @@ def test_summary_renders_dev_sells_and_omits_when_missing():
     assert "dev sells: none seen" in summary(none, SAMPLE_ANS)
     assert "dev sold 12%" not in summary(SAMPLE_D, SAMPLE_ANS)
     assert "dev sells" not in summary(SAMPLE_D, SAMPLE_ANS)
-    assert "dev sold unknown" in summary(SAMPLE_D, SAMPLE_ANS)
+    assert "unknown" not in summary(SAMPLE_D, SAMPLE_ANS)
 
 
 def test_summary_sample_token_before_after_all_fields():
@@ -122,24 +117,15 @@ def test_summary_sample_token_before_after_all_fields():
 
 def test_summary_social_tail_unknowns_and_values():
     s = summary(SAMPLE_D, SAMPLE_ANS)
-    assert "x followers unknown" in s
-    assert "account age unknown" in s
-    assert "official unknown" in s
-    assert "recycled unknown" in s
-    assert "dev_loaded unknown" in s
-    assert "sniper unknown" in s
-    assert "bundled unknown" in s
-    assert "snipers unknown" in s
-    assert "dev holding unknown" in s
-    assert "dev sold unknown" in s
-    assert "paid promo unknown" in s
-    assert "dex boost unknown" in s
-    assert "lp unknown" in s
-    assert " 0" not in s.split("x followers")[1][:20]
+    assert s == SAMPLE_PREFIX
+    assert "unknown" not in s
+    assert "sniper" not in s
+    assert "bundled" not in s
+    assert "x followers" not in s
 
     d = {
         **SAMPLE_D,
-        "x_account": {"followers": 240, "account_age_days": 12},
+        "x_account": {"handle": "t0", "followers": 240, "account_age_days": 12},
         "developer_holding_percentage": 2.4,
         "dev_sold_pct": 12.0,
         "_rug_veto": {"sniper_share": 0.12, "bundled": 0, "sniper_wallets": 4},
@@ -155,20 +141,13 @@ def test_summary_social_tail_unknowns_and_values():
         "dev_still_loaded": {"noul": 0.20},
     }
     filled = summary(d, ans)
-    assert "x followers 240" in filled
-    assert "account age 12d" in filled
-    assert "official 0.85" in filled
-    assert "recycled 0.10" in filled
-    assert "dev_loaded 0.20" in filled
-    assert "sniper 0.12" in filled
-    assert "bundled no" in filled
-    assert "snipers 4" in filled
-    assert "dev holding 2%" in filled
-    assert "dev sold 12%" in filled
-    assert "paid promo no" in filled
-    assert "dex boost 0.00" in filled
-    assert "lp 80%" in filled
-    assert "unknown" not in filled.split("x followers")[1]
+    assert "x followers 240" not in filled
+    assert "sniper 0.12" not in filled
+    assert "bundled" not in filled
+    assert "dev holding" not in filled
+    assert "dev sold 12%" not in filled
+    assert "unknown" not in filled
+    assert project_followers(d, ans) == pytest.approx(240)
 
 
 def test_summary_parses_status_url_handle_and_linked_x_post():
@@ -183,8 +162,10 @@ def test_summary_parses_status_url_handle_and_linked_x_post():
     ans = {**SAMPLE_ANS, "account_is_the_project": {"noul": 0.10},
            "effort": {"score": 1.0}}
     text = summary(url_d, ans)
-    assert "(@MarioNawfal, 88000 followers)" in text
-    assert "@unknown" not in text
+    assert "88000" not in text
+    assert "unknown" not in text
+    from pick import _x_handle
+    assert _x_handle(url_d) == "MarioNawfal"
     post_d = {
         **SAMPLE_D,
         "ticker": "XYZ",
@@ -192,8 +173,8 @@ def test_summary_parses_status_url_handle_and_linked_x_post():
         "x_account": {"followers": 12, "account_age_days": 3},
     }
     text2 = summary(post_d, ans)
-    assert "linked x post" in text2
-    assert "@unknown" not in text2
+    assert "linked x post" not in text2
+    assert "unknown" not in text2
 
 
 def test_fresh_followers_used_everywhere(tmp_path, monkeypatch):
@@ -228,8 +209,9 @@ def test_fresh_followers_used_everywhere(tmp_path, monkeypatch):
     ans = {**SAMPLE_ANS, "account_is_the_project": {"noul": 0.80},
            "effort": {"score": 1.0}}
     text = summary(d, ans)
-    assert "x followers 42" in text
+    assert "x followers 42" not in text
     assert "x followers 18" not in text
+    assert project_followers(d, ans) == pytest.approx(42)
     x_lookup.reset()
     x_lookup.set_time_fn(None)
     desk_rugrisk.reset()
@@ -247,7 +229,8 @@ def test_summary_followers_only_when_account_is_project():
            "effort": {"score": 1.0}}
     text = summary(borrowed, ans)
     assert "x followers 4400000" not in text
-    assert "x linked account is not the project (@elonmusk, 4400000 followers)" in text
+    assert "linked account is not the project" not in text
+    assert project_followers(borrowed, ans) is None
     official = {
         **SAMPLE_D,
         "ticker": "FOD",
@@ -256,15 +239,16 @@ def test_summary_followers_only_when_account_is_project():
     ans2 = {**SAMPLE_ANS, "account_is_the_project": {"noul": 0.80},
             "effort": {"score": 2.0}}
     text2 = summary(official, ans2)
-    assert "x followers 88" in text2
-    assert "linked account is not the project" not in text2
+    assert "x followers 88" not in text2
+    assert project_followers(official, ans2) == pytest.approx(88)
     matched = {
         **SAMPLE_D,
         "ticker": "COOKED",
         "x_account": {"handle": "cooked", "followers": 210, "account_age_days": 20},
     }
     text3 = summary(matched, SAMPLE_ANS)
-    assert "x followers 210" in text3
+    assert "x followers 210" not in text3
+    assert project_followers(matched, SAMPLE_ANS) == pytest.approx(210)
 
 
 def test_summary_lp_boost_zero_from_signals_is_unknown(monkeypatch):
@@ -283,8 +267,8 @@ def test_summary_lp_boost_zero_from_signals_is_unknown(monkeypatch):
 
     monkeypatch.setattr(young_trail_signals, "all_rows", _Rows().all_rows)
     text = summary(SAMPLE_D, SAMPLE_ANS)
-    assert "dex boost unknown" in text
-    assert "lp unknown" in text
+    assert "dex boost" not in text
+    assert "unknown" not in text
     assert "dex boost 0.00" not in text
     assert "lp 0%" not in text
 
@@ -874,7 +858,26 @@ def test_thresholds_and_questions_diff_empty():
     q = (ROOT / "questions.py").read_text()
     assert "Classify the shape of this launch from the fields in `state`." in q
     assert "`developer_holding_percentage` is large enough that the creator" in q
-    assert "classic rug setups" in q
+    assert "classic rug setups" not in q
+    assert "Choose the single token in `candidates` that is the best entry" in q
+
+
+def test_prompt_equals_pre96_rendering():
+    assert summary(SAMPLE_D, SAMPLE_ANS) == SAMPLE_PREFIX
+    prompt = render_pick_prompt([(SAMPLE_D, SAMPLE_ANS)])
+    assert prompt == PRE_96_PROMPT
+    qs = PICK({"candidates": [{"ticker": "T0", "summary": SAMPLE_PREFIX}]})
+    assert qs["best"].instructions == PICK_INSTRUCTIONS
+    assert "classic rug" not in prompt
+    assert "unknown" not in prompt
+    fat = {
+        **SAMPLE_D,
+        "_rug_veto": {"sniper_share": 0.8, "bundled": 1},
+        "x_account": {"handle": "elonmusk", "followers": 4_400_000},
+    }
+    assert "sniper" not in summary(fat, SAMPLE_ANS)
+    assert "unknown" not in summary(fat, SAMPLE_ANS)
+    assert render_pick_prompt([(fat, SAMPLE_ANS)]).split("\n", 1)[0] == PICK_INSTRUCTIONS
 
 
 def test_replay_judge_social_prints_unknowns():
@@ -885,12 +888,8 @@ def test_replay_judge_social_prints_unknowns():
         "hellop", "CHILL", "HORN", "PROWLER", "PEPA", "FOD", "SHADOW",
         "Jeetjak", "COOKED", "KUM", "Bien",
     }
-    assert "x followers 40" in by["PEPA"]["new_summary"]
-    assert "sniper 0.75" in by["PROWLER"]["new_summary"]
-    assert "x linked account is not the project" in by["FOD"]["new_summary"]
-    assert "x followers 4400000" in by["FOD"]["old_summary"]
-    assert "dex boost 0.00" in by["hellop"]["old_summary"]
-    assert "dex boost unknown" in by["hellop"]["new_summary"]
-    assert "lp unknown" in by["hellop"]["new_summary"]
-    assert "sniper 1.00" in by["hellop"]["new_summary"]
-    assert "sniper 1.02" in by["hellop"]["old_summary"]
+    assert "x followers 40" not in by["PEPA"]["new_summary"]
+    assert "sniper 0.75" not in by["PROWLER"]["new_summary"]
+    assert "x linked account is not the project" not in by["FOD"]["new_summary"]
+    assert "unknown" not in by["hellop"]["new_summary"]
+    assert "sniper" not in by["hellop"]["new_summary"]
